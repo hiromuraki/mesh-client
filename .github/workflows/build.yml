@@ -1,0 +1,204 @@
+name: build
+
+# 每次 push 与 PR 都验证「编得过、测试绿」，打 v* tag 时把两个平台的产物挂到 GitHub Release。
+
+# 与 build/ 下的本机脚本是一回事，只是换一台干净机器再证一遍：
+#   build/app.ps1  → windows job（版本号由 CI 给，不读 dist/build-version）
+#   面板必须先构建 → crates/panel 编译期 include_dir 前端产物，顺序不能反
+#
+# 发行包不在这里出：它要连 easytier-core.exe 一起打包，而那份内核对上游打了补丁，
+# 源码树与补丁都不在本仓库（见 mesh 根下的 easytier-minimal/）。Release 只挂客户端本体。
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      # 前端只有 pnpm-lock.yaml，npm ci 复现不了依赖。
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      # crates/panel 用 include_dir! 把产物嵌进二进制：没有 dist 就编不过。
+      - name: Build the panel
+        working-directory: frontend
+        run: pnpm run build
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --all
+
+  windows:
+    name: Windows client
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the panel
+        working-directory: frontend
+        run: pnpm run build
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 版本号只进 VERSIONINFO 与 --help：真实版本在 bin/version.json，运行时读。
+      - name: Build
+        env:
+          MESH_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('ci-{0}', github.sha) }}
+        run: cargo build --release -p mesh-client
+
+      - name: Collect the build
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item target/release/mesh-client.exe out/mesh-client-windows-amd64.exe
+
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: mesh-client-windows-amd64
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Linux client
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: pnpm install --frozen-lockfile
+
+      - name: Build the panel
+        working-directory: frontend
+        run: pnpm run build
+
+      # .cargo/config.toml 把 musl 目标的 linker 指到 musl-gcc；发行版要的是静态二进制
+      # （目标机最低 CentOS 9 的 glibc 2.34），所以这里就按 musl 编，不给 glibc 留口子。
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-musl
+
+      - name: Build
+        run: cargo build --release -p mesh-client --target x86_64-unknown-linux-musl
+
+      - name: Collect the build
+        run: |
+          mkdir -p out
+          cp target/x86_64-unknown-linux-musl/release/mesh-client out/mesh-client-linux-amd64
+          chmod +x out/mesh-client-linux-amd64
+
+      - uses: actions/upload-artifact@v7
+        if: github.event_name != 'pull_request'
+        with:
+          name: mesh-client-linux-amd64
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Attach the build to the release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesh-client-windows-amd64
+          path: artifact
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: mesh-client-linux-amd64
+          path: artifact
+
+      # 资产名不带版本号：tag 已经钉住它。内核（easytier-core.exe）不进 Release——
+      # 他由 easytier-minimal/ 的补丁单独构建，和客户端一起打成的 tar.zst 走控制面发布。
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            artifact/mesh-client-windows-amd64.exe \
+            artifact/mesh-client-linux-amd64 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Mesh Client $TAG" \
+            --generate-notes
