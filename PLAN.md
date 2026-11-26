@@ -1,5 +1,8 @@
 # 用 Rust 重写客户端：总体方案
 
+> 这份是重写当时的方案，保留原样。里面的 `client/` 指旧的 Go 实现（现在是 `../client-prototype/`），
+> `client-rust/` 就是现在这份 `client/`。目录改名之后下面的路径不再逐一修订。
+
 依据：`contract/{README,client,updates,device-api}.md`、`client/`（Go 实现）、`client-launcher/`（Rust 启动器）、`docs/client-flows.md`。
 模块划分、并发模型与错误分层见 [MODULES.md](MODULES.md)。本文只写结论与理由。
 

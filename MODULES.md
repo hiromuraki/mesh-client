@@ -1,13 +1,15 @@
 # 模块划分（cargo workspace）
 
-九个成员：七个库 crate、两个二进制。`client-rust/` 是一个独立 workspace（不与 `client-launcher/` 混编，阶段 0 时把它搬进来）。
+九个成员：七个库 crate、两个二进制。整个 workspace 就是 `client/`；启动器原来是一个独立仓库
+（`client-launcher`），已经并进 `crates/launcher`。
 
 ## 1. 形状与依赖图
 
 ```
-client-rust/
+client/
   Cargo.toml            # [workspace] + [workspace.dependencies]
-  .cargo/config.toml    # musl 目标用 musl-gcc（从 client-launcher/ 搬来）
+  .cargo/config.toml    # musl 目标用 musl-gcc（从原来的启动器仓库搬来）
+  frontend/             # pnpm + Vue 3 的面板前端，dist 在编译期嵌进 panel
   crates/
     install/            # mesh-install   安装根形状、版本、失败计数、单实例锁、平台名
     state/              # mesh-state     config/ 下的身份与配置（含 config.toml 提示字段）
@@ -451,7 +453,7 @@ strip = true
 | `client` | `mesh-install`、`mesh-engine`、`mesh-panel`；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_UI_WindowsAndMessaging`、`Win32_Graphics_Gdi`、`Win32_System_LibraryLoader`、`Win32_System_Console`）+ `windows`（`Win32_UI_Shell` 的 `IShellDispatch`、`Win32_System_Com`）；unix: `signal-hook`；build: `winresource` |
 | `launcher` | `mesh-install`、`zstd`、`tar`、`sha2`、`serde_json`、`ureq`（windows: `native-tls`）；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_System_Threading`）；unix: 无（下载走系统 `curl`）；build: `winresource` |
 
-`crates/panel/build.rs` 或 `assets.rs`：`include_dir!("../../../client/frontend/dist")`——路径相对 crate 根（`client-rust/crates/panel` → workspace 根 → 仓库根），直接吃 `client/frontend` 的构建产物，不复制、不改名。前端未构建时先跑占位脚本（等价 `wails3 task stub:frontend`），再编译。
+`crates/panel/src/assets.rs`：`include_dir!("../../frontend/dist")`——路径相对 crate 根（`client/crates/panel` → 仓库根），直接吃 `frontend/` 的构建产物，不复制、不改名。前端未构建时先跑占位脚本（等价 `wails3 task stub:frontend`），再编译。
 
 ## 9. 复核清单（历史故障点 → 新代码位置）
 

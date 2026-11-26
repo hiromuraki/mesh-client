@@ -1,6 +1,8 @@
-# client-rust
+# client
 
-用 Rust 重写 Mesh 客户端的 workspace。方案见 [PLAN.md](PLAN.md)，模块划分、并发模型与
+Mesh 客户端的 workspace。`PLAN.md` 与 `MODULES.md` 是当初重写时的方案与模块划分，
+里面的 `client-rust/`、`client/`、`client-launcher/` 是当时的目录名；现在这份就是 `client/`，
+旧的 Go 客户端在 `../client-prototype/`。并发模型与
 错误分层见 [MODULES.md](MODULES.md)；本文件只写“怎么用、现在到哪一步、跟文档差在哪”。
 
 当前是 **PLAN.md 阶段 1 完成、阶段 2 的 Windows 侧已补齐**：九个 crate 全部有实现。
@@ -9,15 +11,16 @@
 是本地面板（回环监听、guard、静态资源与 SPA 兜底、10 个 `/api` 路由、仪表盘 2 秒缓存），
 `client` 是进程壳（CLI、单实例、线程装配、headless、Windows 托盘）。
 
-**还没有做的**：Windows 桌面形态的真机验证（托盘/UAC/自启任务只能人工核对）、发布脚本里的
-`cargo` 分支。
+**还没有做的**：Linux 产物的发布链路（控制面上 `linux/amd64` 的记录已经删了），以及
+Windows 桌面形态的完整回归（托盘、UAC、自启任务靠人工核对）。出包脚本在 mesh 根下的
+`build/`，不在本仓库。
 
 ## 构建与测试
 
-在 `client-rust/` 下（PowerShell 例子，bash 同形）：
+在本仓库根下（PowerShell 例子，bash 同形）：
 
 ```powershell
-cargo build                     # 整个 workspace（面板要 client/frontend/dist，见下）
+cargo build                     # 整个 workspace（面板要 frontend/dist，见下）
 cargo build --examples -p mesh-core   # 引擎/core 的用例要它当假 core，先编一次
 cargo test                      # 全部单测（当前 206 个）
 cargo clippy --all-targets -- -D warnings
@@ -28,28 +31,27 @@ cargo build -p mesh-client      # 客户端：target/debug/mesh-client.exe
 .\target\debug\mesh-client.exe --help
 ```
 
-`mesh-panel` 用 `include_dir!` 在**编译期**嵌入 `client/frontend/dist`，所以那份构建产物必须
-在：目录不在时编译直接失败（这是有意的，比产出一个打开白屏的二进制好）。不要为了跑 Rust
-的单测去重新构建前端——仓库里那份 dist 就是当前版本。
+`mesh-panel` 用 `include_dir!` 在**编译期**嵌入 `frontend/dist`，所以那份构建产物必须在：
+目录不在时编译直接失败（这是有意的，比产出一个打开白屏的二进制好）。改了前端源码要
+`cd frontend && pnpm build` 再 `cargo build`——`include_dir` 看不到目录内容的变化。
 
 Linux 产物（WSL，源码先 rsync 到 ext4；**不要**在 `/mnt` 下编：cargo 在 drvfs 上很慢，
 WSL 3.x 还会为它弹一次系统通知）：
 
 ```bash
 wsl -d Ubuntu -- bash -lc 'set -e
-mkdir -p ~/mb/client/frontend
-rsync -a --delete --exclude target /mnt/s/local/repos/mesh/client-rust/ ~/mb/client-rust/
+rsync -a --delete --exclude target --exclude frontend/dist /mnt/s/local/repos/mesh/client/ ~/mb/client/
 rsync -a --delete /mnt/s/local/repos/mesh/client/frontend/dist/ ~/mb/client/frontend/dist/
 export PATH=/opt/workbench/app/rust/bin:$PATH
-cd ~/mb/client-rust && cargo build --release --workspace --target x86_64-unknown-linux-musl'
+cd ~/mb/client && cargo build --release --workspace --target x86_64-unknown-linux-musl'
 ```
 
-产物在 `~/mb/client-rust/target/x86_64-unknown-linux-musl/release/`：`mesh`（启动器）与
-`mesh-client`。上面两个 rsync 的目录相对位置与仓库里一致（`crates/panel` 的
-`../../../client/frontend/dist` 正好指到 `~/mb/client/frontend/dist`），所以编出来的就是最终形态；
-这只用于编译验证，改动永远发生在 `S:\local\repos\mesh\client-rust`。
+产物在 `~/mb/client/target/x86_64-unknown-linux-musl/release/`：`mesh`（启动器）与
+`mesh-client`。目录相对位置与仓库里一致（`crates/panel` 的 `../../frontend/dist` 正好指到
+`~/mb/client/frontend/dist`），所以编出来的就是最终形态；这只用于编译验证，改动永远发生在
+`S:\local\repos\mesh\client`。
 
-`.cargo/config.toml` 把 musl 目标的 linker 指到 `musl-gcc`（搬自 `client-launcher/`）：
+`.cargo/config.toml` 把 musl 目标的 linker 指到 `musl-gcc`（搬自旧的启动器仓库）：
 不指定的话 rustc 会用宿主机的 cc 去链 glibc，出来的是照样依赖 `GLIBC_2.39` 的“静态”二进制。
 **这台 Windows 上没有 musl 目标**，Linux 产物只能在 WSL 里编。
 
@@ -73,7 +75,7 @@ Windows 资源（图标、`requireAdministrator` 清单、VERSIONINFO）由 `cra
 | `mesh-engine` | `crates/engine` | 主干完成 | 状态机（唯一可变状态的拥有者）：连接循环、心跳、配置同步、core 启停与退避、401、更新交接、快照与节点表 |
 | `mesh-panel` | `crates/panel` | 完成 | 本地面板：回环监听与端口顺延、`Host`/同源 guard、静态资源与 SPA 兜底、10 个 `/api` 路由、仪表盘 2 秒缓存、`config/ui.json` |
 | `mesh-client` | `crates/client` | 完成（Windows 托盘待真机验证） | bin `mesh-client`：手写 CLI、安装根、单实例、线程装配、headless、Win32 托盘 |
-| `mesh-launcher` | `crates/launcher` | 完成 | bin `mesh`：安装、回滚、监督（搬自 `client-launcher/`） |
+| `mesh-launcher` | `crates/launcher` | 完成 | bin `mesh`：安装、回滚、监督（搬自原来的启动器仓库，已并入本仓库） |
 
 依赖方向（硬规则，MODULES.md 第 2 节）由 `crates/client/tests/dependency_direction.rs` 盯着：
 它读每个成员的 `Cargo.toml`，多出一条不在允许表里的 `mesh-*` 依赖就让 `cargo test` 红。
@@ -82,7 +84,7 @@ Windows 资源（图标、`requireAdministrator` 清单、VERSIONINFO）由 `cra
 
 ## 测试数据
 
-`crates/etrpc/testdata/*.bin` 是**从 `client/internal/easytierrpc/testdata/` 原样拷贝**的
+`crates/etrpc/testdata/*.bin` 是**从 `client-prototype/internal/easytierrpc/testdata/` 原样拷贝**的
 真实 core 应答（`ShowNodeInfo`/`ListPeer`/`ListRoute` 各一份，抓法见那边的 `capture_test.go`）。
 两边用同一份二进制数据、断言同一组数值，Rust 的解码结果才有可比性；重新抓包时两边一起换。
 `client/` 下没有做任何修改。
@@ -171,7 +173,7 @@ registry = "sparse+https://rsproxy.cn/index/"
 - `autoUpdate` 照单全收（它已经是控制面覆盖后的值），本地 `--disable-auto-update` 仍是唯一的
   一票否决。
 - 退出：`Shutdown` 注册“停 core”一步，`run_and_exit` 幂等；引擎在收尾开始后不再处理命令。
-- 快照与节点表：`Snapshot` 字段逐个对齐 `client/frontend/src/api/types.ts`；`build_nodes` 把
+- 快照与节点表：`Snapshot` 字段逐个对齐 `frontend/src/api/types.ts`；`build_nodes` 把
   `ListPeer` + `ListRoute` 拼成数据页的行（直连用实测延迟覆盖路由表的整数毫秒、中继按
   `next_hop` 还原整条链路）。
 - 日志：`HH:MM:SS [app|core] …`、4MB/2MB 高低水位裁剪（只保留完整行，Windows 上 close →
@@ -184,7 +186,7 @@ registry = "sparse+https://rsproxy.cn/index/"
   缩进，与 Go 的 `MarshalIndent` 同形），第二次启动靠它唤起已有实例。
 - guard 只罩 `/api`：非回环 `Host` → 400 `bad_host`；跨源 `Sec-Fetch-Site` → 403 `cross_origin`；
   两个头都没有（curl、脚本、托盘新标签页）放行。判据逐条搬自 `internal/uits/server_test.go`。
-- 静态资源：`include_dir!` 嵌 `client/frontend/dist`，任何未知路径回 `index.html`；带
+- 静态资源：`include_dir!` 嵌 `frontend/dist`，任何未知路径回 `index.html`；带
   `Cache-Control: no-store` 与 `X-Frame-Options: DENY`（防透明 iframe 骗点“退出”“立即更新”）。
 - 路由 10 个 `/api` + 静态兜底；`GET` 的注册同时接受 `HEAD`，方法不对回 405 + `Allow`。
 - 会改状态的动作全部转成 `Cmd` 并等引擎回复；`/api/quit` 先回 204、再跑退出动作。
@@ -393,7 +395,7 @@ Start-Sleep 3; Get-Content "$root\config\ui.json"
 
 以下是读文档与 Go 实现时发现的出入，**没有改文档**（按约定先报告）：
 
-1. `client/internal/layout/layout.go` 的包注释与 `MaxVersionLen` 注释仍写着 `packages/`
+1. `client-prototype/internal/layout/layout.go` 的包注释与 `MaxVersionLen` 注释仍写着 `packages/`
    （“下载好的更新包，回滚材料”），但当前实现是下到安装根的 `update.tar.zst` + `.part`
    （`engine/update.go` 的 `downloadUpdate`），跑起来的安装根里没有 `packages/`。
    `contract/updates.md` 与 PLAN.md 描述的布局才是对的，Rust 侧不建这个目录。
@@ -429,4 +431,5 @@ Start-Sleep 3; Get-Content "$root\config\ui.json"
    `schtasks /Create` 需要管理员：任务本身是 `HighestAvailable`，非提权进程建不了，这一点与
    「客户端必须以管理员运行」一致，不算缺陷。
 2. **发布链路**：`build/*.ps1` 增加 `cargo` 分支（`MESH_VERSION` 注入、产物拷到 `dist/bin`、
-   `bin/version.json` 由打包脚本生成），以及 `client-rust` 在阶段 3 顶替 `client/` 时的目录改名。
+   `bin/version.json` 由打包脚本生成）。出包脚本现在在 mesh 根下的 `build/`（不入库），
+不再放本仓库。
