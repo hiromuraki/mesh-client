@@ -1,0 +1,4 @@
+# 上游仓库与钉住的提交。升级时改这两行，然后跑 build/easytier.ps1（CI 读同一个文件）。
+# 当前对应上游 2.7.1 之后的一个 main 提交。
+repo=https://github.com/EasyTier/EasyTier.git
+commit=36ba7fb

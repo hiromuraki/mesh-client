@@ -170,10 +170,67 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  kernel:
+    name: Kernel patch check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # 上游钉在 easytier/upstream.txt，本地脚本读同一个文件。
+      - name: Read the upstream pin
+        id: pin
+        shell: pwsh
+        run: |
+          $conf = @{}
+          Get-Content easytier/upstream.txt | Where-Object { $_ -match '^\s*[A-Za-z_]+\s*=' } | ForEach-Object {
+            $pair = $_ -split '=', 2
+            $conf[$pair[0].Trim()] = $pair[1].Trim()
+          }
+          "repo=$($conf['repo'])" >> $env:GITHUB_OUTPUT
+          "commit=$($conf['commit'])" >> $env:GITHUB_OUTPUT
+
+      # 只取 blob 不取历史：checkout 任意提交都要能命中，浅克隆做不到。
+      - name: Clone the upstream tree
+        shell: pwsh
+        run: |
+          git clone --filter=blob:none --no-checkout '${{ steps.pin.outputs.repo }}' upstream
+          git -C upstream checkout -f ${{ steps.pin.outputs.commit }}
+
+      - name: Apply the patch
+        shell: pwsh
+        run: git -C upstream apply easytier/mini.patch
+
+      # protoc 由 easytier-proto 的 build.rs 调用，缺失时它会尝试自行下载。
+      - uses: arduino/setup-protoc@v3
+        with:
+          version: '35.1'
+          repo-token: ${{ github.token }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: upstream
+
+      # 不打 --locked：补丁给 mini 的 Cargo.toml 加了 easytier-core 依赖。
+      - name: Build the mini kernel
+        working-directory: upstream
+        run: cargo build --release -p easytier-mini
+
+      # 补丁没生效时它会把 --credential 当成已知参数接受。
+      - name: Self-check
+        shell: pwsh
+        run: |
+          $exe = 'upstream/target/release/easytier-mini.exe'
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $out = & $exe --credential x 2>&1 | Select-Object -First 1
+          if ($out -notmatch 'unknown argument') { throw "补丁没生效: $out" }
   release:
     name: Attach the build to the release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [windows, linux]
+    needs: [windows, linux, kernel]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

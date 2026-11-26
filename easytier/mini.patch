@@ -1,0 +1,220 @@
+diff --git a/easytier-contrib/easytier-mini/Cargo.toml b/easytier-contrib/easytier-mini/Cargo.toml
+index 73e517b..db3c0f4 100644
+--- a/easytier-contrib/easytier-mini/Cargo.toml
++++ b/easytier-contrib/easytier-mini/Cargo.toml
+@@ -9,13 +9,14 @@ build = "build.rs"
+ 
+ [dependencies]
+ anyhow.workspace = true
++easytier-core = { workspace = true, features = ["chacha20"] }
+ easytier = { workspace = true, features = [
+     "aes-gcm",
+-    "dhcp-ipv4",
+     "icmp-proxy",
+     "logging",
++    "management-rpc",
+     "proxy-cidr-monitor",
+-    "smoltcp",
++    "tcp-hole-punch",
+     "tun",
+     "web-client",
+ ] }
+diff --git a/easytier-contrib/easytier-mini/src/main.rs b/easytier-contrib/easytier-mini/src/main.rs
+index add3120..5fa38eb 100644
+--- a/easytier-contrib/easytier-mini/src/main.rs
++++ b/easytier-contrib/easytier-mini/src/main.rs
+@@ -3,8 +3,11 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
+ use anyhow::Context as _;
+ use easytier::common::MachineIdOptions;
+ use easytier::{
+-    common::config::{ConfigFileControl, load_toml_config_from_path},
++    common::config::{
++        ConfigFileControl, ConfigLoader, TomlConfigLoader, load_toml_config_from_str_with_source,
++    },
+     instance::factory::native_compact_instance_manager_with_runtime,
++    proto::common::SecureModeConfig,
+     rpc_service::ReadOnlyApiRpcServer,
+     web_client::{WebClientHooks, parse_config_server_endpoint, run_web_client},
+ };
+@@ -21,10 +24,15 @@ struct RunOptions {
+     machine_id: Option<String>,
+     hostname: Option<String>,
+     secure_mode: bool,
++    credential: Option<String>,
++    local_private_key: Option<String>,
++    rpc_portal: Option<String>,
+ }
+ 
+ const USAGE: &str = "usage: easytier-mini [--config <FILE>] [--config-server <URL>] \
+-                     [--machine-id <ID>] [--hostname <NAME>] [--secure-mode]";
++                     [--machine-id <ID>] [--hostname <NAME>] [--secure-mode] \
++                     [--rpc-portal <ADDR>]";
++const DEFAULT_RPC_PORTAL: &str = "127.0.0.1:15888";
+ 
+ fn required_value(
+     args: &mut impl Iterator<Item = OsString>,
+@@ -34,8 +42,18 @@ fn required_value(
+         .with_context(|| format!("{option} requires a value"))
+ }
+ 
++// 密钥从环境变量读，不从命令行读：命令行参数对同机其它用户可读，而这两把私钥
++// 各自等价于该节点的 mesh 身份。环境变量名与 easytier-core 的 clap 定义一致。
++fn env_value(name: &str) -> Option<String> {
++    std::env::var(name).ok().filter(|value| !value.is_empty())
++}
++
+ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Command> {
+-    let mut options = RunOptions::default();
++    let mut options = RunOptions {
++        credential: env_value("ET_CREDENTIAL"),
++        local_private_key: env_value("ET_LOCAL_PRIVATE_KEY"),
++        ..RunOptions::default()
++    };
+     while let Some(arg) = args.next() {
+         if arg == "-h" || arg == "--help" {
+             println!(
+@@ -86,6 +104,17 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
+             options.secure_mode = true;
+             continue;
+         }
++        if arg == "--rpc-portal" {
++            if options.rpc_portal.is_some() {
++                anyhow::bail!("--rpc-portal may only be specified once");
++            }
++            options.rpc_portal = Some(
++                required_value(&mut args, "--rpc-portal")?
++                    .into_string()
++                    .map_err(|_| anyhow::anyhow!("--rpc-portal must be valid UTF-8"))?,
++            );
++            continue;
++        }
+         anyhow::bail!("unknown argument {arg:?}; {USAGE}");
+     }
+     if options.config.is_none() && options.config_server.is_none() {
+@@ -108,6 +137,96 @@ fn validate_config_server(config_server: &str) -> anyhow::Result<()> {
+     require_tcp_or_udp(endpoint.connect_url().scheme(), "config server")
+ }
+ 
++// 身份由 --secure-mode / ET_CREDENTIAL 决定，但 core 在**装载配置的那一刻**就按
++// 「TOML 里 secure_mode 是否开着」定型网络身份（TomlConfigLoader::new_from_config）：
++// 装载完再调 set_secure_mode 只换得来密钥、换不来身份，凭据节点会退化成「正式节点 +
++// 空 secret」，握手时被种子以 authentication failed: invalid proof and unknown
++// credential 拒掉。所以这里把 secure_mode 写进配置文本再交给 loader，身份定型与密钥
++// 规范化都让 core 自己做。
++fn secure_mode_for(config: &impl ConfigLoader, options: &RunOptions) -> Option<SecureModeConfig> {
++    if let Some(secret) = options.credential.as_deref() {
++        return Some(SecureModeConfig {
++            enabled: true,
++            local_private_key: Some(secret.to_owned()),
++            local_public_key: None,
++        });
++    }
++    if !options.secure_mode {
++        return None;
++    }
++    let from_env = options.local_private_key.clone().filter(|key| !key.is_empty());
++    let from_file = config.get_secure_mode();
++    let local_public_key = if from_env.is_some() {
++        None
++    } else {
++        from_file
++            .as_ref()
++            .and_then(|mode| mode.local_public_key.clone())
++    };
++    let local_private_key = from_env.or_else(|| {
++        from_file
++            .as_ref()
++            .and_then(|mode| mode.local_private_key.clone())
++    });
++    Some(SecureModeConfig {
++        enabled: true,
++        local_private_key,
++        local_public_key,
++    })
++}
++
++fn with_secure_mode(text: &str, mode: &SecureModeConfig) -> String {
++    let mut out = drop_secure_mode_table(text);
++    out.push_str("\n[secure_mode]\nenabled = true\n");
++    if let Some(key) = mode.local_private_key.as_ref() {
++        out.push_str(&format!("local_private_key = \"{}\"\n", toml_string(key)));
++    }
++    if let Some(key) = mode.local_public_key.as_ref() {
++        out.push_str(&format!("local_public_key = \"{}\"\n", toml_string(key)));
++    }
++    out
++}
++
++// 配置里原本的 [secure_mode] 整段丢掉：身份入口只有命令行与环境变量，配置文件里那份
++// 只可能是过期的副本。
++fn drop_secure_mode_table(text: &str) -> String {
++    let mut out = String::with_capacity(text.len());
++    let mut dropping = false;
++    for line in text.lines() {
++        let trimmed = line.trim_start();
++        if trimmed.starts_with('[') {
++            dropping = trimmed.starts_with("[secure_mode]");
++        }
++        if dropping {
++            continue;
++        }
++        out.push_str(line);
++        out.push('\n');
++    }
++    out
++}
++
++fn toml_string(value: &str) -> String {
++    value.replace('\\', "\\\\").replace('"', "\\\"")
++}
++
++fn load_local_config(
++    config_path: &PathBuf,
++    options: &RunOptions,
++) -> anyhow::Result<TomlConfigLoader> {
++    let source = config_path.display().to_string();
++    let text = std::fs::read_to_string(config_path)
++        .with_context(|| format!("failed to read config file: {source}"))?;
++    let mut config = load_toml_config_from_str_with_source(&source, &text)?;
++    if let Some(mode) = secure_mode_for(&config, options) {
++        config = load_toml_config_from_str_with_source(&source, &with_secure_mode(&text, &mode))?;
++    }
++    if let Some(hostname) = options.hostname.clone().filter(|name| !name.is_empty()) {
++        config.set_hostname(Some(hostname));
++    }
++    Ok(config)
++}
++
+ struct MiniWebClientHooks;
+ 
+ impl WebClientHooks for MiniWebClientHooks {
+@@ -125,10 +244,7 @@ async fn main() -> anyhow::Result<()> {
+     let local_config = options
+         .config
+         .as_ref()
+-        .map(|config_path| {
+-            load_toml_config_from_path(config_path)
+-                .with_context(|| format!("failed to load {}", config_path.display()))
+-        })
++        .map(|config_path| load_local_config(config_path, &options))
+         .transpose()?;
+     if let Some(config_server) = options.config_server.as_deref() {
+         validate_config_server(config_server)?;
+@@ -158,12 +274,15 @@ async fn main() -> anyhow::Result<()> {
+     } else {
+         None
+     };
++    let rpc_portal = options
++        .rpc_portal
++        .unwrap_or_else(|| DEFAULT_RPC_PORTAL.to_owned());
+     let _rpc_server =
+-        ReadOnlyApiRpcServer::new(Some("127.0.0.1:15888".to_owned()), None, instances.clone())?
++        ReadOnlyApiRpcServer::new(Some(rpc_portal.clone()), None, instances.clone())?
+             .serve()
+             .await?;
+     eprintln!(
+-        "easytier-mini started: local={local_instance_id:?}, web={}; RPC: 127.0.0.1:15888",
++        "easytier-mini started: local={local_instance_id:?}, web={}; RPC: {rpc_portal}",
+         options.config_server.is_some()
+     );
+ 
