@@ -197,9 +197,10 @@ jobs:
           git clone --filter=blob:none --no-checkout '${{ steps.pin.outputs.repo }}' upstream
           git -C upstream checkout -f ${{ steps.pin.outputs.commit }}
 
+      # -C 会把相对路径解析到 upstream/ 下面，所以补丁给绝对路径。
       - name: Apply the patch
         shell: pwsh
-        run: git -C upstream apply easytier/mini.patch
+        run: git -C upstream apply "${{ github.workspace }}/easytier/mini.patch"
 
       # protoc 由 easytier-proto 的 build.rs 调用，缺失时它会尝试自行下载。
       - uses: arduino/setup-protoc@v3
