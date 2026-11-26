@@ -14,6 +14,7 @@ mod autostart;
 mod clock;
 mod coreline;
 mod log;
+mod redact;
 mod run;
 mod settings;
 mod sync;

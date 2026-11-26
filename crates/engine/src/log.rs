@@ -82,6 +82,8 @@ impl Log {
     pub fn add(&self, source: &str, message: &str) {
         // 一条日志必须占一行：core 的多行错误展开成单行，换行替换成空格。
         let message = message.replace('\n', " ");
+        // 密钥类字段在这里统一打码：app 与 core 的行、写盘与面板读出来的都是同一份。
+        let message = crate::redact::line(&message);
         let line = format!("{} [{}] {}\n", clock::hms(), source, message);
         let mut inner = self.lock();
         if inner.size >= HIGH_WATERMARK {
