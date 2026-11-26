@@ -6,6 +6,7 @@
 //! 连接循环的形状与 Go 的 `engine.run` 一致，只是“等退避”换成了 inbox 的
 //! `recv_timeout`：等待期间设置请求、配置下发、core 事件照常处理，退避也不占线程。
 
+use crate::autostart;
 use crate::clock;
 use crate::log::Log;
 use crate::views::{Snapshot, StateCell};
@@ -157,6 +158,9 @@ pub(crate) struct Engine {
     pub(crate) auto_tried: Option<String>,
     pub(crate) launcher_sum: String,
     pub(crate) launcher_tried: Option<String>,
+    /// 开机自启任务是否存在。查询要起一个 `schtasks` 进程，所以缓存起来，由
+    /// [`Engine::refresh_autostart`] 在启动、改动与每轮心跳后刷新。
+    pub(crate) autostart_on: bool,
     pub(crate) identity: IdentityMeta,
     pub(crate) hints: ConfigHints,
     pub(crate) local_ip: String,
@@ -251,6 +255,7 @@ pub fn spawn(
         auto_tried: None,
         launcher_sum,
         launcher_tried: None,
+        autostart_on: false,
         identity: IdentityMeta::default(),
         hints: ConfigHints::default(),
         local_ip: String::new(),
@@ -285,6 +290,7 @@ impl Engine {
         self.logf("app", &format!("客户端启动 {}", self.config.self_version));
         self.clean_update_dir();
         self.refresh_identity();
+        self.refresh_autostart();
         self.publish();
         // 先用磁盘上那份配置把 core 拉起来，再进连接循环：控制面不可达只该让状态
         // 降级，不该把数据面一起停掉。
@@ -485,11 +491,13 @@ impl Engine {
                 let _ = reply.send(result.map(|()| snapshot).map_err(|err| err.to_string()));
                 restart
             }
-            Cmd::SetAutostart(_enabled, reply) => {
-                // 阶段 1 不做：Windows 用任务计划程序（`Mesh Client`），阶段 2 接入。
-                let message = "开机自启在本平台尚未接入（阶段 2）".to_string();
-                self.notify(&message);
-                let _ = reply.send(Err(message));
+            Cmd::SetAutostart(enabled, reply) => {
+                let result = self.set_autostart(enabled);
+                if let Err(err) = &result {
+                    self.notify(&format!("设置开机自启失败: {err}"));
+                }
+                let snapshot = self.snapshot();
+                let _ = reply.send(result.map(|()| snapshot).map_err(|err| err.to_string()));
                 false
             }
             Cmd::ApplyUpdate(reply) => {
@@ -562,6 +570,9 @@ impl Engine {
             self.logf("app", "服务端配置已变更，开始同步");
             self.apply_remote(&res);
         }
+        // 自启状态只在启动、用户改动和这里刷新：快照两秒一次，不可能每次都去起进程。
+        // 用心跳当节拍也顺带接住“任务被组策略或用户从系统里删掉”这种情况。
+        self.refresh_autostart();
         // 心跳通了、core 却没在跑：让主循环重新走一遍 connect，它会补启动 core。
         // 缺凭据就是这一类——凭据只能从心跳里来，重试必须挂在心跳上。
         if !self.core_running() {
@@ -667,6 +678,34 @@ impl Engine {
         // 用一条自己的命令把“重连”插到队尾：调用点遍布各个 handler，直接 return true
         // 会把正在处理的命令处理到一半。
         let _ = self.self_tx.send(Cmd::Reconnect);
+    }
+
+    /// 重读系统里的自启状态。
+    ///
+    /// 查询失败时保留上一次的值：读不出来不等于用户关掉了它，把复选框自己跳回未选中
+    /// 只会让人以为设置丢了。
+    pub(crate) fn refresh_autostart(&mut self) {
+        match autostart::enabled() {
+            Ok(on) => self.autostart_on = on,
+            Err(err) => self.logf("app", &format!("读取开机自启状态失败: {err}")),
+        }
+    }
+
+    /// 打开或关闭开机自启。托盘与面板共用这一条路径。
+    pub(crate) fn set_autostart(&mut self, on: bool) -> Result<(), String> {
+        if on {
+            let launcher = self
+                .config
+                .root
+                .join(mesh_install::platform::launcher_name());
+            autostart::enable(&launcher)?;
+            self.logf("app", "已开启开机自启");
+        } else {
+            autostart::disable()?;
+            self.logf("app", "已关闭开机自启");
+        }
+        self.refresh_autostart();
+        Ok(())
     }
 
     fn notify(&self, message: &str) {

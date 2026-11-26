@@ -15,7 +15,7 @@ use mesh_remote as remote;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// 更新包上限，和启动器里的 200MB 对齐。
 pub(crate) const MAX_UPDATE_BYTES: u64 = 200 << 20;
@@ -25,6 +25,9 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// 与启动器里的 `LIMIT` 一致：两次还是起不来就说明包本身有问题。
 const FAILURE_LIMIT: u32 = 2;
+/// 下载失败后自动重试的次数上限。用完就停下来等人处理，别把日志和发布文件服务
+/// 一起刷满。
+const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
 /// 启动器替换用的临时目录（Go 也叫 `update/`）。
 const UPDATE_DIR: &str = "update";
 
@@ -65,6 +68,10 @@ pub(crate) struct UpdateState {
     pub busy: bool,
     /// 下载完成后是否立刻交接（用户点了安装 / 自动安装）。
     pub apply_after_download: bool,
+    /// 这份 offer 已经失败过几次下载。
+    pub attempts: u32,
+    /// 下一次自动重试的时刻；退避由它算，不额外排定时器：心跳就是节拍。
+    pub retry_at: Option<Instant>,
 }
 
 impl Engine {
@@ -151,6 +158,9 @@ impl Engine {
             && (info.sha256.is_empty() || self.update.sha256.eq_ignore_ascii_case(&info.sha256));
         let settled = matches!(self.update.phase, Phase::Ready | Phase::Failed);
         if settled && same_offer {
+            // 下载失败过的包在退避到期后自动重下一次：发布文件服务短暂不可达时，
+            // 不该让提示永远停在错误上，也不该要求用户自己去点重试。
+            self.retry_failed_download(api);
             return;
         }
         self.update = UpdateState {
@@ -221,10 +231,28 @@ impl Engine {
             Phase::Idle => return Err("没有可安装的更新".to_string()),
         }
         if cfg!(windows) {
-            // 包已经预取到本地；没有本地包说明还在下载或下载失败过。
+            // 包已经预取到本地；没有本地包说明下载失败过或被人删掉了。
+            // 这时重新下一份、下完直接交接——面板上的「重试」走的就是这条路径。
             let path = self.update.path.clone();
             if !path.as_deref().map(Path::is_file).unwrap_or(false) {
-                return Err("更新包不在本地，等下一轮心跳重新下发".to_string());
+                let Some(api) = self.api.clone() else {
+                    return Err("尚未连接服务端，无法下载更新".to_string());
+                };
+                // 用户主动重试：次数重新给满。
+                self.update.attempts = 0;
+                self.update.retry_at = None;
+                self.update.phase = Phase::Downloading;
+                self.update.error.clear();
+                self.update.apply_after_download = true;
+                let version = self.update.version.clone();
+                self.logf("app", &format!("重新下载 {version} 以便安装"));
+                self.spawn_download(
+                    api,
+                    version,
+                    self.update.url.clone(),
+                    self.update.sha256.clone(),
+                );
+                return Ok(());
             }
             self.update.busy = true;
             self.update.apply_after_download = false;
@@ -273,9 +301,49 @@ impl Engine {
                 self.update.phase = Phase::Failed;
                 self.update.error = err.clone();
                 self.update.busy = false;
-                self.logf("app", &format!("下载 {version} 失败: {err}"));
+                self.update.attempts = self.update.attempts.saturating_add(1);
+                self.update.retry_at = Some(Instant::now() + retry_delay(self.update.attempts));
+                self.logf(
+                    "app",
+                    &format!(
+                        "下载 {version} 失败（第 {} 次）: {err}",
+                        self.update.attempts
+                    ),
+                );
             }
         }
+    }
+
+    /// 下载失败且退避到期时重下一次。次数用完就停，错误提示留在界面上等人处理。
+    fn retry_failed_download(&mut self, api: &Arc<remote::Client>) {
+        if self.update.phase != Phase::Failed || self.update.busy || self.update.url.is_empty() {
+            return;
+        }
+        if self.update.attempts >= MAX_DOWNLOAD_ATTEMPTS {
+            return;
+        }
+        if !self
+            .update
+            .retry_at
+            .map(|at| Instant::now() >= at)
+            .unwrap_or(true)
+        {
+            return;
+        }
+        let version = self.update.version.clone();
+        self.update.phase = Phase::Downloading;
+        self.update.error.clear();
+        self.update.retry_at = None;
+        self.logf(
+            "app",
+            &format!("重新下载 {version}（第 {} 次）", self.update.attempts + 1),
+        );
+        self.spawn_download(
+            Arc::clone(api),
+            version,
+            self.update.url.clone(),
+            self.update.sha256.clone(),
+        );
     }
 
     /// 把安装交给启动器，然后退出。
@@ -454,6 +522,14 @@ impl Engine {
             self.logf("app", &message);
         }
     }
+}
+
+/// 第 n 次失败之后多久再试：30s 起步翻倍，最多 10 分钟。
+///
+/// 节拍是心跳（30s 一次），所以这里给的是下限，实际发生时刻在下一轮心跳。
+fn retry_delay(attempts: u32) -> Duration {
+    let shift = attempts.saturating_sub(1).min(5);
+    Duration::from_secs((30u64 << shift).min(600))
 }
 
 /// 下载并校验更新包：落 `.part` → 算摘要 → 改名成固定的 `update.tar.zst`。

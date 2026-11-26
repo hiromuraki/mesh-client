@@ -3,6 +3,7 @@
 //! 这些结构就是面板 JSON 的形状（对应 Go 的 `engine/views.go` 与
 //! `client/frontend/src/api/types.ts`），所以字段名用 camelCase、字段集合逐条对齐。
 
+use crate::autostart;
 use crate::run::{Engine, Status};
 use mesh_etrpc::{Peer, Route};
 use serde::Serialize;
@@ -142,9 +143,8 @@ impl Engine {
             update_version: self.update.version.clone(),
             update_notes: self.update.notes.clone(),
             update_error: self.update.error.clone(),
-            // 阶段 1 不做开机自启（Windows schtasks 在阶段 2 接入）。
-            autostart_supported: false,
-            autostart_enabled: false,
+            autostart_supported: autostart::SUPPORTED,
+            autostart_enabled: self.autostart_on,
         };
         if let Some(core) = self.core.as_ref() {
             snapshot.core_pid = core.pid;

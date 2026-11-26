@@ -3,14 +3,14 @@
 用 Rust 重写 Mesh 客户端的 workspace。方案见 [PLAN.md](PLAN.md)，模块划分、并发模型与
 错误分层见 [MODULES.md](MODULES.md)；本文件只写“怎么用、现在到哪一步、跟文档差在哪”。
 
-当前是 **PLAN.md 阶段 1 完成**：九个 crate 全部有实现。`install`/`state`/`remote`/`etrpc`
-（阶段 0）、`core`、`engine`（连接循环、注册、心跳、配置下发与写盘、core 重启判定、401 三支、
-更新下载与交接）都已落地；`panel` 是本地面板（回环监听、guard、静态资源与 SPA 兜底、
-10 个 `/api` 路由、仪表盘 2 秒缓存），`client` 是进程壳（CLI、单实例、线程装配、headless、
-Windows 托盘）。
+当前是 **PLAN.md 阶段 1 完成、阶段 2 的 Windows 侧已补齐**：九个 crate 全部有实现。
+`install`/`state`/`remote`/`etrpc`（阶段 0）、`core`、`engine`（连接循环、注册、心跳、
+配置下发与写盘、core 重启判定、401 三支、更新下载与交接、开机自启）都已落地；`panel`
+是本地面板（回环监听、guard、静态资源与 SPA 兜底、10 个 `/api` 路由、仪表盘 2 秒缓存），
+`client` 是进程壳（CLI、单实例、线程装配、headless、Windows 托盘）。
 
-**还没有做的**：Windows 开机自启（schtasks 的 `Mesh Client` 任务，阶段 2）、Windows 桌面
-形态的真机验证（托盘/UAC 只能人工核对）、发布脚本里的 `cargo` 分支。
+**还没有做的**：Windows 桌面形态的真机验证（托盘/UAC/自启任务只能人工核对）、发布脚本里的
+`cargo` 分支。
 
 ## 构建与测试
 
@@ -19,7 +19,7 @@ Windows 托盘）。
 ```powershell
 cargo build                     # 整个 workspace（面板要 client/frontend/dist，见下）
 cargo build --examples -p mesh-core   # 引擎/core 的用例要它当假 core，先编一次
-cargo test                      # 全部单测（当前 188 个）
+cargo test                      # 全部单测（当前 206 个）
 cargo clippy --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -123,7 +123,7 @@ registry = "sparse+https://rsproxy.cn/index/"
   `StartFailed`，不留孤儿。
 - 事件带 `gen`，引擎据此忽略“我主动停掉的那一代”的迟到事件。
 
-**`mesh-engine`（主干；开机自启留阶段 2）**
+**`mesh-engine`（主干）**
 
 - 连接循环：读 `client.json` → 一次心跳（服务端哈希不一致就随响应下发整份配置）→ 应用配置
   → 起 core → 订阅心跳。连接失败按 10s→×1.5→60s 退避，退避期间照常处理命令
@@ -138,7 +138,11 @@ registry = "sparse+https://rsproxy.cn/index/"
 - 身份与凭据：上报 core **实际加载**的那张凭据（F1）；正式节点报空串；换凭据才重启 core。
 - 更新：`offer_update` 校验版本号/不比当前新/失败计数；Windows 先预取到 `update.tar.zst.part`
   → 校验摘要 → 改名成 `update.tar.zst`；Unix 在用户点安装时下载再交接；**服务端没给摘要一律
-  拒绝**；失败态保留到换版本或用户重试。启动器另走一路（比摘要、只试一次）。
+  拒绝**。启动器另走一路（比摘要、只试一次）。
+- 下载失败会自动重试：失败态保留，`attempts` 计数，退避 30s 起翻倍（最多 10 分钟、共 5 次），
+  到期由下一轮心跳驱动重下——不另排定时器，心跳就是节拍。次数用完就停下来等人处理，
+  错误行留在界面上。面板上失败态的「重试」走 `apply_update`：本地没有包时它重新下一份、
+  下完直接交接，所以“重试”在“包没下完”和“包已下好但安装失败”两种失败上都成立。
 
 ### 心跳里的更新载荷瘦身（`appUpdateKnown` / `unchanged`）
 
@@ -195,7 +199,7 @@ registry = "sparse+https://rsproxy.cn/index/"
 | `GET /api/logs` | `GET/HEAD /api/logs?lines=N` | `logs_rejects_invalid_line_counts`、`logs_returns_the_file_tail_and_events_filter_app_lines` |
 | `GET /api/events` | `GET/HEAD /api/events?lines=N` | `logs_returns_the_file_tail_and_events_filter_app_lines` |
 | `PUT /api/settings` | `PUT /api/settings`（64KiB 上限） | `settings_are_forwarded_to_the_engine`、`settings_rejects_bad_json_and_too_large_bodies`、`settings_report_the_engine_error_as_400` |
-| `PUT /api/autostart` | `PUT /api/autostart`（4KiB 上限） | `autostart_is_forwarded_and_errors_are_400`（引擎仍回“阶段 2”，见偏差 18/28） |
+| `PUT /api/autostart` | `PUT /api/autostart`（4KiB 上限） | `autostart_is_forwarded_and_errors_are_400`（引擎的拒绝在非 Windows 上，见偏差 18） |
 | `POST /api/reset` | `POST /api/reset`（引擎失败 → 500） | `reset_maps_engine_failure_to_500` |
 | `POST /api/update` | `POST /api/update`（等回复 ≤1s，见偏差 24） | `update_returns_the_snapshot_when_the_engine_exits_before_replying`、`update_reports_an_immediate_engine_error` |
 | `POST /api/reconnect` | `POST /api/reconnect` → 204 | `reconnect_is_204_and_sends_the_command` |
@@ -230,13 +234,20 @@ Start-Sleep 3; Get-Content "$root\config\ui.json"
 - `--boot-check` 标记：引擎与面板就位后写 `.boot-ok-<标记>`，写不进去只打 stderr。
 - headless：每 300ms 把日志新增的完整行抄到控制台；SIGTERM/SIGINT 正常退出；身份失效
   （状态停在 `unconfigured`）按 Go 的同一句话报错退出。
-- Windows 桌面：手写 Win32 托盘（`Shell_NotifyIconW` + 隐藏窗口消息泵），菜单五项
-  （应用可更新 / 本机地址 / 打开面板 / 打开应用目录 / 退出），explorer 重启后按
-  `TaskbarCreated` 重建图标。图标是 PNG 压缩的 .ico，用 `LoadImageW` 读临时文件（与 Go 的
-  systray 同一做法）。浏览器与资源管理器都经 `explorer.exe` 转发（见偏差 27）。
+- Windows 桌面：手写 Win32 托盘（`Shell_NotifyIconW` + 隐藏窗口消息泵），菜单六项
+  （应用可更新 / 本机地址 / 打开面板 / 打开应用目录 / 开机自启 / 退出）。explorer 重启后按
+  `TaskbarCreated` 重建图标；开机时客户端常比 explorer 先起来，那时 `NIM_ADD` 会返回 FALSE，
+  所以加图标失败要每 500ms 重试（最多一分钟）。`CALLBACK_MESSAGE` 与 `TaskbarCreated` 经
+  `ChangeWindowMessageFilterEx` 放行：客户端是最高权限进程，explorer 是中等完整性，不放行
+  就会「图标看得见、点下去没反应」。图标是 PNG 压缩的 .ico，用 `LoadImageW` 读临时文件
+  （与 Go 的 systray 同一做法）。浏览器与资源管理器都经 `explorer.exe` 转发（见偏差 27）。
+- 开机自启（仅 Windows）：任务计划程序里的 `Mesh Client`——登录触发、`HighestAvailable`、
+  `ExecutionTimeLimit=PT0S`，UTF-16 XML 交给 `schtasks /Create`；目标是安装根的 `mesh.exe`，
+  不是 `bin/` 里的主程序。状态以系统里有没有这条任务为准，缓存在引擎里，只在启动、用户改动
+  与每轮心跳之后刷新（查询要起一个进程，快照 2 秒一次扛不住）。其它平台没有这个能力，
+  快照的 `autostartSupported` 恒为 `false`，面板与托盘都不显示入口。
 
-**这一轮没做**：Windows 开机自启（schtasks 的 `Mesh Client` 任务，阶段 2；`Cmd::SetAutostart`
-仍返回“尚未接入”）；Windows 桌面形态的真机验证（托盘、UAC 只能人工核对）；
+**这一轮没做**：Windows 桌面形态的真机验证（托盘、UAC、自启任务只能人工核对）；
 发布脚本（`build/*.ps1`）里的 `cargo` 分支。
 
 ## 阶段 1 真机验收（wsl）
@@ -323,8 +334,12 @@ Start-Sleep 3; Get-Content "$root\config\ui.json"
     与 `time.Now().Format("15:04:05")` 一致；引 `chrono` 会拖进时区数据库。
     反过来 `serde_json`/`thiserror` 删掉了：失败计数与清单解析都在 `mesh-install`，引擎的
     错误一律是给用户看的一句话。
-18. **`Cmd::SetAutostart` 阶段 1 直接返回错误**（“开机自启在本平台尚未接入（阶段 2）”），
-    快照里 `autostartSupported` 恒为 `false`。接口先占位，面板先把开关的显示条件接上。
+18. **开机自启走 `schtasks` 子进程，不接 Task Scheduler 的 COM 接口**：一共三条命令
+    （建、删、查），`schtasks` 是系统自带、行为稳定的那个入口；COM 要多一整层 vtable 声明
+    与内存管理，换不来可见收益。任务名、触发器、`RunLevel`、`ExecutionTimeLimit` 是现场
+    排障时的事实来源，`schtasks /Query` 直接能看。
+    `schtasks` 按控制台代码页输出（中文系统是 GBK），报错文本用 `MultiByteToWideChar(CP_ACP)`
+    解回来再进日志与消息框，否则整段都是替换符。
 19. **`build_nodes` 的 `path` 用空数组而不是 Go 的 `null`**（直连时 Go 的 nil slice 序列化成
     `null`，而 `types.ts` 写的是 `Hop[]`）；日志的 `count` 与 Go 一致：单条是 `1`，只省略 `0`
     ——MODULES.md 3.7 说“count 为 1 时必须省略”，与 Go 和前端注释都对不上，按后两者实现。
@@ -350,9 +365,9 @@ Start-Sleep 3; Get-Content "$root\config\ui.json"
 27. **打开浏览器/目录用 `explorer.exe` 转发**，不是 MODULES.md 列的 `windows` crate +
     `IShellDispatch`。explorer 是中等完整性的 shell 代理，效果与 COM 路径相同，少一个重量级
     依赖与一套 vtable 绑定。真机验证时若 UIPI 仍然挡，再补 COM 实现。
-28. **托盘没有“开机自启”勾选项**：schtasks 实现留给阶段 2（`Cmd::SetAutostart` 仍返回错误、
-    快照 `autostartSupported=false`，设置页也不会显示开关）。Go 的托盘有这一项；阶段 2 接上
-    引擎能力后两边一起加。
+28. **托盘的自启勾选项不做乐观更新**：点击后在后台线程等引擎回复，成功了才改勾选状态；
+    失败由引擎的 `Notice` 弹框，勾选最终由 2 秒一次的同步线程按快照对齐。Go 是同步调用
+    `SetAutostart` 成功后立刻 `Check()`，用户看到的结果一样。
 29. **Windows 资源只在 release 里编**（图标、`requireAdministrator` 清单、VERSIONINFO）：
     debug 的 `mesh-client.exe` 不需要 UAC，测试二进制也不会因为 SxS 起不来——与启动器
     `build.rs` 同一取舍。运行时版本始终来自 `bin/version.json`；`MESH_VERSION` 只进
@@ -389,9 +404,9 @@ Start-Sleep 3; Get-Content "$root\config\ui.json"
 4. MODULES.md 3.7 说日志 `count` 为 1 时必须省略、3.5 说 `spawn(events: Sender<Event>)`，
    都与 Go 实现/前端类型不符，见上一节第 19、16 条。
 
-## 下一轮（阶段 2：Windows 桌面）
+## 下一轮
 
-**已经就位的接口**（本轮由 client 用起来的，阶段 2 不用改）：
+**已经就位的接口**（以下都由 client 用起来了）：
 
 | 接口 | 用途 |
 | --- | --- |
@@ -403,15 +418,13 @@ Start-Sleep 3; Get-Content "$root\config\ui.json"
 | `build_nodes(peers, routes, LocalNode)` | 面板仪表盘拼行；查询与 2 秒缓存由面板自己做 |
 | `Shutdown::register(fn)` / `run()` / `run_and_exit(code)` | 唯一的退出路径；托盘退出、`/api/quit`、SIGTERM、更新交接都走它 |
 
-**阶段 2 要做的**：
+**剩下的**：
 
-1. **开机自启**：`mesh_engine` 里补 `cmd/autostart`（Windows schtasks `Mesh Client`：登录触发、
-   HighestAvailable、`ExecutionTimeLimit=PT0S`、UTF-16 XML），`Cmd::SetAutostart` 变成真的，
-   快照的 `autostartSupported/autostartEnabled` 跟着刷新；托盘把那行勾选项加回来。
-   任务 XML 与判据照 `client/internal/autostart/autostart_windows.go`，单元测试可以只测
-   XML 生成（不真跑 schtasks）。
-2. **真机验证 Windows 桌面形态**：托盘消息泵、`TaskbarCreated` 重建、菜单在提权进程下的行为、
-   UAC 与 `explorer.exe` 转发打开浏览器、`/api/quit` 与托盘退出都能带走 core。这一条只能
-   人工核对（本机在跑的 Go 客户端占着 11020，Rust 版要装到另一个安装根 / 另一台设备）。
-3. **发布链路**：`build/*.ps1` 增加 `cargo` 分支（`MESH_VERSION` 注入、产物拷到 `dist/bin`、
+1. **真机验证 Windows 桌面形态**：托盘消息泵、`TaskbarCreated` 重建、`ChangeWindowMessageFilterEx`
+   放行后在提权进程下点击是否真的有效、UAC 与 `explorer.exe` 转发打开浏览器、开机自启任务的
+   创建与删除、`/api/quit` 与托盘退出都能带走 core。这一条只能人工核对（本机在跑的 Go 客户端
+   占着 11020，Rust 版要装到另一个安装根 / 另一台设备）。
+   `schtasks /Create` 需要管理员：任务本身是 `HighestAvailable`，非提权进程建不了，这一点与
+   「客户端必须以管理员运行」一致，不算缺陷。
+2. **发布链路**：`build/*.ps1` 增加 `cargo` 分支（`MESH_VERSION` 注入、产物拷到 `dist/bin`、
    `bin/version.json` 由打包脚本生成），以及 `client-rust` 在阶段 3 顶替 `client/` 时的目录改名。

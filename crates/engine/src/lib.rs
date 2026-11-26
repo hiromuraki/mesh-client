@@ -10,6 +10,7 @@
 //! 阶段 1 只做主干：连接循环、注册、心跳、配置下发与写盘、core 重启判定、401 三支、
 //! 更新下载与交接。开机自启（Windows schtasks）、面板、托盘在后续阶段接入。
 
+mod autostart;
 mod clock;
 mod coreline;
 mod log;

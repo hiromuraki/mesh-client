@@ -17,10 +17,14 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
 
-# 本地时间（日志时间列，Go 用 time.Now().Format("15:04:05")）与 Unix 上的进程信号。
-# 自启的 schtasks 在阶段 2 接入，那时这里再加 Win32_UI_Shell 之类的位。
+# 本地时间（日志时间列，Go 用 time.Now().Format("15:04:05")）与 Unix 上的进程信号；
+# Win32_Globalization 是自启模块解 schtasks 输出用的（它按控制台代码页输出）。
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_SystemInformation",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

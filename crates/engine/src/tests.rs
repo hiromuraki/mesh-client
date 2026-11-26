@@ -31,6 +31,9 @@ pub(crate) enum Recorded {
 pub(crate) struct Harness {
     pub engine: Engine,
     pub core: Receiver<Recorded>,
+    /// 用户动作失败的通知。目前只有非 Windows 的自启测试读它：Windows 上那条路径
+    /// 会真的改系统，测试不碰。
+    #[cfg_attr(windows, allow(dead_code))]
     pub notices: Receiver<Notice>,
     pub dir: PathBuf,
 }
@@ -103,6 +106,7 @@ fn harness(tag: &str) -> Harness {
         auto_tried: None,
         launcher_sum: String::new(),
         launcher_tried: None,
+        autostart_on: false,
         identity: Default::default(),
         hints: Default::default(),
         local_ip: String::new(),
@@ -546,14 +550,18 @@ fn the_engine_thread_starts_publishes_and_exits() {
 
 // ------------------------------------------------------------ 用户动作
 
+// 真建一条 `Mesh Client` 任务会改掉跑测试的这台机器的开机行为，所以成功的
+// SetAutostart 只在真机验收里走，单元测试只覆盖两个平台各自能安全覆盖的那一半。
+
+#[cfg(not(windows))]
 #[test]
-fn autostart_reports_that_it_is_not_available_yet() {
+fn autostart_reports_a_missing_capability() {
     let mut harness = harness("autostart");
     let (reply_tx, reply_rx) = channel();
     let restart = harness.engine.handle(Cmd::SetAutostart(true, reply_tx));
     assert!(!restart, "自启失败不该触发重连");
     let reply = reply_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    assert!(reply.is_err(), "阶段 1 还没有自启能力");
+    assert!(reply.is_err(), "非 Windows 上没有自启能力");
     match harness
         .notices
         .recv_timeout(Duration::from_secs(5))
@@ -563,6 +571,16 @@ fn autostart_reports_that_it_is_not_available_yet() {
             assert!(message.contains("开机自启"), "message = {message}")
         }
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn autostart_is_reported_as_supported() {
+    let harness = harness("autostart");
+    assert!(
+        harness.engine.snapshot().autostart_supported,
+        "Windows 上快照要如实报告这项能力，否则面板与托盘都不会出现入口"
+    );
 }
 
 // ------------------------------------------------------------ 心跳
@@ -685,28 +703,114 @@ fn an_invalid_version_is_ignored_before_downloading() {
     assert_ne!(harness.engine.update.phase, Phase::Idle);
 }
 
+/// 一次已经失败、正在退避中的下载。
+fn failed_download(harness: &mut Harness, attempts: u32, retry_in: i64) {
+    harness.engine.update.phase = Phase::Failed;
+    harness.engine.update.error = "下载中断".to_string();
+    harness.engine.update.attempts = attempts;
+    harness.engine.update.retry_at = Some(if retry_in >= 0 {
+        Instant::now() + Duration::from_secs(retry_in as u64)
+    } else {
+        Instant::now() - Duration::from_secs((-retry_in) as u64)
+    });
+}
+
 #[test]
-fn a_failure_is_kept_until_the_version_changes() {
+fn a_failure_is_kept_until_the_backoff_expires() {
     let mut harness = harness("update-failure");
     let key = harness.engine.store.signing_key().unwrap();
     let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
     harness
         .engine
         .offer_update(&api, Some(&update_info("2026.11.26-2")));
-    harness.engine.update.phase = Phase::Failed;
-    harness.engine.update.error = "下载中断".to_string();
-    // 同一个版本：心跳不能把失败态抹成“已就绪”。
+    failed_download(&mut harness, 1, 30);
+    // 退避还没到：心跳既不能把失败态抹成“已就绪”，也不能抢着重下。
     harness
         .engine
         .offer_update(&api, Some(&update_info("2026.11.26-2")));
     assert_eq!(harness.engine.update.phase, Phase::Failed);
     assert_eq!(harness.engine.update.error, "下载中断");
-    // 换版本：失败态重置。
+}
+
+#[test]
+fn a_failed_download_is_retried_once_the_backoff_expires() {
+    let mut harness = harness("update-retry");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    harness
+        .engine
+        .offer_update(&api, Some(&update_info("2026.11.26-2")));
+    failed_download(&mut harness, 1, -1);
+    harness
+        .engine
+        .offer_update(&api, Some(&update_info("2026.11.26-2")));
+    assert_eq!(harness.engine.update.phase, Phase::Downloading);
+    assert!(harness.engine.update.error.is_empty(), "重试时错误行要清掉");
+}
+
+#[test]
+fn downloading_gives_up_after_the_attempt_limit() {
+    let mut harness = harness("update-give-up");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    harness
+        .engine
+        .offer_update(&api, Some(&update_info("2026.11.26-2")));
+    failed_download(&mut harness, 5, -1);
+    harness
+        .engine
+        .offer_update(&api, Some(&update_info("2026.11.26-2")));
+    assert_eq!(
+        harness.engine.update.phase,
+        Phase::Failed,
+        "次数用完就该停下来等人处理，不能一直刷发布文件服务"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_missing_package_is_downloaded_again_when_the_user_asks_to_apply() {
+    let mut harness = harness("update-redownload");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    harness
+        .engine
+        .offer_update(&api, Some(&update_info("2026.11.26-2")));
+    harness.engine.api = Some(Arc::clone(&api));
+    // 下载失败之后的状态：没有本地包。面板上的“重试”就是在这个状态上点的。
+    failed_download(&mut harness, 1, 30);
+    harness.engine.update.path = None;
+    let result = harness.engine.apply_update();
+    assert!(result.is_ok(), "点重试要重新下一份，而不是报“包不在本地”");
+    assert_eq!(harness.engine.update.phase, Phase::Downloading);
+    assert!(
+        harness.engine.update.apply_after_download,
+        "用户点了重试，下完就该直接装"
+    );
+    assert_eq!(
+        harness.engine.update.attempts, 0,
+        "用户主动重试要把次数还回来"
+    );
+}
+
+#[test]
+fn a_new_version_resets_the_failure() {
+    let mut harness = harness("update-new-version");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    harness
+        .engine
+        .offer_update(&api, Some(&update_info("2026.11.26-2")));
+    failed_download(&mut harness, 3, 60);
     harness
         .engine
         .offer_update(&api, Some(&update_info("2026.11.26-3")));
     assert_eq!(harness.engine.update.version, "2026.11.26-3");
     assert_ne!(harness.engine.update.phase, Phase::Failed);
+    assert_eq!(
+        harness.engine.update.attempts, 0,
+        "换版本要重新给满重试次数"
+    );
 }
 
 #[test]

@@ -9,7 +9,7 @@
 use crate::{platform, APP_TITLE};
 use mesh_engine::{Cmd, StateCell};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -20,12 +20,12 @@ use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetMessageW, LoadImageW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu, TranslateMessage, HICON, HMENU,
-    IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG,
-    TPM_RIGHTBUTTON, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
-    WNDCLASSEXW,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, LoadImageW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetForegroundWindow, TrackPopupMenu,
+    TranslateMessage, HICON, HMENU, IMAGE_ICON, LR_DEFAULTSIZE, LR_LOADFROMFILE, MF_CHECKED,
+    MF_GRAYED, MF_SEPARATOR, MF_STRING, MSG, MSGFLT_ALLOW, TPM_RIGHTBUTTON, WM_APP, WM_COMMAND,
+    WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSEXW,
 };
 
 /// 托盘图标的字节（Go 的 client/build/windows/tray.ico，构建期嵌进来）。
@@ -38,6 +38,7 @@ const CALLBACK_MESSAGE: u32 = WM_APP + 1;
 const ID_UPDATE: usize = 1;
 const ID_PANEL: usize = 2;
 const ID_DIR: usize = 3;
+const ID_AUTOSTART: usize = 5;
 const ID_QUIT: usize = 4;
 /// 地址那一行不可点，id 只用于 AppendMenuW 占位。
 const ID_ADDRESS: usize = 10;
@@ -58,6 +59,9 @@ struct Context {
     root: PathBuf,
     quit: Arc<dyn Fn() + Send + Sync>,
     model: Mutex<Model>,
+    /// 开机自启的勾选状态。单独放一个原子量而不是塞进 Model：点击的处理在别的
+    /// 线程里，改完要立刻被下一次右键读到。
+    autostart: AtomicBool,
     tooltip: String,
     icon: AtomicIsize,
     taskbar_created: u32,
@@ -79,6 +83,8 @@ pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
     let icon = load_tray_icon(TRAY_ICON)?;
     let taskbar_created =
         unsafe { RegisterWindowMessageW(platform::wide("TaskbarCreated").as_ptr()) };
+    // 初值取快照：开机自启已经开着时，第一帧菜单就该是勾上的。
+    let autostart = options.cell.get().snapshot.autostart_enabled;
     let context = Arc::new(Context {
         cell: options.cell,
         tx: Mutex::new(options.tx),
@@ -86,6 +92,7 @@ pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
         root: options.root,
         quit: options.quit,
         model: Mutex::new(Model::default()),
+        autostart: AtomicBool::new(autostart),
         tooltip: format!("{APP_TITLE} {}", options.version),
         icon: AtomicIsize::new(icon as isize),
         taskbar_created,
@@ -145,7 +152,8 @@ pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
         .name("mesh-tray-watch".to_string())
         .spawn(move || watch_state(&watcher))
         .map_err(|err| format!("启动托盘同步线程失败: {err}"))?;
-    add_icon(&context, hwnd);
+    allow_shell_messages(hwnd, taskbar_created);
+    add_icon_with_retry(Arc::clone(&context), hwnd as usize);
 
     let mut message: MSG = unsafe { std::mem::zeroed() };
     loop {
@@ -171,6 +179,10 @@ fn watch_state(context: &Context) {
             model.update_state = snapshot.update_state;
             model.update_version = snapshot.update_version;
         }
+        // 面板里改过之后也走这里同步，两个入口永远显示同一个状态。
+        context
+            .autostart
+            .store(snapshot.autostart_enabled, Ordering::SeqCst);
         thread::sleep(Duration::from_secs(2));
     }
 }
@@ -184,9 +196,12 @@ unsafe extern "system" fn window_proc(
     let Some(context) = CONTEXT.get() else {
         return DefWindowProcW(hwnd, message, wparam, lparam);
     };
-    // explorer 重启后系统广播 TaskbarCreated：图标要重新加一遍。
+    // explorer 重启后系统广播 TaskbarCreated：图标要重新加一遍。任务栏可能还没就绪，
+    // 加不上就走重试线程。
     if message == context.taskbar_created {
-        add_icon(context, hwnd);
+        if !add_icon(context, hwnd) {
+            add_icon_with_retry(Arc::clone(context), hwnd as usize);
+        }
         return 0;
     }
     match message {
@@ -209,7 +224,21 @@ unsafe extern "system" fn window_proc(
     }
 }
 
-fn add_icon(context: &Context, hwnd: HWND) {
+/// 放行来自 shell 的窗口消息。
+///
+/// 客户端以「最高权限」运行（建 TUN 要管理员），explorer 是中等完整性：UIPI 默认
+/// 会把它的消息挡在门外——图标看得见、点下去没反应，explorer 重启之后也收不到
+/// TaskbarCreated，图标就再也回不来。
+fn allow_shell_messages(hwnd: HWND, taskbar_created: u32) {
+    for message in [CALLBACK_MESSAGE, taskbar_created] {
+        unsafe {
+            ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, std::ptr::null_mut());
+        }
+    }
+}
+
+/// 把图标交给任务栏。返回 false 表示这次没加上（任务栏还没就绪）。
+fn add_icon(context: &Context, hwnd: HWND) -> bool {
     let mut data: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
     data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
     data.hWnd = hwnd;
@@ -218,9 +247,25 @@ fn add_icon(context: &Context, hwnd: HWND) {
     data.uCallbackMessage = CALLBACK_MESSAGE;
     data.hIcon = context.icon.load(Ordering::SeqCst) as HICON;
     fill_tip(&mut data.szTip, &context.tooltip);
-    unsafe {
-        Shell_NotifyIconW(NIM_ADD, &data);
-    }
+    unsafe { Shell_NotifyIconW(NIM_ADD, &data) != 0 }
+}
+
+/// 开机时客户端常常比 explorer 先起来：那时任务栏还没建好，`NIM_ADD` 直接返回
+/// FALSE，图标就再也不会出现。失败要重试，直到加上或一分钟过去。
+///
+/// `hwnd` 走 usize：HWND 是裸指针，不是 Send，但窗口本身属于消息泵那个线程，
+/// 别的线程只拿它的值调 Shell_NotifyIconW 与 ChangeWindowMessageFilterEx。
+fn add_icon_with_retry(context: Arc<Context>, hwnd: usize) {
+    let _ = thread::Builder::new()
+        .name("mesh-tray-icon".to_string())
+        .spawn(move || {
+            for _ in 0..120 {
+                if add_icon(&context, hwnd as HWND) {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        });
 }
 
 fn remove_icon(hwnd: HWND) {
@@ -269,6 +314,14 @@ fn show_menu(context: &Context, hwnd: HWND) {
     append(menu, MF_SEPARATOR, 0, "");
     append(menu, MF_STRING, ID_PANEL, "打开面板");
     append(menu, MF_STRING, ID_DIR, "打开应用目录");
+    append(menu, MF_SEPARATOR, 0, "");
+    // 自启只在 Windows 桌面形态下有意义：Linux 上客户端由 systemd 拉起。
+    let checked = if context.autostart.load(Ordering::SeqCst) {
+        MF_CHECKED
+    } else {
+        0
+    };
+    append(menu, MF_STRING | checked, ID_AUTOSTART, "开机自启");
     append(menu, MF_SEPARATOR, 0, "");
     append(menu, MF_STRING, ID_QUIT, "退出");
 
@@ -329,6 +382,28 @@ fn on_command(context: &Arc<Context>, raw: usize) {
                     .spawn(move || {
                         let (reply, _reply_rx) = std::sync::mpsc::channel();
                         let _ = tx.send(Cmd::ApplyUpdate(reply));
+                    });
+            }
+        }
+        ID_AUTOSTART => {
+            // 不在消息泵里等回复（引擎可能正忙），也不先改勾选状态：改成功才写，
+            // 失败由引擎的 Notice 弹框，菜单保持原状。
+            let context = Arc::clone(context);
+            let on = !context.autostart.load(Ordering::SeqCst);
+            let tx = context.tx.lock().ok().map(|tx| tx.clone());
+            if let Some(tx) = tx {
+                let _ = thread::Builder::new()
+                    .name("mesh-tray-autostart".to_string())
+                    .spawn(move || {
+                        let (reply, reply_rx) = std::sync::mpsc::channel();
+                        if tx.send(Cmd::SetAutostart(on, reply)).is_err() {
+                            return;
+                        }
+                        if let Ok(Ok(snapshot)) = reply_rx.recv() {
+                            context
+                                .autostart
+                                .store(snapshot.autostart_enabled, Ordering::SeqCst);
+                        }
                     });
             }
         }
