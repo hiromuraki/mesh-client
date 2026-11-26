@@ -208,7 +208,11 @@ jobs:
           version: '35.1'
           repo-token: ${{ github.token }}
 
+      # 这个 action 默认把 RUSTFLAGS 设成 -D warnings；上游代码本身带几条 warning，
+      # 不是我们的改动引入的，所以显式清空。
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
 
       - uses: Swatinem/rust-cache@v2
         with:
