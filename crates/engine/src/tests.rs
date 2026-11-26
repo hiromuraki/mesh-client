@@ -646,12 +646,17 @@ fn a_heartbeat_401_does_not_clear_the_identity_on_the_first_strike() {
 
 // ------------------------------------------------------------ 更新
 
+/// 合法的完整摘要（64 位十六进制）。发布链要求摘要必填，测试里的 offer 必须带它。
+fn digest(tag: u8) -> String {
+    format!("{tag:02x}").repeat(32)
+}
+
 fn update_info(version: &str) -> remote::UpdateInfo {
     remote::UpdateInfo {
         version: version.to_string(),
         url: "http://127.0.0.1:1/pkg.tar.zst".to_string(),
         notes: String::new(),
-        sha256: "ab".to_string(),
+        sha256: digest(0xab),
         auto_update: false,
         unchanged: false,
     }
@@ -849,7 +854,7 @@ fn a_full_offer_is_reported_in_the_next_heartbeat() {
         .engine
         .offer_update(&api, Some(&update_info("2026.11.26-2")));
     // 完整响应把摘要记进内存：下一轮心跳据此告诉服务端“我手上是这一份”。
-    assert_eq!(beat_known(&harness).as_deref(), Some("ab"));
+    assert_eq!(beat_known(&harness).as_deref(), Some(digest(0xab).as_str()));
 }
 
 #[test]
@@ -857,7 +862,7 @@ fn a_slim_offer_keeps_the_offer_and_does_not_download() {
     let mut harness = harness("known-slim");
     let key = harness.engine.store.signing_key().unwrap();
     let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
-    harness.engine.update = ready_offer("2026.11.26-2", "ab");
+    harness.engine.update = ready_offer("2026.11.26-2", &digest(0xab));
     harness.engine.auto_update = false;
     harness
         .engine
@@ -871,7 +876,7 @@ fn a_slim_offer_keeps_the_offer_and_does_not_download() {
         harness.engine.update.url,
         "http://127.0.0.1:1/2026.11.26-2.tar.zst"
     );
-    assert_eq!(harness.engine.update.sha256, "ab");
+    assert_eq!(harness.engine.update.sha256, digest(0xab));
     assert!(harness.engine.update.path.is_some());
     assert!(!harness.engine.update.busy);
     // ② 不触发下载：Windows 的完整分支会把它改成 Downloading，这里必须还是 Ready。
@@ -879,7 +884,7 @@ fn a_slim_offer_keeps_the_offer_and_does_not_download() {
     // ③ 只把开关更新掉（管理员可能刚改过设备级覆盖）。
     assert!(harness.engine.auto_update);
     // ④ 下一轮心跳仍然报同一份摘要：known 派生自 offer 的 sha，不受 phase 影响。
-    assert_eq!(beat_known(&harness).as_deref(), Some("ab"));
+    assert_eq!(beat_known(&harness).as_deref(), Some(digest(0xab).as_str()));
 }
 
 #[test]
@@ -920,19 +925,19 @@ fn a_republished_version_replaces_the_offer() {
     let mut harness = harness("known-republish");
     let key = harness.engine.store.signing_key().unwrap();
     let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
-    harness.engine.update = ready_offer("2026.11.26-2", "aaaa");
+    harness.engine.update = ready_offer("2026.11.26-2", &digest(0xaa));
     // 同一版本号重新发布：内容变了，摘要不同就是新的一份，必须换掉而不是按“同版本”跳过。
     let mut info = update_info("2026.11.26-2");
-    info.sha256 = "bbbb".to_string();
+    info.sha256 = digest(0xbb);
     info.url = "http://127.0.0.1:1/new.tar.zst".to_string();
     harness.engine.offer_update(&api, Some(&info));
-    assert_eq!(harness.engine.update.sha256, "bbbb");
+    assert_eq!(harness.engine.update.sha256, digest(0xbb));
     assert_eq!(harness.engine.update.url, "http://127.0.0.1:1/new.tar.zst");
     // 同一版本、同一摘要：还按“手上就是它”跳过，不反复重下。
     let before = harness.engine.update.phase;
     harness.engine.offer_update(&api, Some(&info));
     assert_eq!(harness.engine.update.phase, before);
-    assert_eq!(harness.engine.update.sha256, "bbbb");
+    assert_eq!(harness.engine.update.sha256, digest(0xbb));
 }
 
 #[test]
@@ -1111,4 +1116,18 @@ fn a_mismatched_digest_is_refused() {
         crate::update::download_update(&api, &harness.dir, &stub.url, &"0".repeat(64)).unwrap_err();
     assert!(err.contains("包摘要不符"), "err = {err}");
     assert!(!harness.dir.join("update.tar.zst").exists());
+}
+/// 摘要必填：没有完整摘要的 offer 不下载、不提示，也不覆盖手上已有的那份。
+#[test]
+fn an_offer_without_a_full_digest_is_ignored() {
+    let mut harness = harness("update-bad-digest");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    for bad in ["", "ab", &digest(0xab)[..63]] {
+        let mut info = update_info("2026.11.26-9");
+        info.sha256 = bad.to_string();
+        harness.engine.offer_update(&api, Some(&info));
+        assert_eq!(harness.engine.update.phase, Phase::Idle, "digest = {bad:?}");
+        assert!(harness.engine.update.version.is_empty(), "digest = {bad:?}");
+    }
 }

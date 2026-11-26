@@ -74,6 +74,12 @@ pub(crate) struct UpdateState {
     pub retry_at: Option<Instant>,
 }
 
+/// 64 位十六进制的完整 sha256。发布链用「摘要来自控制面、内容来自任意地址」这一对
+/// 判据确认包没被换过，所以两边都必须是完整摘要。
+fn is_full_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
 impl Engine {
     /// 下一轮心跳要上报的「我手上是哪一份发布包」。
     ///
@@ -148,14 +154,22 @@ impl Engine {
             self.logf("app", &format!("更新地址不是绝对地址: {:?}", info.url));
             return;
         }
+        // 摘要必填：没有摘要就证明不了下载到的包就是发布的那一份，这种 offer 不接。
+        // 服务端每次发布都会现算完整摘要，缺失只说明对面不是我们以为的控制面。
+        if !is_full_digest(&info.sha256) {
+            self.logf(
+                "app",
+                &format!("忽略 {}：服务端没有给出可用的包摘要", info.version),
+            );
+            return;
+        }
         // 正在下载/交接：这份状态由下载线程独占，心跳不要碰。
         if self.update.busy || self.update.phase == Phase::Downloading {
             return;
         }
-        // 同一个版本号重新发布时内容会变，所以“是不是同一份 offer”看摘要，不看版本号：
-        // 摘要一致（或服务端没给摘要的早期记录）才认为手上这份就是它。
+        // 同一个版本号重新发布时内容会变，所以“是不是同一份 offer”看摘要，不看版本号。
         let same_offer = self.update.version == info.version
-            && (info.sha256.is_empty() || self.update.sha256.eq_ignore_ascii_case(&info.sha256));
+            && self.update.sha256.eq_ignore_ascii_case(&info.sha256);
         let settled = matches!(self.update.phase, Phase::Ready | Phase::Failed);
         if settled && same_offer {
             // 下载失败过的包在退避到期后自动重下一次：发布文件服务短暂不可达时，
@@ -408,7 +422,7 @@ impl Engine {
         let Some(info) = info else {
             return;
         };
-        if info.url.is_empty() || info.sha256.is_empty() {
+        if info.url.is_empty() || !is_full_digest(&info.sha256) {
             return;
         }
         // 判重与占位在同一处完成：同一台机器只尝试一次，换不掉就等下个版本。
