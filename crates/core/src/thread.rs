@@ -183,6 +183,22 @@ impl CoreThread {
             .arg(spec.rpc_addr.to_string())
             .arg("--hostname")
             .arg(&spec.hostname);
+        // core 默认按 info 刷屏：打洞重试约占七成行数、直连探测一成半、RPC 断开半成，
+        // 另外每 15 秒还有一行 4.5 KB 的全局拓扑（字节数接近一半）。只把这四个 target
+        // 压到 warn，其余仍是 info——「连上了」「配置变了」这类排障要看的不受影响。
+        // RUST_LOG 是 EasyTier 原生的级别入口，最长前缀匹配，不用改内核参数解析。
+        // 外部已经设了 RUST_LOG 就用外部的：现场排查打洞问题时可以直接放宽级别。
+        cmd.env(
+            "RUST_LOG",
+            std::env::var("RUST_LOG").unwrap_or_else(|_| {
+                "info,\
+                 easytier_core::connectivity::hole_punch=warn,\
+                 easytier_core::connectivity::direct=warn,\
+                 easytier_core::rpc::bidirect=warn,\
+                 easytier_core::peers::peer_center=warn"
+                    .to_string()
+            }),
+        );
         // 钉住可达地址时同时收窄来源：这个端口能签发凭据，等价于 network_secret。
         if let Some(whitelist) = spec
             .rpc_whitelist
