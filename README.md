@@ -59,4 +59,4 @@ cargo fmt --all --check
 ```
 
 生产形态永远经启动器：`dist/mesh.exe` 或 `dist/mesh`。安装布局、配置热更新、core 管理、
-更新与自启的行为见 [../docs/client.md](../docs/client.md) 与 [../docs/updates.md](../docs/updates.md)。
+更新与自启的行为见 [../docs/contract/client.md](../docs/contract/client.md) 与 [../docs/contract/updates.md](../docs/contract/updates.md)。
