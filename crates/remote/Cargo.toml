@@ -14,12 +14,10 @@ ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 thiserror = { workspace = true }
 httpdate = { workspace = true }
-ureq = { workspace = true }
-
-# Windows 用系统 TLS（schannel），不增体积、也吃系统根证书；Linux musl 静态链 openssl
-# 是硬伤，改用 rustls + 系统根证书（native-certs），与 Go 的默认行为一致。
-[target.'cfg(windows)'.dependencies]
-ureq = { workspace = true, features = ["native-tls"] }
-
-[target.'cfg(unix)'.dependencies]
+# 两个平台统一用 rustls + 系统根证书。
+#
+# 别改成 Windows 走 native-tls：ureq 的 `native-tls` feature 只是把 schannel 编进来，
+# **不会**成为默认 provider——它要求调用方自己在 `AgentBuilder` 上 `.tls_connector()`。
+# 只启它不启 `tls` 的话，默认 provider 是那个一律报「no TLS backend is configured」
+# 的占位实现，而请求正是在那里失败的。2026-11-26 在 Windows 上就是这么炸的。
 ureq = { workspace = true, features = ["tls", "native-certs"] }
