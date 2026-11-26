@@ -3,7 +3,7 @@
 > 这份是重写当时的方案，保留原样。里面的 `client/` 指旧的 Go 实现（现在是 `../client-prototype/`），
 > `client-rust/` 就是现在这份 `client/`。目录改名之后下面的路径不再逐一修订。
 
-依据：`contract/{README,client,updates,device-api}.md`、`client/`（Go 实现）、`client-launcher/`（Rust 启动器）、`docs/client-flows.md`。
+依据：`docs/{README,client,updates,device-api}.md`、`client/`（Go 实现）、`client-launcher/`（Rust 启动器）、`docs/client-flows.md`。
 模块划分、并发模型与错误分层见 [MODULES.md](MODULES.md)。本文只写结论与理由。
 
 ## 1. 目标与非目标
@@ -22,7 +22,7 @@
 - **启动器的安装/回滚/监督语义不动**：只搬进 workspace 并复用共享 crate。
 - **不改契约**：协议字段、端口（11020 起顺延 20 个）、路径与文件名（`bin/version.json`、`update.tar.zst`、`bin.old/`、`.update-failures.json`、`instance.lock`、`config/ui.json`）、安装布局、更新交接方式、自启实现（任务计划程序 `Mesh Client`）都不变。
 - **不加面板接口、不加 UI 形态**：不做 WebView 窗口（现有实现没有窗口，托盘只是菜单）。
-- 不动 `server/`、`contract/`、`client/`、`build/easytier-mini.patch`。
+- 不动 `server/`、`docs/`、`client/`、`build/easytier-mini.patch`。
 
 ## 2. 与现有 Go 实现的对应
 
@@ -103,7 +103,7 @@
 
 ### 能否与 Go 版共存
 
-- **协议层可以**：两端读的是同一份 `contract/`，同一个控制面可以把 Go 客户端和 Rust 客户端当成两台不同设备。
+- **协议层可以**：两端读的是同一份 `docs/`，同一个控制面可以把 Go 客户端和 Rust 客户端当成两台不同设备。
 - **安装根不能**：`instance.lock` 与 `bin/` 是唯一的。所以共存的实际形态只有两种：另一台设备 / 另一个安装根（`--root dist-next`），或按平台分开发布——发布槽位是按 `GOOS/GOARCH` 的，可以先给 `linux/amd64` 发 Rust 包、`windows/amd64` 继续发 Go 包。
 - **回滚**：把上一版 Go 包用**新的版本号**重新发布。同号重发会被两道闸挡住（客户端的「不比当前新不装」与 `.update-failures.json` 的连续失败 2 次）。
 
@@ -138,7 +138,7 @@
 - **Windows 上替换被打开的文件**：日志裁剪、`rename` 覆盖都在这里踩过；Rust 一样要 close → rename → reopen，不能指望 `std::fs::rename` 帮我们绕开。
 - **musl 静态链接**：客户端的硬约束是**不能链 openssl**（Linux 侧用 rustls），`ring` 需要 cc，`musl-gcc` 已配好（启动器在用）；`zstd` 的 C 源码只在启动器侧编。目标机最低 glibc 2.34 这条约束不变。
 - **体积**：目标与 Go 版同量级（内嵌前端与 6MB 字体是主要部分，两者都要带）；Rust 侧多出来的是 TLS 栈（Windows 走 schannel 可忽略）与托盘代码，少掉的是 Go 运行时。沿用启动器的 `opt-level=z`/`lto`/`panic=abort`/`strip`。实际数字以首次出包为准，不作为选型依据。
-- **双实现维护期**：阶段 1–2 之间两份实现并存，`contract/` 的任何改动要改两处。这段时间要尽量短，并用第 7 节的 diff 手段而不是靠人记。
+- **双实现维护期**：阶段 1–2 之间两份实现并存，`docs/` 的任何改动要改两处。这段时间要尽量短，并用第 7 节的 diff 手段而不是靠人记。
 
 ## 7. 验收与 review 手段
 
