@@ -1,0 +1,5 @@
+# 钉住工具链：本机与 CI 必须是同一个 rustc，否则 easytier-core.exe 的产物哈希对不上。
+# 升级时改这里，本地与 CI 一起动。
+[toolchain]
+channel = "1.100.0"
+components = ["rustfmt", "clippy"]
