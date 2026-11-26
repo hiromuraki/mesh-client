@@ -169,6 +169,9 @@ pub(crate) struct Engine {
     pub(crate) network_name: String,
     pub(crate) stun: mesh_etrpc::StunInfo,
     pub(crate) hb_stop: Option<Sender<()>>,
+    /// STUN 刷新线程的停止通道。与心跳一样按连接循环的生命周期管理：每次重连新起
+    /// 一个而不停旧的，线程就会按心跳的节奏无限累积（core 长期起不来时 2 个/分钟）。
+    pub(crate) stun_stop: Option<Sender<()>>,
     pub(crate) closed: bool,
 }
 
@@ -264,6 +267,7 @@ pub fn spawn(
         network_name: String::new(),
         stun: mesh_etrpc::StunInfo::default(),
         hb_stop: None,
+        stun_stop: None,
         closed: false,
         config,
     };
@@ -297,6 +301,7 @@ impl Engine {
         self.start_core_from_disk();
         self.connection_loop();
         self.stop_heartbeat();
+        self.stop_stun_loop();
         let _ = self.stop_core();
         self.publish();
         self.log.close();
@@ -365,11 +370,13 @@ impl Engine {
                     Flow::Closed => {
                         self.closed = true;
                         self.stop_heartbeat();
+                        self.stop_stun_loop();
                         return;
                     }
                 }
             }
             self.stop_heartbeat();
+            self.stop_stun_loop();
             if self.closed {
                 return;
             }
@@ -936,8 +943,10 @@ impl Engine {
     }
 
     fn start_stun_loop(&mut self) {
+        self.stop_stun_loop();
         let cell = Arc::clone(&self.cell);
         let tx = self.self_tx.clone();
+        let (stop_tx, stop_rx) = channel();
         thread::Builder::new()
             .name("mesh-stun".to_string())
             .spawn(move || loop {
@@ -950,9 +959,20 @@ impl Engine {
                         }
                     }
                 }
-                thread::sleep(STUN_REFRESH_INTERVAL);
+                // 用停止通道代替 sleep：退出与重连都不必等满一个刷新周期。
+                match stop_rx.recv_timeout(STUN_REFRESH_INTERVAL) {
+                    Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => {}
+                }
             })
             .expect("启动 STUN 刷新线程失败");
+        self.stun_stop = Some(stop_tx);
+    }
+
+    fn stop_stun_loop(&mut self) {
+        if let Some(stop) = self.stun_stop.take() {
+            let _ = stop.send(());
+        }
     }
 }
 

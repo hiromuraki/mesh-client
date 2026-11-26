@@ -96,11 +96,6 @@ impl Log {
         }
     }
 
-    /// 返回本文件末尾最多 `n` 行（已合并相邻重复行）。
-    pub fn tail(&self, n: usize) -> Vec<Line> {
-        collapse(tail_lines(&self.path, n))
-    }
-
     /// 关闭文件句柄。进程退出前调用；不调用也不会丢已写入的内容。
     pub fn close(&self) {
         let mut inner = self.lock();
@@ -347,7 +342,7 @@ pub(crate) mod tests {
         let log = Log::open(&path).unwrap();
         log.add("app", "客户端启动");
         log.add("core", "multi\nline message");
-        let lines = log.tail(10);
+        let lines = logs(&path, 10);
         assert_eq!(lines.len(), 2, "lines = {lines:?}");
         assert_eq!(lines[0].source, "app");
         assert_eq!(lines[0].text, "客户端启动");
@@ -368,7 +363,7 @@ pub(crate) mod tests {
         }
         log.add("app", "换个话题");
         log.add("core", "peer rpc transport read aborted");
-        let lines = log.tail(10);
+        let lines = logs(&path, 10);
         assert_eq!(lines.len(), 3, "lines = {lines:?}");
         assert_eq!(lines[0].count, 3);
         assert_eq!(lines[1].count, 1);
@@ -395,7 +390,7 @@ pub(crate) mod tests {
             size <= LOW_WATERMARK + 4096,
             "裁剪后大小 = {size}，应回到低水位附近"
         );
-        let lines = log.tail(3);
+        let lines = logs(&path, 3);
         assert_eq!(lines.last().unwrap().text, "after rotate");
         // 首行必须是完整的一行（形如 "12:00:00 [app] line ..."）。
         let first = tail_lines(&path, 100_000).remove(0);

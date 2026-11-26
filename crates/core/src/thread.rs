@@ -3,11 +3,12 @@
 //! 这个线程是 `Child`、pid 与 Job 句柄的唯一所有者。别的线程只能发 [`Cmd`]、
 //! 收 [`Event`]，所以“两个线程同时动 core”这件事在类型上就不存在。
 
-use crate::probe::{self, Outcome};
+use crate::probe::{self, Attempt};
 use crate::process;
 use crate::pump::{self, LineSink};
-use crate::{Cmd, Event, Identity, Options, StartSpec};
+use crate::{Cmd, Event, Expect, Identity, Options, StartSpec};
 use std::io::Read;
+use std::net::SocketAddr;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -39,6 +40,7 @@ pub(crate) fn spawn(
             sink,
             options,
             running: None,
+            pending: None,
         }
         .run();
     });
@@ -53,18 +55,32 @@ struct Running {
     pumps: Vec<thread::JoinHandle<()>>,
 }
 
+/// 已拉起、还没确认就绪的那一代。探测从“内联阻塞”挪到这里之后，命令循环每
+/// 100ms 仍在转：Stop 不会再被一整段就绪等待挡住（退出与更新不必等满 25 秒）。
+struct Pending {
+    running: Running,
+    rpc: SocketAddr,
+    expect: Expect,
+    deadline: Instant,
+    next_probe: Instant,
+    /// 最近一次没能确认就绪的原因，用于有时限那条路径的说明。
+    last: Option<String>,
+}
+
 struct CoreThread {
     cmds: Receiver<Cmd>,
     events: EventSink,
     sink: LineSink,
     options: Options,
     running: Option<Running>,
+    pending: Option<Pending>,
 }
 
 impl CoreThread {
     fn run(mut self) {
         loop {
             self.reap();
+            self.poll_ready();
             match self.cmds.recv_timeout(TICK) {
                 Ok(Cmd::Start(spec)) => self.start(spec),
                 Ok(Cmd::Stop { reply }) => {
@@ -114,7 +130,7 @@ impl CoreThread {
     }
 
     fn start(&mut self, spec: StartSpec) {
-        if self.running.is_some() {
+        if self.running.is_some() || self.pending.is_some() {
             if let Err(reason) = self.stop(false) {
                 self.emit(Event::StartFailed {
                     gen: spec.gen,
@@ -133,46 +149,94 @@ impl CoreThread {
                 return;
             }
         };
-        let mut running = running;
-        match probe::wait_ready(
-            &mut running.child,
-            spec.rpc_addr,
-            &spec.expect,
-            &self.options,
-        ) {
-            Outcome::Ready(node) => {
-                let (gen, pid) = (running.gen, running.pid);
-                self.running = Some(running);
+        // 探测交给命令循环逐拍推进：拉起与确认就绪之间不再挡住 Stop。
+        let now = Instant::now();
+        self.pending = Some(Pending {
+            running,
+            rpc: spec.rpc_addr,
+            expect: spec.expect,
+            deadline: now + self.options.ready_timeout,
+            next_probe: now,
+            last: None,
+        });
+    }
+
+    /// 推进一次就绪探测。每个 TICK 调用一次，到点才真的查一次；查询本身最多
+    /// `probe_timeout`，所以 Stop 的等待有上界。
+    fn poll_ready(&mut self) {
+        let now = Instant::now();
+        let (rpc, expired, due) = match self.pending.as_ref() {
+            None => return,
+            Some(pending) => (
+                pending.rpc,
+                now >= pending.deadline,
+                now >= pending.next_probe,
+            ),
+        };
+        if expired {
+            let pending = self.pending.take().expect("pending if present");
+            self.fail_ready(pending);
+            return;
+        }
+        if !due {
+            return;
+        }
+        let outcome = {
+            let Some(pending) = self.pending.as_mut() else {
+                return;
+            };
+            pending.next_probe = now + self.options.ready_interval;
+            probe::attempt(
+                &mut pending.running.child,
+                rpc,
+                &pending.expect,
+                &self.options,
+            )
+        };
+        match outcome {
+            Attempt::NotYet(why) => {
+                if let Some(pending) = self.pending.as_mut() {
+                    pending.last = Some(why);
+                }
+            }
+            Attempt::Ready(node) => {
+                let pending = self.pending.take().expect("pending if present");
+                let (gen, pid) = (pending.running.gen, pending.running.pid);
+                self.running = Some(pending.running);
                 self.emit(Event::Started { gen, pid, node });
             }
-            Outcome::Exited(status) => {
-                let gen = running.gen;
+            Attempt::Exited(status) => {
+                let pending = self.pending.take().expect("pending if present");
+                let running = pending.running;
                 for pump in running.pumps {
                     let _ = pump.join();
                 }
                 self.emit(Event::StartFailed {
-                    gen,
+                    gen: running.gen,
                     reason: format!("core 进程已退出（{}）", describe_status_opt(status)),
                 });
             }
-            Outcome::Timeout(reason) => {
-                let gen = running.gen;
-                self.running = Some(running);
-                // 停不掉也要报：继续下去会起来第二个 core 抢同一个虚拟 IP。
-                let stop_note = match self.stop(false) {
-                    Ok(()) => String::new(),
-                    Err(err) => format!("；停止 core 失败: {err}"),
-                };
-                self.emit(Event::StartFailed {
-                    gen,
-                    reason: format!(
-                        "{}{}",
-                        probe::timeout_message(self.options.ready_timeout, &reason),
-                        stop_note
-                    ),
-                });
-            }
         }
+    }
+
+    /// 到时限还没确认就绪：停掉那个进程，报启动失败。
+    fn fail_ready(&mut self, pending: Pending) {
+        let gen = pending.running.gen;
+        let reason = pending.last.unwrap_or_else(|| "超时".to_string());
+        // 探测期间进程可能已经半起来：先当成“在跑”交给 stop 处理，停不掉就报出来。
+        self.running = Some(pending.running);
+        let stop_note = match self.stop(false) {
+            Ok(()) => String::new(),
+            Err(err) => format!("；停止 core 失败: {err}"),
+        };
+        self.emit(Event::StartFailed {
+            gen,
+            reason: format!(
+                "{}{}",
+                probe::timeout_message(self.options.ready_timeout, &reason),
+                stop_note
+            ),
+        });
     }
 
     fn launch(&self, spec: &StartSpec) -> Result<Running, String> {
@@ -258,42 +322,68 @@ impl CoreThread {
     /// 停止 core。`report_exit` 为真时发 `Exited`（对应 Go 里关闭 Done）：
     /// 引擎按代号忽略自己主动停掉的那一代，所以这里照发不误。
     fn stop(&mut self, report_exit: bool) -> Result<(), String> {
+        // 探测中的那一代引擎还没收到 Started：停掉它，但不补 Exited。
+        if let Some(pending) = self.pending.take() {
+            return self.stop_process(pending.running, false);
+        }
         let Some(running) = self.running.take() else {
             return Ok(());
         };
+        self.stop_process(running, report_exit)
+    }
+
+    /// 停一个 core 进程并等输出泵收尾。停不掉时把句柄放回 running：句柄是唯一
+    /// 能证明「它还在」的东西，丢掉它就等于以为它停了，下一次 Start 会再起一个
+    /// 抢同一个虚拟 IP。
+    fn stop_process(&mut self, running: Running, report_exit: bool) -> Result<(), String> {
         let gen = running.gen;
-        let pid = running.pid;
-        let mut running = running;
-        // 先礼：软停止命令本身失败（Windows 上无窗口的 core 必然如此）就立刻改强杀，
-        // 不再空等满 grace——旧实现每次停 core 固定多等 5 秒。
-        let status = match process::terminate(pid, false) {
-            Ok(()) => wait_exit(&mut running.child, STOP_GRACE),
-            Err(_) => None,
-        };
-        let status = match status {
-            Some(status) => Some(status),
-            None => {
-                let _ = process::terminate(pid, true);
-                match wait_exit(&mut running.child, KILL_GRACE) {
-                    Some(status) => Some(status),
-                    None => return Err(format!("core 进程 {pid} 未能退出")),
+        match terminate_and_reap(running) {
+            Ok(status) => {
+                if report_exit {
+                    self.emit(Event::Exited {
+                        gen,
+                        err: status.and_then(describe_status),
+                    });
                 }
+                Ok(())
             }
-        };
-        for pump in running.pumps {
-            let _ = pump.join();
+            Err((running, err)) => {
+                self.running = Some(running);
+                Err(err)
+            }
         }
-        if report_exit {
-            self.emit(Event::Exited {
-                gen,
-                err: status.and_then(describe_status),
-            });
-        }
-        Ok(())
     }
 }
 
-/// 等子进程退出，最多 `grace`。退出状态由 `Child` 缓存，之后不会再被回收一次。
+/// 停掉一个 core 进程，等它退出、等输出泵收尾，返回退出状态。停不掉时把
+/// Running 原样交还，调用方必须把它放回去。
+// Err 里带着 Running：停不掉时调用方必须把句柄拿回去，装箱只是多一次分配。
+#[allow(clippy::result_large_err)]
+fn terminate_and_reap(mut running: Running) -> Result<Option<ExitStatus>, (Running, String)> {
+    let pid = running.pid;
+    // 先礼：软停止命令本身失败（Windows 上无窗口的 core 必然如此）就立刻改强杀，
+    // 不再空等满 grace——旧实现每次停 core 固定多等 5 秒。
+    let status = match process::terminate(pid, false) {
+        Ok(()) => wait_exit(&mut running.child, STOP_GRACE),
+        Err(_) => None,
+    };
+    let status = match status {
+        Some(status) => Some(status),
+        None => {
+            let _ = process::terminate(pid, true);
+            match wait_exit(&mut running.child, KILL_GRACE) {
+                Some(status) => Some(status),
+                None => return Err((running, format!("core 进程 {pid} 未能退出"))),
+            }
+        }
+    };
+    for pump in running.pumps.drain(..) {
+        let _ = pump.join();
+    }
+    Ok(status)
+}
+
+/// 等子进程退出，最多 grace。退出状态由 Child 缓存，之后不会再被回收一次。
 fn wait_exit(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
     let deadline = Instant::now() + grace;
     loop {

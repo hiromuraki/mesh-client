@@ -38,6 +38,9 @@ pub fn run(
     wait_for: Option<u32>,
     force: bool,
 ) -> Result<(), String> {
+    // 上次安装没走完（bin.old 还在）就先回滚。手动安装与启动路径必须同一个前提：
+    // 不能拿唯一的回滚材料去换一份还没验过的新包。
+    recover(root)?;
     if let Some(pid) = wait_for {
         log::line(&format!("等待进程 {pid} 退出"));
         launch::wait_exit(pid, WAIT_CLIENT)?;
@@ -55,9 +58,14 @@ pub fn run(
 
     // 这一条只防“下载完成到安装之间”包被换掉，与解包结果无关。
     let sum = sha256_file(&pkg)?;
+    // 只有自己下载到 <root>/update.tar.zst 的那份才删：--file 给的是用户的文件，
+    // 同样的路径成功安装时反而保留，两种结果不该由失败与否决定。
+    let owned = pkg == root.join(UPDATE_FILE);
     if let Some(want) = want_sha {
         if !sum.eq_ignore_ascii_case(&want) {
-            let _ = fs::remove_file(&pkg);
+            if owned {
+                let _ = fs::remove_file(&pkg);
+            }
             return Err(format!("包摘要不符：得到 {sum}，期望 {want}"));
         }
     }
@@ -65,7 +73,9 @@ pub fn run(
 
     if let Err(e) = install_from_file(root, &pkg, force) {
         log::line(&format!("安装失败: {e}"));
-        let _ = fs::remove_file(&pkg);
+        if owned {
+            let _ = fs::remove_file(&pkg);
+        }
         // 安装失败时 bin/ 已经被换回原来那一套。Windows 上客户端早已退出，
         // 必须把它拉回来——否则节点就此静默离线，直到有人去双击 UAC。
         #[cfg(windows)]
@@ -144,8 +154,15 @@ pub(crate) fn install_from_file(
         }
     }
 
+    // recover() 已在入口把残留的 bin.old 回滚回 bin/：这里再看到它，说明有人跳过了
+    // 那一步。宁可失败，也不要删掉唯一的回滚材料。
     let old = root.join(BIN_OLD);
-    let _ = fs::remove_dir_all(&old);
+    if old.exists() {
+        return Err(format!(
+            "{} 仍然存在：上次安装没有走完，先回滚再装",
+            old.display()
+        ));
+    }
     if bin.exists() {
         fs::rename(&bin, &old).map_err(|e| format!("挪开旧 bin 失败: {e}"))?;
     }
@@ -358,4 +375,94 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         return Err(format!("下载失败: curl 退出 {status}"));
     }
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mesh-launcher-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 造一个 tar.zst 包：根上是清单，`entries` 是包里的文件。
+    fn package(dir: &Path, manifest: &str, entries: &[(&str, &[u8])]) -> PathBuf {
+        let path = dir.join("pkg.tar.zst");
+        let file = fs::File::create(&path).unwrap();
+        let encoder = zstd::Encoder::new(file, 3).unwrap();
+        let mut builder = tar::Builder::new(encoder);
+        append(&mut builder, "version.json", manifest.as_bytes());
+        for (name, body) in entries {
+            append(&mut builder, name, body);
+        }
+        let encoder = builder.into_inner().unwrap();
+        encoder.finish().unwrap();
+        path
+    }
+
+    fn append<W: std::io::Write>(builder: &mut tar::Builder<W>, name: &str, body: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        builder.append_data(&mut header, name, body).unwrap();
+    }
+
+    /// 清单声明的摘要与实际内容不符：解包成功、校验失败。
+    fn broken_package(dir: &Path) -> PathBuf {
+        package(
+            dir,
+            r#"{"version":"2099.01.01-1","files":{"mesh-client.exe":"00"}}"#,
+            &[("mesh-client.exe", b"not the bytes the manifest claims")],
+        )
+    }
+
+    /// 安装失败不能删用户给的文件：--file 收的是用户自己的包，客户端交接时那个
+    /// 路径（<root>/update.tar.zst）才是下载下来的、可以删的那一份。
+    #[test]
+    fn a_failed_manual_install_keeps_the_package_the_user_gave() {
+        let root = temp_root("keep-package");
+        let src = temp_root("keep-package-src");
+        let pkg = broken_package(&src);
+
+        assert!(
+            run(&root, Source::File(pkg.clone()), None, None, true).is_err(),
+            "坏包应当安装失败"
+        );
+        assert!(pkg.is_file(), "用户给的包被删掉了: {}", pkg.display());
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 上次安装没走完时，残留的 bin.old 是唯一的回滚材料：手动安装必须先回滚它，
+    /// 而不是把它删掉再拿坏 bin 顶上。
+    #[test]
+    fn a_manual_install_rolls_a_stale_bin_old_back_first() {
+        let root = temp_root("stale-bin-old");
+        let src = temp_root("stale-bin-old-src");
+        fs::create_dir_all(root.join("bin.old")).unwrap();
+        fs::write(root.join("bin.old").join("GOOD"), b"good").unwrap();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin").join("BROKEN"), b"broken").unwrap();
+        let pkg = broken_package(&src);
+
+        let _ = run(&root, Source::File(pkg), None, None, true);
+
+        assert!(
+            root.join("bin").join("GOOD").is_file(),
+            "残留的 bin.old 没有先回滚：回滚材料被坏 bin 顶掉了"
+        );
+        assert!(!root.join("bin.old").exists(), "回滚之后不该再有 bin.old");
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
 }

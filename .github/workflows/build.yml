@@ -97,10 +97,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # 版本号只进 VERSIONINFO 与 --help：真实版本在 bin/version.json，运行时读。
+      # 整个 workspace 都编：启动器的提权、安装与回滚路径只有 Windows 才编得出来，
+      # 而它们正是自更新的关键路径。
       - name: Build
         env:
           MESH_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('ci-{0}', github.sha) }}
-        run: cargo build --release -p mesh-client
+        run: cargo build --release --workspace
+
+      # 自启 XML、Job 对象、进程树这些只有 Windows 上跑得动，check job 覆盖不到。
+      - name: Test
+        run: cargo test --all
 
       - name: Collect the build
         run: |

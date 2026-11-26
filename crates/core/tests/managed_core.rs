@@ -377,3 +377,34 @@ fn process_alive(pid: u32) -> bool {
     // 0 号信号只做存在性检查；pid 已被别人复用时可能误判，测试窗口里可以接受。
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
+/// 就绪探测期间也必须能停下：退出与更新不该被整段探测（最长 25 秒）挡住。
+/// 探测移进命令循环之前，Stop 要排在探测后面，引擎 15 秒超时后只能 process::exit，
+/// Unix 上还会把没停掉的 core 留成孤儿。
+#[test]
+fn stop_is_answered_while_the_ready_probe_is_still_running() {
+    let dir = temp_dir("stop-during-probe");
+    let config = write_config(&dir, &[("mode", "no-portal")]);
+    let harness = harness(Options {
+        ready_timeout: Duration::from_secs(25),
+        ready_interval: Duration::from_millis(100),
+        probe_timeout: Duration::from_millis(200),
+    });
+    harness.start(spec(5, config, "laptop"));
+    // 给它一拍时间把进程拉起来并进入探测。
+    std::thread::sleep(Duration::from_millis(400));
+
+    let (tx, rx) = channel();
+    harness.core.send(Cmd::Stop { reply: tx }).unwrap();
+    let began = Instant::now();
+    let reply = rx.recv_timeout(Duration::from_secs(10));
+    assert!(
+        matches!(reply, Ok(Ok(()))),
+        "探测期间 Stop 必须成功: {reply:?}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "Stop 被就绪探测挡住了 {:?}",
+        began.elapsed()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

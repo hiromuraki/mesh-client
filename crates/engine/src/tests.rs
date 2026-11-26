@@ -115,6 +115,7 @@ fn harness(tag: &str) -> Harness {
         network_name: String::new(),
         stun: Default::default(),
         hb_stop: None,
+        stun_stop: None,
         closed: false,
     };
     Harness {

@@ -1,55 +1,40 @@
 //! 就绪探测：判断“core 真的起来了”，而不是“进程还在”。
 //!
-//! 与 Go 的 `engine.waitReady` 一致：每 500ms 查一次 `ShowNodeInfo`，最多 25s；
-//! 每次查询单独 3s 超时（core 刚起来时 portal 可能还没开始监听）。判据见
-//! [`crate::Expect`]。
+//! 与 Go 的 `engine.waitReady` 判据一致（`ShowNodeInfo` + [`crate::Expect`]），
+//! 但只做**一次**：时限与间隔由 core 线程的命令循环推进。整段循环内联在这里时，
+//! 探测期间 core 线程取不到 Stop，退出与更新都得等满就绪时限。
 
 use crate::{Expect, NodeInfo, Options};
 use std::net::SocketAddr;
 use std::process::{Child, ExitStatus};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-pub(crate) enum Outcome {
+pub(crate) enum Attempt {
     Ready(NodeInfo),
     /// 探测期间进程就退了；退出状态在 `try_wait` 里已经被回收，不能再 wait。
     Exited(Option<ExitStatus>),
-    /// 到时限还没确认就绪，`reason` 是最后一次失败的原因。
-    Timeout(String),
+    /// 还不算就绪，`why` 是这一次没能确认的原因。
+    NotYet(String),
 }
 
-pub(crate) fn wait_ready(
+pub(crate) fn attempt(
     child: &mut Child,
     rpc: SocketAddr,
     expect: &Expect,
     options: &Options,
-) -> Outcome {
-    let deadline = Instant::now() + options.ready_timeout;
-    let mut last = None;
-    loop {
-        // 时限判断放在最前面：这样 `last` 的初始值才会被读到（也才是“时限已到’
-        // 那条路径的唯一出口）。
-        let now = Instant::now();
-        if now >= deadline {
-            return Outcome::Timeout(last.unwrap_or_else(|| "超时".to_string()));
-        }
-        // 进程先退出就不必等满时限：装上就崩是最常见的一种失败。
-        match child.try_wait() {
-            Ok(Some(status)) => return Outcome::Exited(Some(status)),
-            Ok(None) => {}
-            Err(err) => {
-                return Outcome::Timeout(format!("等待 core 进程失败: {err}"));
-            }
-        }
-        match mesh_etrpc::show_node_info(rpc, options.probe_timeout) {
-            Ok(node) => match check(&node, expect) {
-                Ok(()) => return Outcome::Ready(node),
-                Err(why) => last = Some(why),
-            },
-            Err(err) => last = Some(err.to_string()),
-        }
-        // 睡到下一次探测，但不要越过时限。
-        let sleep = options.ready_interval.min(deadline - Instant::now());
-        std::thread::sleep(sleep);
+) -> Attempt {
+    // 进程先退出就不必再查：装上就崩是最常见的一种失败。
+    match child.try_wait() {
+        Ok(Some(status)) => return Attempt::Exited(Some(status)),
+        Ok(None) => {}
+        Err(err) => return Attempt::NotYet(format!("等待 core 进程失败: {err}")),
+    }
+    match mesh_etrpc::show_node_info(rpc, options.probe_timeout) {
+        Ok(node) => match check(&node, expect) {
+            Ok(()) => Attempt::Ready(node),
+            Err(why) => Attempt::NotYet(why),
+        },
+        Err(err) => Attempt::NotYet(err.to_string()),
     }
 }
 

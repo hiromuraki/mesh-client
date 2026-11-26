@@ -112,7 +112,12 @@ impl StateCell {
 impl Engine {
     /// 当前状态快照。不查询 core、不碰网络，只读引擎自己的状态与磁盘上的摘要。
     pub(crate) fn snapshot(&self) -> Snapshot {
-        let hash = self.hash();
+        self.snapshot_with_hash(self.hash())
+    }
+
+    /// snapshot 用调用方已经算好的配置摘要。一次 publish 里快照与心跳必须用同一份
+    /// 摘要：各读一次文件、各算一次，两次取样之间外部改了文件就会自相矛盾。
+    pub(crate) fn snapshot_with_hash(&self, hash: String) -> Snapshot {
         let core_running = self.core_running();
         let mut snapshot = Snapshot {
             status: self.status.as_str().to_string(),
@@ -177,10 +182,11 @@ impl Engine {
 
     /// 发布一次快照。引擎每处理完一条消息调用它。
     pub(crate) fn publish(&self) {
+        let hash = self.hash();
         let published = Published {
-            snapshot: self.snapshot(),
+            snapshot: self.snapshot_with_hash(hash.clone()),
             beat: BeatInput {
-                config_hash: self.hash(),
+                config_hash: hash,
                 credential_id: self.credential_id(),
                 app_version: self.config.self_version.clone(),
                 app_update_known: self.known_app_update(),

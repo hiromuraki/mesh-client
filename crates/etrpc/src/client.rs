@@ -24,6 +24,11 @@ static TRANSACTION_ID: AtomicI64 = AtomicI64::new(0);
 /// 对端不是我们以为的服务，报错比一直收下去安全。
 const MAX_PIECES: u32 = 4096;
 
+/// 单次响应允许的总字节数。片数上限单独存在时，理论上限是 4096 × 32MiB；对端本来
+/// 是本地 core，但「单条应答有界」应当由代码保证，而不是靠对端可信。8MiB 留了两个
+/// 数量级余量（最大的实测应答 160KB）。
+const MAX_RESPONSE_BYTES: usize = 8 << 20;
+
 /// 发一次请求并返回完整的业务载荷。
 pub(crate) fn call(
     addr: SocketAddr,
@@ -54,6 +59,7 @@ pub(crate) fn call(
 
     let mut pieces: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     let mut total = 0u32;
+    let mut received = 0usize;
     loop {
         set_timeout(&stream, deadline)?;
         let (packet_type, raw) = frame::read_frame(&mut stream)?;
@@ -75,6 +81,12 @@ pub(crate) fn call(
         if total == 0 {
             total = total_pieces;
         }
+        if packet.body.len() > MAX_RESPONSE_BYTES - received {
+            return Err(Error::Frame(format!(
+                "rpc 应答超过 {MAX_RESPONSE_BYTES} 字节"
+            )));
+        }
+        received += packet.body.len();
         if packet.piece_index < total {
             pieces.insert(packet.piece_index, packet.body);
         }

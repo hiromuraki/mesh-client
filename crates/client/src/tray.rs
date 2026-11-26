@@ -77,6 +77,8 @@ pub(crate) struct TrayOptions {
     pub cell: Arc<StateCell>,
     pub tx: Sender<Cmd>,
     pub quit: Arc<dyn Fn() + Send + Sync>,
+    /// 托盘真的立起来之后调用：安装器等这个信号才敢删 bin.old。
+    pub ready: Box<dyn Fn() + Send + Sync>,
 }
 
 pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
@@ -154,6 +156,8 @@ pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
         .map_err(|err| format!("启动托盘同步线程失败: {err}"))?;
     allow_shell_messages(hwnd, taskbar_created);
     add_icon_with_retry(Arc::clone(&context), hwnd as usize);
+    // 窗口、监听线程与托盘图标都就位了：这一版算能跑起来。
+    (options.ready)();
 
     let mut message: MSG = unsafe { std::mem::zeroed() };
     loop {

@@ -21,6 +21,7 @@ use mesh_panel::Panel;
 use mesh_state::Store;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 
@@ -133,23 +134,34 @@ fn serve(
     shutdown.register(move || panel_closer.close());
     let _ = mesh_panel::write_url(&root.join(layout::CONFIG).join("ui.json"), &panel.url);
 
-    // 安装器在等这个标记来判断新版本「能不能正常跑起来」：引擎与面板都已经就位，
-    // 网络通不通不算失败——那不该触发回退。
-    if let Some(token) = options
-        .boot_check
-        .as_deref()
-        .filter(|token| !token.is_empty())
-    {
-        if let Err(message) = boot_check::write_marker(root, token) {
-            platform::say_err(&format!("{APP_TITLE}: {message}"));
-        }
-    }
+    // 安装器在等这个标记来判断新版本「能不能正常跑起来」：一看到它就删掉 bin.old。
+    // 所以时机不能只看「引擎与面板已就位」——进程形态本身（托盘）也得立起来，否则
+    // 更新已提交、客户端随即退出，下一次登录同样失败，而回滚材料已经没了。
+    let ready = boot_ready(root, options.boot_check.as_deref());
 
     if desktop {
-        return desktop_main(&panel, root, version, cell, tx, shutdown);
+        return desktop_main(&panel, root, version, cell, tx, shutdown, ready);
     }
     platform::say(&format!("{APP_TITLE} 面板 {}", panel.url));
-    headless::run(Arc::clone(cell), &log_path)
+    headless::run(Arc::clone(cell), &log_path, ready)
+}
+
+/// boot_ready 返回「这一版算成功启动」的回调。它只生效一次，可以重复调用。
+fn boot_ready(root: &Path, token: Option<&str>) -> Box<dyn Fn() + Send + Sync> {
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
+        return Box::new(|| {});
+    };
+    let root = root.to_path_buf();
+    let token = token.to_string();
+    let done = AtomicBool::new(false);
+    Box::new(move || {
+        if done.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(message) = boot_check::write_marker(&root, &token) {
+            platform::say_err(&format!("{APP_TITLE}: {message}"));
+        }
+    })
 }
 
 #[cfg(windows)]
@@ -160,6 +172,7 @@ fn desktop_main(
     cell: &Arc<StateCell>,
     tx: &Sender<Cmd>,
     shutdown: &Arc<Shutdown>,
+    ready: Box<dyn Fn() + Send + Sync>,
 ) -> Result<(), String> {
     let quit_shutdown = Arc::clone(shutdown);
     tray::run(tray::TrayOptions {
@@ -169,6 +182,7 @@ fn desktop_main(
         cell: Arc::clone(cell),
         tx: tx.clone(),
         quit: Arc::new(move || quit_shutdown.run_and_exit(0)),
+        ready,
     })
 }
 

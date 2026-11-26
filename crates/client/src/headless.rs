@@ -21,7 +21,11 @@ const SIGNAL_SLICE: Duration = Duration::from_millis(250);
 /// 身份失效时的退出原因（Go 的同一句话）。
 const IDENTITY_LOST: &str = "设备身份已失效（服务端拒绝签名请求），请先确认本机时间准确，再用 --server 与 --token 重新注册后启动";
 
-pub(crate) fn run(cell: Arc<StateCell>, log_path: &Path) -> Result<(), String> {
+pub(crate) fn run(
+    cell: Arc<StateCell>,
+    log_path: &Path,
+    ready: Box<dyn Fn() + Send + Sync>,
+) -> Result<(), String> {
     let stop = Arc::new(AtomicBool::new(false));
     let offset = follow_log::file_size(log_path);
     let follower = {
@@ -58,6 +62,8 @@ pub(crate) fn run(cell: Arc<StateCell>, log_path: &Path) -> Result<(), String> {
         if started.elapsed() >= LOST_CHECK && cell.get().snapshot.status == "unconfigured" {
             break Err(IDENTITY_LOST.to_string());
         }
+        // 过了这一关说明进程会留下来：此时才让安装器认为这一版启动成功。
+        ready();
     };
 
     stop.store(true, Ordering::SeqCst);

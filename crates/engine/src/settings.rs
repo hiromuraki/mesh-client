@@ -45,6 +45,10 @@ impl Engine {
             created_at: 0,
             core_path,
         };
+        let previous_device_id = current
+            .as_ref()
+            .map(|current| current.device_id.clone())
+            .unwrap_or_default();
         if let Some(current) = current.as_ref() {
             config.device_id = current.device_id.clone();
             config.created_at = current.created_at;
@@ -69,6 +73,14 @@ impl Engine {
             self.store
                 .save_client(&config)
                 .map_err(|err| format!("保存注册结果失败: {err}"))?;
+            // 设备身份变了（管理端新建了槽位、或这台机器改绑另一台设备）：上一台设备
+            // 的凭据还留在磁盘上，core 会先带着它启动，而控制面要等冷却才会签发新的。
+            // 丢掉旧的那份，下一轮心跳就按「没有凭据」重签。
+            if previous_device_id != config.device_id {
+                self.store
+                    .remove_credential()
+                    .map_err(|err| format!("清理旧设备的凭据失败: {err}"))?;
+            }
             self.stop_core()?;
             self.store
                 .write_config(&reply.config_toml)
