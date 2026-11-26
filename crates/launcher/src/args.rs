@@ -1,0 +1,195 @@
+use std::path::PathBuf;
+
+/// 启动器只做三件事：启动、装本地包、从地址拉包装。没有别的开关。
+pub enum Command {
+    Launch,
+    Install {
+        source: Source,
+        sha256: Option<String>,
+        wait_for: Option<u32>,
+        /// force 跳过“不比当前新”和“失败次数已满”这两道闸，只给手动修机器用。
+        force: bool,
+    },
+}
+
+pub enum Source {
+    File(PathBuf),
+    Url(String),
+}
+
+/// Options 是解析结果：要做什么，以及在哪个安装根里做。
+pub struct Options {
+    pub command: Command,
+    /// root 显式指定安装根；不给就用启动器自己所在目录。systemd 的 ExecStart
+    /// 会传它，手动排障时也用它把启动器指向别处的一份安装。
+    pub root: Option<PathBuf>,
+}
+
+/// 解析失败有两种：用户要帮助（正常请求），和参数真的不对。
+#[derive(Debug)]
+pub enum ParseError {
+    Help,
+    Invalid(String),
+}
+
+pub fn usage() -> &'static str {
+    "启动\n  mesh [--root <安装根>]\n\n安装本地包\n  mesh --file <包> [--root <安装根>] [--wait-for <进程号>] [--sha256 <摘要>] [--force]\n\n从地址下载并安装\n  mesh --url <地址> [--sha256 <摘要>] [--force]"
+}
+
+pub fn parse(argv: &[String]) -> Result<Options, ParseError> {
+    let mut root = None;
+    let mut file = None;
+    let mut url = None;
+    let mut sha = None;
+    let mut wait = None;
+    let mut force = false;
+    let mut i = 0;
+    while i < argv.len() {
+        let raw = argv[i].as_str();
+        let (name, inline) = match raw.split_once('=') {
+            Some((n, v)) => (n, Some(v.to_string())),
+            None => (raw, None),
+        };
+        match name {
+            "--root" => root = Some(PathBuf::from(value(argv, &mut i, inline, name)?)),
+            "--file" => file = Some(PathBuf::from(value(argv, &mut i, inline, name)?)),
+            "--url" => url = Some(value(argv, &mut i, inline, name)?),
+            "--sha256" => sha = Some(value(argv, &mut i, inline, name)?),
+            "--wait-for" => {
+                let v = value(argv, &mut i, inline, name)?;
+                wait = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| ParseError::Invalid(format!("--wait-for 不是进程号: {v}")))?,
+                );
+            }
+            "--force" => force = true,
+            "-h" | "--help" => return Err(ParseError::Help),
+            other => return Err(ParseError::Invalid(format!("未知参数: {other}"))),
+        }
+        i += 1;
+    }
+    let command = match (file, url) {
+        (Some(_), Some(_)) => return Err(ParseError::Invalid("--file 与 --url 只能给一个".into())),
+        (Some(f), None) => Command::Install {
+            source: Source::File(f),
+            sha256: sha,
+            wait_for: wait,
+            force,
+        },
+        (None, Some(u)) => Command::Install {
+            source: Source::Url(u),
+            sha256: sha,
+            wait_for: wait,
+            force,
+        },
+        (None, None) => {
+            if sha.is_some() || wait.is_some() || force {
+                return Err(ParseError::Invalid(
+                    "--sha256 / --wait-for / --force 只在安装时使用".into(),
+                ));
+            }
+            Command::Launch
+        }
+    };
+    Ok(Options { command, root })
+}
+
+fn value(
+    argv: &[String],
+    i: &mut usize,
+    inline: Option<String>,
+    name: &str,
+) -> Result<String, ParseError> {
+    if let Some(v) = inline {
+        return Ok(v);
+    }
+    *i += 1;
+    argv.get(*i)
+        .cloned()
+        .ok_or_else(|| ParseError::Invalid(format!("{name} 缺值")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn argv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bare_invocation_launches() {
+        let opts = parse(&[]).unwrap();
+        assert!(matches!(opts.command, Command::Launch));
+        assert!(opts.root.is_none());
+    }
+
+    #[test]
+    fn root_overrides_the_install_dir() {
+        let opts = parse(&argv(&["--root", "/opt/mesh"])).unwrap();
+        assert!(matches!(opts.command, Command::Launch));
+        assert_eq!(
+            opts.root.as_deref(),
+            Some(std::path::Path::new("/opt/mesh"))
+        );
+    }
+
+    #[test]
+    fn file_install_accepts_inline_values() {
+        match parse(&argv(&[
+            "--file=p.tar.zst",
+            "--wait-for=42",
+            "--sha256",
+            "abc",
+        ]))
+        .unwrap()
+        .command
+        {
+            Command::Install {
+                source,
+                sha256,
+                wait_for,
+                force,
+            } => {
+                assert!(matches!(source, Source::File(ref p) if p.as_os_str() == "p.tar.zst"));
+                assert_eq!(sha256.as_deref(), Some("abc"));
+                assert_eq!(wait_for, Some(42));
+                assert!(!force);
+            }
+            _ => panic!("expected install"),
+        }
+    }
+
+    #[test]
+    fn force_is_install_only() {
+        match parse(&argv(&["--file", "p", "--force"])).unwrap().command {
+            Command::Install { force, .. } => assert!(force),
+            _ => panic!("expected install"),
+        }
+        assert!(parse(&argv(&["--force"])).is_err());
+    }
+
+    #[test]
+    fn url_and_file_are_exclusive() {
+        assert!(matches!(
+            parse(&argv(&["--file", "a", "--url", "b"])),
+            Err(ParseError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn install_only_flags_are_rejected_without_a_source() {
+        assert!(parse(&argv(&["--wait-for", "1"])).is_err());
+    }
+
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert!(parse(&argv(&["--nope"])).is_err());
+    }
+
+    #[test]
+    fn help_is_its_own_case() {
+        assert!(matches!(parse(&argv(&["--help"])), Err(ParseError::Help)));
+        assert!(matches!(parse(&argv(&["-h"])), Err(ParseError::Help)));
+    }
+}

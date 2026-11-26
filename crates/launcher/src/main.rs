@@ -1,0 +1,90 @@
+#![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
+
+mod args;
+mod install;
+mod launch;
+mod log;
+#[cfg(unix)]
+mod supervisor;
+
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+/// 启动器是命令行程序：没有 shell 窗口、有图标。成功不说话，失败写日志和 stderr。
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    // 先解析再决定安装根：--root 可以覆盖它，--help 不需要根。
+    let opts = match args::parse(&argv) {
+        Ok(opts) => opts,
+        Err(args::ParseError::Help) => {
+            eprintln!("{}", args::usage());
+            return ExitCode::SUCCESS;
+        }
+        Err(args::ParseError::Invalid(msg)) => {
+            eprintln!("mesh: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let root = match opts.root {
+        Some(path) => path,
+        None => match root_dir() {
+            Ok(root) => root,
+            Err(e) => {
+                eprintln!("mesh: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    log::init(&root);
+
+    let outcome: Result<i32, String> = match opts.command {
+        args::Command::Launch => launch_installed(&root),
+        args::Command::Install {
+            source,
+            sha256,
+            wait_for,
+            force,
+        } => install::run(&root, source, sha256, wait_for, force).map(|_| 0),
+    };
+
+    match outcome {
+        Ok(code) => ExitCode::from(code as u8),
+        Err(e) => {
+            log::line(&format!("失败: {e}"));
+            eprintln!("mesh: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// root_dir 就是启动器所在目录：bin/、packages/、config/、log/ 都在它下面。
+fn root_dir() -> Result<PathBuf, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+    exe.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "取安装目录失败".to_string())
+}
+
+/// launch_installed 在 Windows 上拉起客户端就放手：客户端是独立进程，
+/// 启动器确认它起来之后退出。
+#[cfg(windows)]
+fn launch_installed(root: &Path) -> Result<i32, String> {
+    // 上次安装没走完会留下 bin.old，先回到那一套再启动。
+    install::recover(root)?;
+    let exe = root.join("bin").join(launch::CLIENT_EXE);
+    if !exe.is_file() {
+        return Err(format!(
+            "{} 不存在；用 mesh --url <包地址> 装一个",
+            exe.display()
+        ));
+    }
+    log::line("启动客户端");
+    launch::start(&exe, root, None)?;
+    Ok(0)
+}
+
+/// Linux 上启动器是常驻的：它守着客户端，客户端退出后把退出码透传给 systemd。
+#[cfg(unix)]
+fn launch_installed(root: &Path) -> Result<i32, String> {
+    supervisor::run(root)
+}

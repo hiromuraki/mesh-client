@@ -1,0 +1,52 @@
+
+≥
+Í∏ÿµ	10.126.126.4/24"wsl*"›Êõÿ"182.150.123.150(Ü00øÃ2$02a60618-28b0-4eda-859a-bd40280f5b78:+ring://02a60618-28b0-4eda-859a-bd40280f5b78:tcp://0.0.0.0:11010:udp://0.0.0.0:11010:wg://0.0.0.0:11011:quic://0.0.0.0:11012:ws://0.0.0.0:11011/:wss://0.0.0.0:11012/:faketcp://0.0.0.0:11013:ws://[::]:11011/:tcp://[::]:11010:udp://[::]:11010:wss://[::]:11012/:wg://[::]:11011BŒhostname = "wsl"
+instance_id = "02a60618-28b0-4eda-859a-bd40280f5b78"
+dhcp = true
+listeners = [
+    "tcp://0.0.0.0:11010",
+    "udp://0.0.0.0:11010",
+    "wg://0.0.0.0:11011",
+    "quic://0.0.0.0:11012",
+    "ws://0.0.0.0:11011/",
+    "wss://0.0.0.0:11012/",
+    "faketcp://0.0.0.0:11013",
+]
+tcp_whitelist = []
+udp_whitelist = []
+
+[network_identity]
+network_name = "test-net"
+
+[[peer]]
+uri = "udp://wg0.daveny.cn:11010"
+
+[[peer]]
+uri = "tcp://wg0.daveny.cn:11010"
+
+[[peer]]
+uri = "udp://wg1.daveny.cn:11010"
+
+[[peer]]
+uri = "tcp://wg1.daveny.cn:11010"
+
+[[peer]]
+uri = "udp://wg2.daveny.cn:11010"
+
+[[peer]]
+uri = "tcp://wg2.daveny.cn:11010"
+
+[secure_mode]
+enabled = true
+local_private_key = "KMKOpha27yzRJhFgYGG0Uf0DNjwcKADCIdLNQnCiZe0="
+local_public_key = "7c2Vg2m+UkiCziNz6q0jqihw9e3X605hdXR5fJbPsQA="
+
+[flags]
+encryption_algorithm = "chacha20"
+J2.7.1-45a6b6f1-20261120R(0@Z8
+ñ˜Ÿ¥ÅÄ‡‡
+ÉÕœ‡
+ÅÄ»‡
+ÅÄ‹‡
+"‹¢ËÎÄÄÄè
+ 

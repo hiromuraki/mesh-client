@@ -1,0 +1,26 @@
+[package]
+name = "mesh-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 只依赖 etrpc：就绪探测要 NodeInfo，避免两处定义同一个结构。
+mesh-etrpc = { workspace = true }
+
+# Job 对象（KILL_ON_JOB_CLOSE）与进程组信号（setsid / kill(-pid)）各要一份系统调用。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    # CreateJobObjectW 的参数是 SECURITY_ATTRIBUTES，这一位是它的隐含依赖。
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+# 集成测试要判断“子进程还在不在”：unix 用 kill(pid, 0)。
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

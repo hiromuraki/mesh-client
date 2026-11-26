@@ -1,0 +1,30 @@
+[package]
+name = "mesh-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 依赖集合就是 MODULES.md 第 1 节那张图里指向 engine 的全部边。
+mesh-install = { workspace = true }
+mesh-state = { workspace = true }
+mesh-remote = { workspace = true }
+mesh-core = { workspace = true }
+mesh-etrpc = { workspace = true }
+serde = { workspace = true }
+# 更新包的摘要（客户端自己算一遍再交给启动器）与设备 id 的随机数。
+sha2 = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+
+# 本地时间（日志时间列，Go 用 time.Now().Format("15:04:05")）与 Unix 上的进程信号。
+# 自启的 schtasks 在阶段 2 接入，那时这里再加 Win32_UI_Shell 之类的位。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+# 测试里判断子进程还在不在（kill(pid, 0)）也要它。
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }

@@ -1,0 +1,18 @@
+[package]
+name = "mesh-panel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mesh-engine = { workspace = true }
+mesh-etrpc = { workspace = true }
+
+# 回环 HTTP 服务端。只监听 127.0.0.1、没有 SSE/WebSocket，请求量是浏览器 2 秒
+# 一次的轮询；tiny_http 是写完的 HTTP/1.1 实现，自己写协议没有收益。
+tiny_http = { workspace = true }
+# 编译期把前端构建产物嵌进二进制：frontend/dist 不存在时直接编译失败，
+# 不留 debug 期的文件系统回退。
+include_dir = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

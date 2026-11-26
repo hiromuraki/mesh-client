@@ -1,0 +1,63 @@
+# 客户端 workspace：九个成员，依赖方向由 crates/client/tests/dependency_direction.rs 盯着。
+# 划分依据与硬规则见 MODULES.md，不要在这里加“临时共享”的成员。
+[workspace]
+resolver = "2"
+members = [
+  "crates/install",
+  "crates/state",
+  "crates/remote",
+  "crates/etrpc",
+  "crates/core",
+  "crates/engine",
+  "crates/panel",
+  "crates/client",
+  "crates/launcher",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+
+[workspace.dependencies]
+mesh-install = { path = "crates/install" }
+mesh-state = { path = "crates/state" }
+mesh-remote = { path = "crates/remote" }
+mesh-etrpc = { path = "crates/etrpc" }
+mesh-core = { path = "crates/core" }
+mesh-engine = { path = "crates/engine" }
+mesh-panel = { path = "crates/panel" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+ed25519-dalek = "2"
+rand = "0.8"
+thiserror = "1"
+fs4 = "0.12"
+# 只解析响应的 Date 头（判断本机时钟偏差）。RFC 7231 的三种日期格式都认，
+# 自己写要把公历换算再写一遍，出错的表现是“时钟偏差算错 → 误判身份失效”。
+httpdate = "1"
+zstd = "0.13"
+tar = "0.4"
+ureq = { version = "2", default-features = false }
+windows-sys = "0.59"
+# 只有 Unix 上的 setsid / kill(-pid) / localtime_r 用得到，但版本要统一钉住。
+libc = "0.2"
+# 面板：回环 HTTP + 编译期嵌入前端产物。tiny_http 写完了 HTTP/1.1 的服务端，
+# 回环面板只需要 guard 与静态兜底，不值得自己写一遍协议。
+tiny_http = "0.12"
+include_dir = "0.7"
+# SIGTERM 是 systemd 停客户端的唯一入口，需要一个能安全唤醒主循环的迭代器线程。
+signal-hook = "0.3"
+
+# 与启动器原有配置一致：体积优先，panic 直接 abort 让启动器的回滚接住。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

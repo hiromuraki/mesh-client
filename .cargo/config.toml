@@ -1,0 +1,4 @@
+# musl 目标要用 musl-gcc 当 linker，否则 rustc 会用宿主机的 cc 去链 glibc，
+# 出来的是一个照样依赖 GLIBC_2.39 的“静态”二进制。搬自 client-launcher/。
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"

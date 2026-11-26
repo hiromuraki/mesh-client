@@ -1,0 +1,39 @@
+[package]
+name = "mesh-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+# Windows 资源（图标、requireAdministrator 清单、版本信息）由 build.rs 生成。
+build = "build.rs"
+
+[[bin]]
+name = "mesh-client"
+path = "src/main.rs"
+
+[dependencies]
+mesh-install = { workspace = true }
+mesh-state = { workspace = true }
+mesh-engine = { workspace = true }
+mesh-panel = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    # WNDCLASSEXW 的 hbrBackground 类型，缺了结构体直接不存在。
+    "Win32_Graphics_Gdi",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(unix)'.dependencies]
+# SIGTERM 是 systemd 停客户端的唯一入口：需要一个能安全唤醒主循环的迭代器线程。
+signal-hook = { workspace = true }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+# 依赖方向的编译期闸门（见 tests/dependency_direction.rs）：这条规则靠人记不住。
+[dev-dependencies]
+toml = { workspace = true }

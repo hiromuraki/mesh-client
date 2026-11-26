@@ -1,0 +1,10 @@
+[package]
+name = "mesh-etrpc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 只有 std：裸 TCP + 手写 protobuf。这个 crate 是升级 EasyTier 时唯一要改的地方，
+# 依赖越少越容易和 client/internal/easytierrpc/wire.go 逐条对读。
+thiserror = { workspace = true }

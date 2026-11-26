@@ -1,0 +1,35 @@
+[package]
+name = "mesh-launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "mesh"
+path = "src/main.rs"
+
+[dependencies]
+# 搬自 client-launcher/Cargo.toml。版本、失败计数、清单解析换成 mesh-install，
+# 所以 serde/serde_json 不再需要；其余依赖与原件一致。
+mesh-install = { workspace = true }
+zstd = { workspace = true }
+tar = { workspace = true }
+sha2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    # 看似没用到，实际是 Win32_UI_Shell 的隐含依赖：去掉它 ShellExecuteExW /
+    # SHELLEXECUTEINFOW 会直接不存在。
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# 只用系统自带的 TLS（Windows 上是 schannel）：rustls + ring 会给 exe 多加
+# 半兆，而这个启动器只下一个包，不需要自带一套 TLS 实现。
+# Linux 版不引它：那边用系统的 curl，静态 musl 下把 openssl 链进来不值得。
+ureq = { workspace = true, features = ["native-tls"] }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
