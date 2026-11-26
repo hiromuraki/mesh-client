@@ -1,0 +1,38 @@
+/* 界面字体一律用系统自带：这是网页面板，不该为了字面把几 MB 字体塞进二进制。
+   中英文混排的顺序是「先让系统挑一个自家的西文字体，再让它挑一个自家的中文字体」，
+   这样 Windows / macOS / Linux 各自用到最熟悉的那套字形，也不会出现中文落到
+   Times 之类的衬线字体上。 */
+/* 单色板：任何地方都不做渐变。层次靠间距、字号和一条极浅的分隔线表达，
+   不靠阴影和描边卡片堆叠。 */
+:root{
+  --bg:#f4f5f7;
+  --wash:#fafbfc;
+  --card:#fff;
+  --ink:#111827;
+  --muted:#6b7280;
+  --faint:#9aa3af;
+  --line:#e6e8eb;
+  --line-soft:#f0f2f4;
+  --blue:#2563eb;
+  --green:#15803d;
+  --orange:#c2410c;
+  --red:#b91c1c;
+  /* 西文优先取系统 UI 字体（Windows 上是 Segoe UI，macOS 上是 SF，Linux 上
+     通常是 Cantarell / Noto Sans）；中文依次交给苹方、雅黑、Noto/思源，都是
+     各家自己最常用的那套。system-ui 放最前，让每个平台先用自己的默认 UI 字。 */
+  --sans:system-ui,-apple-system,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei UI","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC",sans-serif;
+  /* 等宽只留给日志正文和地址那几列：那是真需要字符网格的地方。
+     末尾补上中文字体——等宽字体都没有汉字，不补的话中文会被浏览器丢给
+     NSimSun 一类的系统等宽，和界面其它地方不是一套字。 */
+  --mono:ui-monospace,"Cascadia Mono",Consolas,"SF Mono","Liberation Mono","DejaVu Sans Mono","PingFang SC","Microsoft YaHei UI","Noto Sans CJK SC",monospace;
+}
+*{box-sizing:border-box}
+html,body,#app{height:100%}
+/* 不加 -webkit-font-smoothing:antialiased：在 Windows 上它会把 ClearType 的
+   次像素抗锯齿换成灰度抗锯齿，13px 中文会变灰变闷、看着更粗更糊。 */
+body{margin:0;overflow:hidden;background:var(--bg);color:var(--ink);font:13px/1.55 var(--sans)}
+
+/* 数字列一律等宽对齐，省掉每个表格自己去排 tabular-nums。 */
+.num,dd,time{font-variant-numeric:tabular-nums}
+[hidden]{display:none!important}
+

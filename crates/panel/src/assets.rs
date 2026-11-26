@@ -7,7 +7,7 @@
 use crate::router::Response;
 use include_dir::{include_dir, Dir};
 
-static DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../../client/frontend/dist");
+static DIST: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../../frontend/dist");
 
 /// 控制面板只有单页：不存在的路径一律回 index.html（Go 的 handleStatic 同样把
 /// 未知路径改写成 /）。
