@@ -37,14 +37,17 @@ pub fn manifest_string(slot: &str, platform: &str, version: &str, files_digest: 
 
 /// 清单里全部文件摘要的汇总，签的就是它。
 ///
-/// 每行 `<名字>\t<摘要小写>\n`，按名字的字节序升序——`BTreeMap` 的迭代顺序正是这个，
+/// 每行 `<名字>::<摘要小写>\n`，按名字的字节序升序——`BTreeMap` 的迭代顺序正是这个，
 /// Go 侧显式排序。不用 JSON 重编码：键序、转义、空白在两端的序列化器里默认行为不同，
 /// 而这类分叉的表现是「本地全绿、线上每台都拒绝启动」。
+///
+/// 分隔符用 `::` 而不是制表符：摘要是固定的 64 位十六进制，从行尾剥掉 `\n` 与摘要之后
+/// 分隔符的位置唯一，两种写法都不会产生歧义；选前者只是因为它在日志与 diff 里能读。
 pub fn files_digest(files: &BTreeMap<String, String>) -> String {
     let mut hasher = Sha256::new();
     for (name, sha) in files {
         hasher.update(name.as_bytes());
-        hasher.update(b"\t");
+        hasher.update(b"::");
         // 构建脚本写的是小写，但两端都归一：万一混进大写，签名与验签不该因此分叉。
         hasher.update(sha.to_ascii_lowercase().as_bytes());
         hasher.update(b"\n");
@@ -187,7 +190,7 @@ mod tests {
         let map = files(&[("wintun.dll", "cd"), ("mesh-client.exe", "ab")]);
         assert_eq!(
             files_digest(&map),
-            "413197c7129625e41d736404c8f37d3d277e269a5632db7b9165727b3f5c96a5"
+            "442a109466d320336abdcbad56bdb6cf6fdbf262a50232c599000820f85f31c0"
         );
     }
 
@@ -322,8 +325,8 @@ mod tests {
     #[test]
     fn a_manifest_signature_from_the_release_key_verifies() {
         const SIGNATURE: &str = concat!(
-            "2d7690b80104b2d8189a496dbd9f9724d88bc6cd8e0aa80dda6284c7bbf18984",
-            "456910cfa31ff06851522c6e99099f8dc408a7cb01d25a92a6fc6cddb2715e07",
+            "d3c064d70098d40a7d9d9c7a6ad859f1429a5ccbbe837839c6f4e8056d510ddb",
+            "41f2e3b37b810160df718b99199d719e1271a4f75608851b006474d7ec74ef02",
         );
         let mut map = files(&[("mesh-client.exe", "ab"), ("wintun.dll", "cd")]);
         assert!(verify_manifest(
