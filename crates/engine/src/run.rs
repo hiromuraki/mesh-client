@@ -1,10 +1,10 @@
-//! 引擎线程：连接循环、命令处理、core 事件与退避重拉。
+//! 引擎线程：一个事件循环，控制面与 core 各按自己的期限推进。
 //!
-//! 只有这个线程读写 [`Engine`] 里的状态。别的线程（心跳、STUN、下载、面板）只能通过
+//! 只有这个线程读写 [`Engine`] 里的状态。别的线程（心跳、下载、面板、STUN）只能通过
 //! [`Cmd`] 投递结果、通过 [`StateCell`] 读快照。
 //!
-//! 连接循环的形状与 Go 的 `engine.run` 一致，只是“等退避”换成了 inbox 的
-//! `recv_timeout`：等待期间设置请求、配置下发、core 事件照常处理，退避也不占线程。
+//! 循环只有一个：每次唤醒取「下一次联系控制面」与「下一次重拉 core」里最早的那个，
+//! 到点各推进各的。控制面不可达只会让心跳退避，不会让 core 的监督停下来。
 
 use crate::autostart;
 use crate::clock;
@@ -13,7 +13,7 @@ use crate::views::{Snapshot, StateCell};
 use crate::{coreline, sync, update, Reply, Shutdown};
 use mesh_install::layout;
 use mesh_remote as remote;
-use mesh_state::hints::ConfigHints;
+use mesh_state::hints::{parse_hints, ConfigHints};
 use mesh_state::{ClientConfig, Store};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -38,8 +38,10 @@ const REVIVE_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 /// STUN 结果的刷新间隔。
 pub(crate) const STUN_REFRESH_INTERVAL: Duration = Duration::from_secs(20);
+/// 本地身份读不出来时的重试间隔。
+const LOCAL_STATE_RETRY: Duration = Duration::from_secs(5);
 
-/// 面向界面的连接状态。
+/// 面向界面的连接状态。只由 `Engine::status` 从两个生命周期推导，处理器不直接写它。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Unconfigured,
@@ -63,28 +65,28 @@ impl Status {
 
 /// 引擎的入队点。后台路径只是“把结果交回来”，所有判断都在引擎线程里做。
 pub enum Cmd {
-    /// 心跳线程只负责取样，401 的分类处理在引擎里。
+    /// 心跳线程只负责取样与发请求；响应处理在引擎里，首次与周期走同一段。
     Heartbeat {
-        /// 发这条结果的心跳代次。重连之后的旧结果由引擎丢掉（见 `on_heartbeat`）。
+        /// 发这条结果的心跳代次。重连/换身份之后的旧结果由引擎丢掉。
         gen: u64,
         result: Result<Option<remote::Heartbeat>, remote::Error>,
     },
     Core(mesh_core::Event),
-    Stun(mesh_etrpc::StunInfo),
+    /// STUN 刷新结果。带 core 代次：查询期间换了 core，这份结果就不属于现在这个实例。
+    Stun {
+        gen: u64,
+        info: mesh_etrpc::StunInfo,
+    },
     /// 一份下载任务的完成消息。带着任务代次：撤回、同版本重发与换任务之后，
-    /// 旧任务的结果不许消费新状态（F5）。
+    /// 旧任务的结果不许消费新状态。
     Download {
         task: update::DownloadTask,
         result: Result<PathBuf, String>,
     },
-    /// 启动器替换的结果：盘上那份换了没有（F6）。
-    ///
-    /// `retry` 表示这次只是安装根被启动器占着（F4）：不算结论，下一轮再来。
+    /// 启动器替换的结果。锁被占是“没结论”，不是失败。
     Launcher {
-        version: String,
-        sha256: String,
-        replaced: bool,
-        retry: bool,
+        task: update::DownloadTask,
+        result: update::LauncherResult,
     },
     Settings(SettingsInput, Reply<Result<Snapshot, String>>),
     Reset(Reply<Result<Snapshot, String>>),
@@ -111,15 +113,48 @@ pub struct Config {
     pub auto_update_disabled: bool,
 }
 
-/// 一次 core 代管。`gen` 是引擎分配的代号，事件按它归并。
+/// 控制面生命周期的推进点。`due` 是唯一的时间状态：请求在途时为 `None`，否则是
+/// 下一次心跳（例行或重试）的时刻。
+#[derive(Default)]
+pub(crate) struct Control {
+    /// 心跳代次：每发一次加一，旧代次的结果不认。
+    pub gen: u64,
+    /// 连续失败次数：连接退避的档位。
+    pub failures: u32,
+    /// 下一次联系控制面的时刻。
+    pub due: Option<Instant>,
+}
+
+/// 一代 core 的期望输入。
+///
+/// 期望规格与运行实例实际应用的规格相等就不换进程，不等就换：配置同步、改名、
+/// 凭据轮换与重新绑定都走这一条判据，不再各写一套“要不要重启”。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoreSpec {
+    /// 身份代次：控制面地址 + 设备 id。两者一起才是一代——设备 id 是客户端生成的，
+    /// 两个控制面上可以是同一个。
+    pub generation: String,
+    /// 磁盘上 `config.toml` 的摘要（16 位十六进制）。
+    pub config_hash: String,
+    /// 实际传给 `--hostname` 的名字。
+    pub hostname: String,
+    /// 身份二选一；凭据节点带着 core 实际加载的那张 id。
+    pub auth: AuthMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuthMode {
+    Formal,
+    Credential(String),
+}
+
+/// 一次 core 代管。`gen` 是引擎分配的代号，事件按它归并；`spec` 是它实际应用的
+/// 规格；`pid` 为零表示还没就绪（`Started` 之后才有进程号）。
 pub(crate) struct CoreRun {
     pub gen: u64,
     pub pid: u32,
-    /// 这一代 core 实际加载的凭据 id（正式节点为空串）。
-    pub cred_id: String,
+    pub spec: CoreSpec,
     pub rpc_addr: SocketAddr,
-    /// 收到 `Started` 之后才是“真的起来了”。
-    pub started: bool,
     /// 就绪时刻（unix 秒），给快照用。
     pub started_unix: i64,
 }
@@ -158,11 +193,16 @@ pub(crate) struct Engine {
     pub(crate) self_tx: Sender<Cmd>,
     pub(crate) core_tx: Sender<mesh_core::Cmd>,
 
-    pub(crate) status: Status,
-    pub(crate) last_error: String,
     pub(crate) client: Option<ClientConfig>,
+    /// 下载与启动器替换用的连接；不参与任何“是否在线”的判断。
     pub(crate) api: Option<Arc<remote::Client>>,
+    pub(crate) control: Control,
     pub(crate) last_hb: i64,
+    /// 最近一次失败的说明（界面上的错误行）。
+    pub(crate) last_error: String,
+    /// 需要人看一眼的失败（本地状态、配置、core 启动）。为空表示没有这种失败。
+    pub(crate) fault: String,
+
     pub(crate) core: Option<CoreRun>,
     /// 上一代 core 就绪的时刻：重拉档位靠它判断“刚起来就死”。
     pub(crate) last_core_started_at: Option<Instant>,
@@ -170,13 +210,12 @@ pub(crate) struct Engine {
     pub(crate) revive_attempt: u32,
     pub(crate) next_gen: u64,
     pub(crate) revive: Option<Revive>,
+
     pub(crate) auth_fails: u32,
     pub(crate) update: update::UpdateState,
-    /// 自动安装去重用的摘要（与服务端 offer 同一判据：版本号重发内容会变）。
-    pub(crate) auto_tried: Option<String>,
-    /// 下载任务的代次，只增不减：换 offer 会重置 `update`，代次不能跟着重置，
+    /// 下载任务的代次，只增不减：换 offer 会重置其状态，代次不能跟着重置，
     /// 否则旧任务的完成消息会认领新任务。
-    pub(crate) next_download: u64,
+    pub(crate) next_task: u64,
     /// 启动器槽位的本地状态。与 `update` 分开：那份会随客户端包 offer 重建。
     pub(crate) launcher: update::LauncherState,
     /// 开机自启任务是否存在。查询要起一个 `schtasks` 进程，所以缓存起来，由
@@ -192,14 +231,8 @@ pub(crate) struct Engine {
     pub(crate) core_path_used: String,
     pub(crate) network_name: String,
     pub(crate) stun: mesh_etrpc::StunInfo,
-    pub(crate) hb_stop: Option<Sender<()>>,
-    /// 心跳代次：每起一代心跳线程加一。上一代线程卡在请求里的时候重连了，它带回来
-    /// 的结果属于旧连接（旧控制面、旧 URL、旧凭据），必须丢掉，不能当成这一次心跳。
-    pub(crate) hb_gen: u64,
-    /// STUN 刷新线程的停止通道。与心跳一样按连接循环的生命周期管理：每次重连新起
-    /// 一个而不停旧的，线程就会按心跳的节奏无限累积（core 长期起不来时 2 个/分钟）。
+    /// STUN 刷新线程的停止通道：整条引擎线程一个，不再随重连新建。
     pub(crate) stun_stop: Option<Sender<()>>,
-    pub(crate) closed: bool,
 }
 
 /// 起引擎线程，返回它的命令入口与线程句柄。
@@ -287,11 +320,12 @@ pub fn spawn(
         self_tx: tx.clone(),
         inbox,
         core_tx,
-        status: Status::Unconfigured,
-        last_error: String::new(),
         client: None,
         api: None,
+        control: Control::default(),
         last_hb: 0,
+        last_error: String::new(),
+        fault: String::new(),
         core: None,
         last_core_started_at: None,
         revive_attempt: 0,
@@ -299,8 +333,7 @@ pub fn spawn(
         revive: None,
         auth_fails: 0,
         update: update::UpdateState::default(),
-        auto_tried: None,
-        next_download: 0,
+        next_task: 0,
         launcher,
         autostart_on: false,
         identity: IdentityMeta::default(),
@@ -311,10 +344,7 @@ pub fn spawn(
         core_path_used: String::new(),
         network_name: String::new(),
         stun: mesh_etrpc::StunInfo::default(),
-        hb_stop: None,
-        hb_gen: 0,
         stun_stop: None,
-        closed: false,
         config,
     };
     let handle = thread::Builder::new()
@@ -326,10 +356,8 @@ pub fn spawn(
 
 /// `pump` 的结果。
 enum Flow {
-    /// 给的时间用完了（该做下一件事，比如重连或重拉 core）。
+    /// 给的时间用完了（该推进到期的那一件事）。
     Timeout,
-    /// 收到“要重来一遍连接循环”的命令（设置、重置、手动重连）。
-    Restart,
     /// 命令端全部断开（进程要退了）。
     Closed,
 }
@@ -347,125 +375,41 @@ impl Engine {
         self.clean_update_dir();
         self.refresh_identity();
         self.refresh_autostart();
-        self.publish();
-        // 先用磁盘上那份配置把 core 拉起来，再进连接循环：控制面不可达只该让状态
+        self.reload_identity();
+        // 先用磁盘上那份配置把 core 拉起来，再开始心跳：控制面不可达只该让状态
         // 降级，不该把数据面一起停掉。
         self.start_core_from_disk();
-        self.connection_loop();
-        self.stop_heartbeat();
+        self.start_stun_loop();
+        self.publish();
+        loop {
+            if self.shutdown.triggered() {
+                break;
+            }
+            match self.pump() {
+                Flow::Timeout => {
+                    self.on_deadline();
+                    self.publish();
+                }
+                Flow::Closed => break,
+            }
+        }
         self.stop_stun_loop();
         let _ = self.stop_core();
         self.publish();
         self.log.close();
     }
 
-    fn connection_loop(&mut self) {
-        let mut connect_failures = 0u32;
-        loop {
-            let config = match self.load_client() {
-                sync::Loaded::Failed(err) => {
-                    self.set_client(None);
-                    let msg = mesh_text::format(
-                        mesh_text::id::ENGINE_LOG_LOCAL_STATE_READ_FAILED,
-                        &[&err],
-                    );
-                    self.set_status(Status::Error, msg.clone());
-                    self.logf("app", &msg);
-                    if !self.wait(Duration::from_secs(5)) {
-                        return;
-                    }
-                    continue;
-                }
-                sync::Loaded::Missing => {
-                    self.set_client(None);
-                    // 无 client.json / 无 device_id：设置页该出场了，不需要重连。
-                    let last = self.last_error.clone();
-                    self.set_status(Status::Unconfigured, last);
-                    if !self.wait(Duration::from_secs(2)) {
-                        return;
-                    }
-                    continue;
-                }
-                sync::Loaded::Configured(config) => config,
-            };
-            self.set_client(Some(config.clone()));
-            self.set_status(Status::Connecting, String::new());
-            self.publish();
-            match self.connect(&config) {
-                Err(sync::ConnectError::IdentityInvalid) => continue,
-                Err(sync::ConnectError::Failed(err)) => {
-                    if self.closed {
-                        return;
-                    }
-                    connect_failures += 1;
-                    self.set_status(Status::Error, err.clone());
-                    self.logf(
-                        "app",
-                        &mesh_text::format(mesh_text::id::ENGINE_LOG_CONNECT_FAILED, &[&err]),
-                    );
-                    if !self.wait(connect_backoff(connect_failures)) {
-                        return;
-                    }
-                    continue;
-                }
-                Ok(()) => {}
-            }
-            connect_failures = 0;
-            // core 起不来（比如还没拿到凭据）不是连接失败：控制面已经通了，心跳要继续
-            // 跑，否则凭据永远下不来。状态保留启动失败记下的原因。
-            if self.core_running() {
-                self.mark_online();
-            }
-            self.logf(
-                "app",
-                &mesh_text::format(
-                    mesh_text::id::ENGINE_LOG_CONNECTED_SERVER,
-                    &[&config.server_url],
-                ),
-            );
-            self.start_heartbeat();
-            self.start_stun_loop();
-            self.publish();
-            // 连接建立之后就一直在这里处理命令，直到需要重连或退出。
-            loop {
-                match self.pump(self.next_deadline()) {
-                    Flow::Timeout => self.on_deadline(),
-                    Flow::Restart => break,
-                    Flow::Closed => {
-                        self.closed = true;
-                        self.stop_heartbeat();
-                        self.stop_stun_loop();
-                        return;
-                    }
-                }
-            }
-            self.stop_heartbeat();
-            self.stop_stun_loop();
-            if self.closed {
-                return;
-            }
-        }
-    }
-
-    /// 处理 inbox 直到 `timeout` 用完（`None` 表示一直等），期间每条消息都会发布快照。
-    fn pump(&mut self, timeout: Option<Duration>) -> Flow {
-        let deadline = timeout.map(|wait| Instant::now() + wait);
+    /// 处理 inbox，直到某一边的期限到点或命令端断开；每条消息之后发布快照。
+    ///
+    /// 期限在每条命令之后重新算：命令本身可能把下一次心跳提前（设置、重连），
+    /// 拿消息进来之前的期限继续等会让它白等一个周期。
+    fn pump(&mut self) -> Flow {
         loop {
             // 收尾已经开始：退出只有一条路（Shutdown），引擎不必再处理任何命令。
             if self.shutdown.triggered() {
                 return Flow::Closed;
             }
-            let wait = match deadline {
-                Some(deadline) => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Flow::Timeout;
-                    }
-                    Some(deadline - now)
-                }
-                None => None,
-            };
-            let received = match wait {
+            let received = match self.next_deadline() {
                 Some(wait) => self.inbox.recv_timeout(wait),
                 None => self
                     .inbox
@@ -474,95 +418,52 @@ impl Engine {
             };
             match received {
                 Ok(cmd) => {
-                    if self.handle(cmd) {
-                        return Flow::Restart;
-                    }
+                    self.handle(cmd);
+                    self.publish();
                 }
                 Err(RecvTimeoutError::Timeout) => return Flow::Timeout,
                 Err(RecvTimeoutError::Disconnected) => return Flow::Closed,
             }
-            self.publish();
         }
     }
 
-    /// 等一段时间，期间照常处理命令。返回 false 表示命令端断开、该退出了。
-    fn wait(&mut self, wait: Duration) -> bool {
-        match self.pump(Some(wait)) {
-            Flow::Closed => {
-                self.closed = true;
-                false
-            }
-            // 等待期间收到的“重连”请求：这次等待提前结束，按原来的路径重试即可。
-            Flow::Timeout | Flow::Restart => true,
+    /// 下一次该被唤醒的时刻：控制面与 core 各自期限里最早的那个。
+    pub(crate) fn next_deadline(&self) -> Option<Duration> {
+        let control = self.control.due;
+        let revive = self.revive.as_ref().map(|revive| revive.due);
+        control
+            .into_iter()
+            .chain(revive)
+            .min()
+            .map(|due| due.saturating_duration_since(Instant::now()))
+    }
+
+    /// 到点了：两边各自看自己的期限，互不影响。
+    pub(crate) fn on_deadline(&mut self) {
+        let now = Instant::now();
+        if self.revive.as_ref().is_some_and(|revive| revive.due <= now) {
+            self.revive_core();
+        }
+        if self.control.due.is_some_and(|due| due <= now) {
+            self.beat();
         }
     }
 
-    /// 下一次该被唤醒的时刻：当前只有重拉 core 的退避。
-    fn next_deadline(&self) -> Option<Duration> {
-        let revive = self.revive.as_ref()?;
-        Some(revive.due.saturating_duration_since(Instant::now()))
-    }
-
-    /// 到点了：尝试重拉 core。失败就再排一次（退避在**每次尝试之前**等）。
-    fn on_deadline(&mut self) {
-        let Some(revive) = self.revive.take() else {
-            return;
-        };
-        if Instant::now() < revive.due {
-            self.revive = Some(revive);
-            return;
-        }
-        match self.start_core(false) {
-            Ok(()) => {
-                // 等 Started 事件；这一步只说明“已经把启动请求发出去了”。
-                self.logf(
-                    "app",
-                    mesh_text::get(mesh_text::id::ENGINE_LOG_CORE_REVIVED),
-                );
-            }
-            Err(err) => {
-                let msg = mesh_text::format(
-                    mesh_text::id::ENGINE_LOG_CORE_START_FAILED_ATTEMPT,
-                    &[&revive.attempt, &err],
-                );
-                self.set_status(Status::Degraded, msg.clone());
-                self.logf("app", &msg);
-                self.schedule_revive(revive.attempt + 1);
-            }
-        }
-    }
-
-    /// 处理一条命令；返回 true 表示要重新走一遍连接循环。
-    pub(crate) fn handle(&mut self, cmd: Cmd) -> bool {
+    /// 处理一条命令。
+    pub(crate) fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Heartbeat { gen, result } => {
-                self.on_heartbeat(gen, result);
-                false
+            Cmd::Heartbeat { gen, result } => self.on_heartbeat(gen, result),
+            Cmd::Core(event) => self.on_core_event(event),
+            Cmd::Stun { gen, info } => {
+                // 只有仍在跑的那一代 core 的探测结果才算数。
+                if self.core.as_ref().is_some_and(|core| core.gen == gen) {
+                    self.stun = info;
+                }
             }
-            Cmd::Core(event) => {
-                self.on_core_event(event);
-                false
-            }
-            Cmd::Stun(stun) => {
-                self.stun = stun;
-                false
-            }
-            Cmd::Download { task, result } => {
-                self.on_download(task, result);
-                false
-            }
-            Cmd::Launcher {
-                version,
-                sha256,
-                replaced,
-                retry,
-            } => {
-                self.on_launcher_result(version, sha256, replaced, retry);
-                false
-            }
+            Cmd::Download { task, result } => self.on_download(task, result),
+            Cmd::Launcher { task, result } => self.on_launcher_result(task, result),
             Cmd::Settings(input, reply) => {
                 let result = self.save_settings(input);
-                let restart = result.is_ok();
                 if let Err(err) = &result {
                     self.notify(&mesh_text::format(
                         mesh_text::id::ENGINE_TEXT_SAVE_SETTINGS_FAILED,
@@ -571,14 +472,11 @@ impl Engine {
                 }
                 let snapshot = self.snapshot();
                 let _ = reply.send(result.map(|()| snapshot).map_err(|err| err.to_string()));
-                restart
             }
             Cmd::Reset(reply) => {
                 let result = self.reset_config();
-                let restart = result.is_ok();
                 let snapshot = self.snapshot();
                 let _ = reply.send(result.map(|()| snapshot).map_err(|err| err.to_string()));
-                restart
             }
             Cmd::SetAutostart(enabled, reply) => {
                 let result = self.set_autostart(enabled);
@@ -590,106 +488,163 @@ impl Engine {
                 }
                 let snapshot = self.snapshot();
                 let _ = reply.send(result.map(|()| snapshot).map_err(|err| err.to_string()));
-                false
             }
             Cmd::ApplyUpdate(reply) => {
                 let result = self.apply_update();
                 let _ = reply.send(result);
-                false
             }
             Cmd::Reconnect => {
                 self.logf(
                     "app",
                     mesh_text::get(mesh_text::id::ENGINE_LOG_RECONNECT_MANUAL),
                 );
-                true
+                self.rebind();
             }
         }
     }
 
-    /// 心跳结果的处理：恢复状态、下发配置/更新/凭据、必要时让主循环重连。
+    /// 一次心跳请求。没有身份就先从盘上读一遍；读不到就等设置页。
+    fn beat(&mut self) {
+        if self.client.is_none() {
+            self.reload_identity();
+        }
+        let Some(request) = self.beat_request() else {
+            return;
+        };
+        self.control.gen = self.control.gen.wrapping_add(1);
+        let gen = self.control.gen;
+        // 结果回来之前不再发第二次：请求在途时没有“下一次联系控制面”的时刻。
+        self.control.due = None;
+        let tx = self.self_tx.clone();
+        let spawned = thread::Builder::new()
+            .name("mesh-heartbeat".to_string())
+            .spawn(move || {
+                let result = request.api.heartbeat(
+                    &request.hash,
+                    &request.app_version,
+                    &request.credential_id,
+                    request.known.as_deref(),
+                    HEARTBEAT_TIMEOUT,
+                );
+                let _ = tx.send(Cmd::Heartbeat { gen, result });
+            });
+        if let Err(err) = spawned {
+            self.note_control_failure(&mesh_text::format(
+                mesh_text::id::ENGINE_LOG_CONNECT_FAILED,
+                &[&err],
+            ));
+        }
+    }
+
+    /// 这一轮心跳要上报的事实。取样在引擎线程里做，与发请求的线程无关。
+    fn beat_request(&mut self) -> Option<BeatRequest> {
+        let config = self.client.clone()?;
+        let key = match self.store.signing_key() {
+            Ok(key) => key,
+            Err(err) => {
+                self.note_control_failure(&mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_READ_DEVICE_KEY_FAILED,
+                    &[&err],
+                ));
+                return None;
+            }
+        };
+        let api = Arc::new(remote::Client::new(
+            &config.server_url,
+            &config.device_id,
+            key,
+        ));
+        self.api = Some(Arc::clone(&api));
+        Some(BeatRequest {
+            api,
+            hash: self.hash(),
+            app_version: self.config.self_version.clone(),
+            credential_id: self.credential_id(),
+            known: self.known_app_update(),
+        })
+    }
+
+    /// 心跳结果：成功走唯一的响应处理，失败按退避排下一次。
     ///
     /// `gen` 不是当前代次就直接丢掉：那条结果说的是另一条连接上的事——它可能把
-    /// 状态改回 online、用旧响应里的 URL 去下载、把旧控制面的配置与凭据落盘，甚至
+    /// 状态改回在线、用旧响应里的 URL 去下载、把旧控制面的配置与凭据落盘，甚至
     /// 按旧连接的 401 清掉刚换好的身份。
     pub(crate) fn on_heartbeat(
         &mut self,
         gen: u64,
         result: Result<Option<remote::Heartbeat>, remote::Error>,
     ) {
-        if gen != self.hb_gen {
+        if gen != self.control.gen {
             return;
         }
         let api = match self.api.clone() {
             Some(api) => api,
             None => return,
         };
-        let heartbeat = match result {
-            Ok(heartbeat) => heartbeat,
+        match result {
+            Ok(heartbeat) => {
+                self.control.failures = 0;
+                self.last_hb = clock::unix_now();
+                self.reset_auth_fails();
+                self.control.due = Some(Instant::now() + HEARTBEAT_INTERVAL);
+                self.on_beat(api, heartbeat.unwrap_or_default());
+            }
             Err(err) => {
                 if matches!(err, remote::Error::Unauthorized { .. }) {
-                    // 401 不再一律清身份：吊销立即清，时钟偏差只降级提示，其余连续多次才清。
+                    self.control.failures = self.control.failures.saturating_add(1);
                     if self.handle_auth_rejected(&err) {
-                        self.closed = false;
+                        // 身份已被服务端判定无效：回设置页，不再有心跳期限。
+                        self.unbind();
+                        return;
                     }
+                    self.control.due =
+                        Some(Instant::now() + connect_backoff(self.control.failures));
                     return;
                 }
-                let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_HEARTBEAT_FAILED, &[&err]);
-                self.logf("app", &msg);
-                self.degrade(&msg);
-                return;
+                self.note_control_failure(&mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_HEARTBEAT_FAILED,
+                    &[&err],
+                ));
             }
-        };
-        self.reset_auth_fails();
-        self.last_hb = clock::unix_now();
-        // 心跳成功且 core 在跑，说明链路是通的：error 多半来自上一次失败的配置同步，
-        // 而服务端把配置改回去之后不会再有任何事件把状态拉回 online。
-        let recovered = if self.core_running()
-            && (self.status == Status::Degraded || self.status == Status::Error)
-        {
-            self.status = Status::Online;
-            self.last_error.clear();
-            true
-        } else {
-            false
-        };
-        if recovered {
+        }
+    }
+
+    /// 一次成功心跳的响应处理。首次心跳与之后每一轮走同一段，没有“首轮”分支。
+    fn on_beat(&mut self, api: Arc<remote::Client>, heartbeat: remote::Heartbeat) {
+        // 凭据先落盘：core 只在下一次启动时读到它，`ensure_core` 会因为规格变化换进程。
+        if self.save_credential(&heartbeat) {
             self.logf(
                 "app",
-                mesh_text::get(mesh_text::id::ENGINE_LOG_HEARTBEAT_RECOVERED),
+                mesh_text::get(mesh_text::id::ENGINE_LOG_CREDENTIAL_RECEIVED_RESTART),
             );
         }
-        let res = heartbeat.unwrap_or_default();
-        if res.app_update.is_some() {
-            self.offer_update(res.app_update.as_ref());
-            // 上一轮没拿到安装根写权的那份包：心跳就是重试提交的节拍。
-            self.resume_commit();
-            self.auto_apply();
-        } else {
-            // 服务端不再提供这份 offer（撤回）：显式迁移，不让旧任务的结果续命。
-            self.clear_stale_update();
-        }
+        self.offer_update(heartbeat.app_update.as_ref());
         // 启动器单独一路：控制面每次都带，客户端自己比摘要；下载放后台跑。
-        self.apply_launcher(&api, res.launcher.as_ref());
-        // 凭据：服务端只在签发的那一刻带私钥，之后就只剩 id。
-        if self.apply_credential(&res) {
-            self.trigger_restart();
-        }
-        if !res.config_hash.is_empty() && res.config_hash != self.hash() {
+        self.apply_launcher(&api, heartbeat.launcher.as_ref());
+        if !heartbeat.config_hash.is_empty() && heartbeat.config_hash != self.hash() {
             self.logf(
                 "app",
                 mesh_text::get(mesh_text::id::ENGINE_LOG_CONFIG_CHANGED_SYNC),
             );
-            self.apply_remote(&res);
         }
+        self.apply_remote(&heartbeat);
         // 自启状态只在启动、用户改动和这里刷新：快照两秒一次，不可能每次都去起进程。
-        // 用心跳当节拍也顺带接住“任务被组策略或用户从系统里删掉”这种情况。
         self.refresh_autostart();
-        // 心跳通了、core 却没在跑：让主循环重新走一遍 connect，它会补启动 core。
-        // 缺凭据就是这一类——凭据只能从心跳里来，重试必须挂在心跳上。
-        if !self.core_running() {
-            self.trigger_restart();
-        }
+        // 心跳是节拍：自动安装、被推迟的提交与失败的下载都在这里推进。
+        self.advance_update();
+        // 心跳通了、core 却没在跑：按当前规格补启动（缺凭据也要等下一轮心跳）。
+        self.ensure_core_or_report();
+    }
+
+    /// 记一次控制面失败：退避档位加一，下一次心跳排到退避之后。
+    ///
+    /// 取样失败（读私钥、起线程）与请求失败走同一条路径，否则前者会一直停在
+    /// “connecting”而看起来什么都没发生。
+    fn note_control_failure(&mut self, message: &str) {
+        self.control.failures = self.control.failures.saturating_add(1);
+        self.last_error = message.to_string();
+        self.logf("app", message);
+        self.control.due = Some(Instant::now() + connect_backoff(self.control.failures));
     }
 
     /// core 事件：只认当前这一代，其余都是主动停止/替换留下的迟到事件。
@@ -703,18 +658,16 @@ impl Engine {
                     return;
                 }
                 core.pid = pid;
-                core.started = true;
                 core.started_unix = clock::unix_now();
                 self.last_core_started_at = Some(Instant::now());
                 self.local_ip = strip_cidr(&node.ipv4).to_string();
                 self.core_version = node.version.clone();
                 self.stun = node.stun.clone();
+                self.revive = None;
+                // core 启动失败留下的错误不再成立；两个平面都正常时由 publish 收口。
+                self.fault.clear();
                 if !self.hints.network_name.is_empty() {
                     self.network_name = self.hints.network_name.clone();
-                }
-                self.revive = None;
-                if self.api.is_some() {
-                    self.mark_online();
                 }
                 self.logf(
                     "app",
@@ -731,7 +684,7 @@ impl Engine {
                 self.core = None;
                 let msg =
                     mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&reason]);
-                self.set_status(Status::Error, msg.clone());
+                self.fault = msg.clone();
                 self.logf("app", &msg);
                 let attempt = self.on_start_failed_attempt();
                 self.schedule_revive(attempt);
@@ -741,6 +694,7 @@ impl Engine {
                     return;
                 }
                 self.core = None;
+                self.local_ip.clear();
                 let detail = err.unwrap_or_default();
                 let suffix = if detail.is_empty() {
                     String::new()
@@ -751,11 +705,9 @@ impl Engine {
                     "app",
                     &mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_EXITED, &[&suffix]),
                 );
-                self.set_status(
-                    Status::Degraded,
+                self.last_error =
                     mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_NOT_RUNNING_RESTARTING)
-                        .to_string(),
-                );
+                        .to_string();
                 let attempt = self.next_revive_attempt();
                 self.schedule_revive(attempt);
             }
@@ -797,10 +749,75 @@ impl Engine {
         self.revive_attempt
     }
 
-    pub(crate) fn trigger_restart(&mut self) {
-        // 用一条自己的命令把“重连”插到队尾：调用点遍布各个 handler，直接 return true
-        // 会把正在处理的命令处理到一半。
-        let _ = self.self_tx.send(Cmd::Reconnect);
+    /// 到点的重拉：按当前期望规格补一次启动。
+    fn revive_core(&mut self) {
+        let Some(revive) = self.revive.take() else {
+            return;
+        };
+        if Instant::now() < revive.due {
+            self.revive = Some(revive);
+            return;
+        }
+        match self.ensure_core() {
+            Ok(()) => {
+                if self.core.is_some() {
+                    self.logf(
+                        "app",
+                        mesh_text::get(mesh_text::id::ENGINE_LOG_CORE_REVIVED),
+                    );
+                }
+            }
+            Err(err) => {
+                let msg = mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_CORE_START_FAILED_ATTEMPT,
+                    &[&revive.attempt, &err],
+                );
+                self.fault = msg.clone();
+                self.logf("app", &msg);
+                self.schedule_revive(revive.attempt + 1);
+            }
+        }
+    }
+
+    /// 开始新的一轮控制面同步：在途结果作废，下一次心跳立刻发生。
+    pub(crate) fn rebind(&mut self) {
+        self.control.gen = self.control.gen.wrapping_add(1);
+        self.control.failures = 0;
+        self.control.due = Some(Instant::now());
+        self.last_hb = 0;
+    }
+
+    /// 没有身份可用：控制面不再有期限，等设置页或下一次注册。
+    pub(crate) fn unbind(&mut self) {
+        self.client = None;
+        self.fault.clear();
+        self.control.gen = self.control.gen.wrapping_add(1);
+        self.control.failures = 0;
+        self.control.due = None;
+        self.last_hb = 0;
+    }
+
+    /// 从磁盘重读身份。首次启动、设置页与吊销都走这里，不另设状态。
+    pub(crate) fn reload_identity(&mut self) {
+        match self.load_client() {
+            sync::Loaded::Failed(err) => {
+                self.client = None;
+                let msg =
+                    mesh_text::format(mesh_text::id::ENGINE_LOG_LOCAL_STATE_READ_FAILED, &[&err]);
+                self.fault = msg.clone();
+                self.logf("app", &msg);
+                self.control.due = Some(Instant::now() + LOCAL_STATE_RETRY);
+            }
+            sync::Loaded::Missing => {
+                self.client = None;
+                self.fault.clear();
+                self.control.due = None;
+            }
+            sync::Loaded::Configured(config) => {
+                self.client = Some(config);
+                self.control.due = Some(Instant::now());
+            }
+        }
     }
 
     /// 重读系统里的自启状态。
@@ -844,35 +861,49 @@ impl Engine {
         let _ = self.notices.send(Notice::ActionFailed(message.to_string()));
     }
 
-    pub(crate) fn set_status(&mut self, status: Status, error: String) {
-        self.status = status;
-        self.last_error = error;
-    }
-
-    fn set_client(&mut self, client: Option<ClientConfig>) {
-        self.client = client;
-    }
-
     pub(crate) fn logf(&self, source: &str, message: &str) {
         self.log.add(source, message);
     }
 
-    /// 心跳通了、core 也在跑：状态置为在线。
-    pub(crate) fn mark_online(&mut self) {
-        self.status = Status::Online;
-        self.last_error.clear();
+    /// 界面状态：只由两个生命周期与一个失败槽推导，没有处理器直接写它。
+    ///
+    /// | 事实 | 状态 |
+    /// | --- | --- |
+    /// | 有确定失败（本地状态、配置、core 启动） | `error` |
+    /// | 没有身份 | `unconfigured` |
+    /// | 还没有任何输赢（没心跳结果、没失败、没排重拉） | `connecting` |
+    /// | 心跳通且 core 就绪 | `online` |
+    /// | 其余（控制面或 core 有一边没就绪） | `degraded` |
+    pub(crate) fn status(&self) -> Status {
+        if !self.fault.is_empty() {
+            return Status::Error;
+        }
+        if self.client.is_none() {
+            return Status::Unconfigured;
+        }
+        if self.last_hb == 0 && self.control.failures == 0 && self.revive.is_none() {
+            return Status::Connecting;
+        }
+        if self.control.failures == 0 && self.last_hb > 0 && self.core_running() {
+            Status::Online
+        } else {
+            Status::Degraded
+        }
     }
 
-    /// 只把状态降级，不动错误行（已经在在线/连接中才降）。
-    pub(crate) fn degrade(&mut self, message: &str) {
-        if matches!(self.status, Status::Online | Status::Connecting) {
-            self.status = Status::Degraded;
-            self.last_error = message.to_string();
+    /// 两个平面都恢复了：上一次失败的原因不再成立。发布快照之前统一收口一次。
+    pub(crate) fn settle(&mut self) {
+        if self.core_running() && self.control.failures == 0 && self.last_hb > 0 {
+            self.fault.clear();
+            self.last_error.clear();
         }
     }
 
     pub(crate) fn core_running(&self) -> bool {
-        self.core.as_ref().map(|core| core.started).unwrap_or(false)
+        self.core
+            .as_ref()
+            .map(|core| core.pid != 0)
+            .unwrap_or(false)
     }
 
     fn core_matches(&self, gen: u64) -> bool {
@@ -885,7 +916,7 @@ impl Engine {
     pub(crate) fn core_rpc_addr(&self) -> Option<SocketAddr> {
         self.core
             .as_ref()
-            .filter(|core| core.started)
+            .filter(|core| core.pid != 0)
             .map(|core| core.rpc_addr)
     }
 
@@ -940,12 +971,8 @@ impl Engine {
 
     /// 按磁盘上的配置启动 core（连接控制面之前）。
     fn start_core_from_disk(&mut self) {
-        let config = match self.store.load_client() {
-            Ok(Some(config)) if !config.device_id.is_empty() => config,
-            _ => return,
-        };
-        self.set_client(Some(config.clone()));
-        if self.start_core_or_report(false) {
+        self.ensure_core_or_report();
+        if self.core.is_some() {
             self.logf(
                 "app",
                 mesh_text::get(mesh_text::id::ENGINE_LOG_CORE_STARTED_FROM_DISK),
@@ -953,62 +980,40 @@ impl Engine {
         }
     }
 
-    /// 启动 core，失败只记录不向上抛：core 是数据面，控制面不可达不该让它跟着停。
-    pub(crate) fn start_core_or_report(&mut self, replace: bool) -> bool {
-        match self.start_core(replace) {
-            Ok(()) => true,
-            Err(err) => {
-                let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&err]);
-                self.set_status(Status::Error, msg.clone());
-                self.logf("app", &msg);
-                false
-            }
-        }
-    }
-
-    /// 启动一代 core。`replace` 为真表示调用方刚换过配置：即使已经有 core 在跑
-    /// （可能是崩溃恢复抢先拉起的、读的还是旧配置），也要停掉重起。
-    pub(crate) fn start_core(&mut self, replace: bool) -> Result<(), String> {
-        if self.core.is_some() {
-            if !replace {
-                return Ok(());
-            }
-            self.stop_core()?;
-        }
-        let Some(config) = self.client.clone() else {
-            return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED).to_string());
+    /// 期望规格：当前身份 + 磁盘配置 + 实际设备名 + 身份方式。
+    ///
+    /// `Ok(None)` 表示还没到能启动的时候（没有身份，或还没有配置）——不是失败。
+    /// `Err` 表示配置在、但启动条件不成立（解析不了、没有凭据、私钥读不出）。
+    pub(crate) fn desired_spec(&self) -> Result<Option<CoreSpec>, String> {
+        let Some(config) = self.client.as_ref() else {
+            return Ok(None);
         };
-        // 提示字段现读现算（Go 的 hints() 也是每次读文件）：配置刚被写盘时，
-        // 就绪判据与身份选择都必须基于新内容。
-        self.refresh_identity();
-        // 配置读不出来就不猜身份：把正式节点当成凭据节点，它会拿一张服务端不会签
-        // 给它的凭据去连要求 network_secret 的网，两边都连不上。按实际错误停下。
-        if let Some(err) = self.hints.parse_error.as_deref() {
+        let toml = match self.store.read_config() {
+            Ok(Some(toml)) => toml,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                return Err(mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_CONFIG_UNREADABLE,
+                    &[&err],
+                ))
+            }
+        };
+        let hints = parse_hints(&toml);
+        if let Some(err) = hints.parse_error.as_deref() {
             return Err(mesh_text::format(
                 mesh_text::id::ENGINE_TEXT_CONFIG_UNREADABLE,
                 &[&err],
             ));
         }
-        let core_path = mesh_core::locate(&self.config.program_dir)?;
-        let rpc_addr = sync::rpc_listen_addr()?;
-        let hostname = self.effective_hostname(&config);
-        let hints = self.hints.clone();
-        // 身份二选一，由配置里有没有 network_secret 决定：正式节点（含管理节点）用
-        // secure_mode 的本地私钥，忽略本地凭据；其余节点只能用凭据，没有就不起 core。
-        let (identity, cred_id) = if hints.formal() {
-            let key = self.store.secure_key().map_err(|err| {
+        let auth = if hints.formal() {
+            // 读不出来就不启动：正式节点没有私钥等于没有身份。
+            self.store.secure_key().map_err(|err| {
                 mesh_text::format(mesh_text::id::ENGINE_TEXT_READ_NODE_KEY_FAILED, &[&err])
             })?;
-            (mesh_core::Identity::Formal { key }, String::new())
+            AuthMode::Formal
         } else {
             match self.store.load_credential() {
-                Ok(Some(credential)) => (
-                    mesh_core::Identity::Credential {
-                        id: credential.id.clone(),
-                        secret: credential.secret,
-                    },
-                    credential.id,
-                ),
+                Ok(Some(credential)) => AuthMode::Credential(credential.id),
                 Ok(None) => return Err(sync::no_credential()),
                 Err(err) => {
                     return Err(mesh_text::format(
@@ -1018,76 +1023,94 @@ impl Engine {
                 }
             }
         };
-        let spec = mesh_core::StartSpec {
+        Ok(Some(CoreSpec {
+            generation: identity_key(config),
+            config_hash: config_digest(&toml),
+            hostname: self.effective_hostname(config),
+            auth,
+        }))
+    }
+
+    /// 让运行实例与期望规格一致：相同不重复拉起，不同就换进程。
+    ///
+    /// 这是“要不要换 core”的唯一判据；配置同步、改名、凭据轮换与重新绑定都汇到这里。
+    pub(crate) fn ensure_core(&mut self) -> Result<(), String> {
+        let Some(spec) = self.desired_spec()? else {
+            return Ok(());
+        };
+        if self.core.as_ref().map(|core| &core.spec) == Some(&spec) {
+            return Ok(());
+        }
+        self.stop_core()?;
+        self.start_core(spec)
+    }
+
+    /// 启动失败只记成一次确定失败，不向上抛：core 是数据面，控制面不可达不该让它跟着停。
+    pub(crate) fn ensure_core_or_report(&mut self) {
+        if let Err(err) = self.ensure_core() {
+            let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&err]);
+            self.fault = msg.clone();
+            self.logf("app", &msg);
+        }
+    }
+
+    /// 启动一代 core。调用方已经确认这一代与运行实例不同。
+    pub(crate) fn start_core(&mut self, spec: CoreSpec) -> Result<(), String> {
+        self.refresh_identity();
+        if self.client.is_none() {
+            return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED).to_string());
+        }
+        let core_path = mesh_core::locate(&self.config.program_dir)?;
+        let rpc_addr = sync::rpc_listen_addr()?;
+        let identity = match &spec.auth {
+            AuthMode::Formal => {
+                let key = self.store.secure_key().map_err(|err| {
+                    mesh_text::format(mesh_text::id::ENGINE_TEXT_READ_NODE_KEY_FAILED, &[&err])
+                })?;
+                mesh_core::Identity::Formal { key }
+            }
+            AuthMode::Credential(id) => match self.store.load_credential() {
+                Ok(Some(credential)) if &credential.id == id => mesh_core::Identity::Credential {
+                    id: credential.id,
+                    secret: credential.secret,
+                },
+                Ok(_) => return Err(sync::no_credential()),
+                Err(err) => {
+                    return Err(mesh_text::format(
+                        mesh_text::id::ENGINE_TEXT_READ_CREDENTIAL_FAILED,
+                        &[&err],
+                    ));
+                }
+            },
+        };
+        let start = mesh_core::StartSpec {
             gen: self.next_gen.wrapping_add(1),
             core_path: core_path.clone(),
             config_path: self.store.config_path(),
             rpc_addr,
-            hostname: hostname.clone(),
+            hostname: spec.hostname.clone(),
             rpc_whitelist: sync::rpc_whitelist(),
             identity,
+            // 就绪判据来自磁盘上这份配置；与 spec 的摘要同源。
             expect: mesh_core::Expect {
-                hostname: hints.hostname.clone(),
-                ipv4: hints.ipv4.clone(),
+                hostname: self.hints.hostname.clone(),
+                ipv4: self.hints.ipv4.clone(),
             },
         };
-        self.next_gen = spec.gen;
+        self.next_gen = start.gen;
+        self.core_path_used = core_path.display().to_string();
         self.core = Some(CoreRun {
-            gen: spec.gen,
+            gen: start.gen,
             pid: 0,
-            cred_id,
+            spec,
             rpc_addr,
-            started: false,
             started_unix: 0,
         });
-        self.core_path_used = core_path.display().to_string();
-        if self.core_tx.send(mesh_core::Cmd::Start(spec)).is_err() {
+        if self.core_tx.send(mesh_core::Cmd::Start(start)).is_err() {
             self.core = None;
             return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_THREAD_CLOSED).to_string());
         }
         Ok(())
-    }
-
-    fn start_heartbeat(&mut self) {
-        self.stop_heartbeat();
-        let Some(api) = self.api.clone() else {
-            return;
-        };
-        self.hb_gen = self.hb_gen.wrapping_add(1);
-        let gen = self.hb_gen;
-        let cell = Arc::clone(&self.cell);
-        let tx = self.self_tx.clone();
-        let (stop_tx, stop_rx) = channel();
-        thread::Builder::new()
-            .name("mesh-heartbeat".to_string())
-            .spawn(move || loop {
-                // 进入循环时不立刻 beat：connect 刚用同样的参数打过一次，紧接着再来一次
-                // 只是重复上报；更要紧的是 core 未运行时会让“心跳→重连→心跳”形成零延迟
-                // 回路（core 起不来时实测每秒数百次心跳）。
-                match stop_rx.recv_timeout(HEARTBEAT_INTERVAL) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
-                    Err(RecvTimeoutError::Timeout) => {}
-                }
-                let published = cell.get();
-                let result = api.heartbeat(
-                    &published.beat.config_hash,
-                    &published.beat.app_version,
-                    &published.beat.credential_id,
-                    published.beat.app_update_known.as_deref(),
-                    HEARTBEAT_TIMEOUT,
-                );
-                if tx.send(Cmd::Heartbeat { gen, result }).is_err() {
-                    return;
-                }
-            })
-            .expect("启动心跳线程失败");
-        self.hb_stop = Some(stop_tx);
-    }
-
-    fn stop_heartbeat(&mut self) {
-        if let Some(stop) = self.hb_stop.take() {
-            let _ = stop.send(());
-        }
     }
 
     fn start_stun_loop(&mut self) {
@@ -1102,12 +1125,18 @@ impl Engine {
                 // core 不在跑时 rpc 是 None：省掉一次必然失败的查询。
                 if let Some(addr) = published.rpc {
                     if let Ok(node) = mesh_etrpc::show_node_info(addr, Duration::from_secs(3)) {
-                        if tx.send(Cmd::Stun(node.stun)).is_err() {
+                        if tx
+                            .send(Cmd::Stun {
+                                gen: published.core_gen,
+                                info: node.stun,
+                            })
+                            .is_err()
+                        {
                             return;
                         }
                     }
                 }
-                // 用停止通道代替 sleep：退出与重连都不必等满一个刷新周期。
+                // 用停止通道代替 sleep：退出不必等满一个刷新周期。
                 match stop_rx.recv_timeout(STUN_REFRESH_INTERVAL) {
                     Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
                     Err(RecvTimeoutError::Timeout) => {}
@@ -1122,6 +1151,39 @@ impl Engine {
             let _ = stop.send(());
         }
     }
+
+    /// 同步打一次心跳并把结果交给响应处理。只给单元测试用：生产走后台线程。
+    #[cfg(test)]
+    pub(crate) fn beat_now(&mut self) {
+        let Some(request) = self.beat_request() else {
+            return;
+        };
+        self.control.gen = self.control.gen.wrapping_add(1);
+        let gen = self.control.gen;
+        self.control.due = None;
+        let result = request.api.heartbeat(
+            &request.hash,
+            &request.app_version,
+            &request.credential_id,
+            request.known.as_deref(),
+            HEARTBEAT_TIMEOUT,
+        );
+        self.on_heartbeat(gen, result);
+    }
+}
+
+/// 一次心跳请求的取样结果。
+struct BeatRequest {
+    api: Arc<remote::Client>,
+    hash: String,
+    app_version: String,
+    credential_id: String,
+    known: Option<String>,
+}
+
+/// 身份代次：控制面地址 + 设备 id。
+fn identity_key(config: &ClientConfig) -> String {
+    format!("{}\n{}", config.server_url, config.device_id)
 }
 
 /// 连接失败的退避：10s 起步，每次 ×1.5，最多 60s。

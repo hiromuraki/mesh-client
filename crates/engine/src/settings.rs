@@ -1,10 +1,9 @@
 //! 设置页的两个动作：注册/保存设置、删除本地配置。
 //!
-//! 对应 Go 的 `engine/settings.go`。注册是唯一需要 token 的路径；`device_id` 由客户端
-//! 先随机生成、服务端接受后以响应为准。
+//! 注册是唯一需要 token 的路径；`device_id` 由客户端先随机生成、服务端接受后以响应为准。
 
 use crate::clock;
-use crate::run::{Engine, Status};
+use crate::run::Engine;
 use mesh_remote as remote;
 use mesh_state::{public_key_base64, ClientConfig};
 use std::time::Duration;
@@ -30,9 +29,8 @@ impl Engine {
     /// 处理设置页提交：有 token 则注册，否则保存配置并重启连接。
     ///
     /// 注册分两半：**服务端接受**（token 就此用掉）与**本地激活**。只有前一半
-    /// 能退回设置页重填 token；后一半的每一步失败都只记下来，身份已经在盘上，
-    /// 连接循环按同一份身份继续重试——再要一次 token 只会让用户拿着已经作废的
-    /// 令牌重来（F10）。
+    /// 能退回设置页重填 token；后一半失败只记录，身份已经在盘上，连接循环按同一份
+    /// 身份继续重试。
     pub(crate) fn save_settings(&mut self, input: SettingsInput) -> Result<(), String> {
         let server_url = normalize_server_url(&input.server_url)?;
         // 留空表示用本机主机名，不把当前主机名固化进配置。
@@ -66,12 +64,8 @@ impl Engine {
                 config.device_id = reply.device_id;
             }
             config.created_at = clock::unix_now();
-            // 注册成功即已消耗 token：身份必须立刻落盘。从这里往下都是本地激活，
-            // 失败只影响「这一代什么时候生效」，不能再要求一张新的令牌。
-            self.store.save_client(&config).map_err(|err| {
-                mesh_text::format(mesh_text::id::ENGINE_TEXT_SAVE_REGISTER_FAILED, &[&err])
-            })?;
-            self.activate(&config, current.as_ref());
+            // 注册成功即已消耗 token：身份必须立刻落盘。
+            self.bind(config.clone(), current.as_ref())?;
             self.logf(
                 "app",
                 &mesh_text::format(mesh_text::id::ENGINE_LOG_REGISTERED, &[&config.device_id]),
@@ -84,10 +78,7 @@ impl Engine {
                 mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED_TOKEN).to_string(),
             );
         }
-        self.store
-            .save_client(&config)
-            .map_err(|err| err.to_string())?;
-        self.activate(&config, current.as_ref());
+        self.bind(config, current.as_ref())?;
         self.logf(
             "app",
             mesh_text::get(mesh_text::id::ENGINE_LOG_SETTINGS_SAVED),
@@ -95,60 +86,42 @@ impl Engine {
         Ok(())
     }
 
-    /// 把这一代身份的本地部分交给连接循环，剩下的由它完成。
+    /// 把身份写盘并交给事件循环。
     ///
-    /// 身份换代次（控制面地址或设备 id 变了）时先作废旧代次的凭据与配置：凭据属于
-    /// 某个控制面上的某台设备，配置属于那个控制面上的某个网络，留着只会让 core
-    /// 带着上一代的东西启动。删掉之后「已注册、待激活」是一个确定的状态：身份在
-    /// 盘上，配置等下一次心跳交下来——不依赖内存标记，退出再启动也一样。
-    ///
-    /// 配置本身**不在这里写**：写 `config.toml` 与换 core 是同一次转换，只由
-    /// `apply_locked` 一处完成。这里另写一份，core 会拿着旧文件继续跑（摘要没变
-    /// 就没人会再去重启它）。
-    fn activate(&mut self, config: &ClientConfig, previous: Option<&ClientConfig>) {
-        if generation_changed(previous, config) {
-            // 更新 offer 属于某个控制面的发布记录：换代次就作废，别拿上一代的
-            // 授权去给这一代装包。
+    /// 换代次（控制面地址或设备 id 变了）时先让旧一代的 `config.toml` 与
+    /// `credential.json` 从可读位置消失，再原子写入新 `client.json`：任何中断点之后，
+    /// 本地只可能读到旧一代、空、或新一代，不会出现「新身份配旧配置」。删除失败就是
+    /// 这次保存失败——宁可让用户重试，也不留一代混合数据。
+    fn bind(
+        &mut self,
+        config: ClientConfig,
+        previous: Option<&ClientConfig>,
+    ) -> Result<(), String> {
+        if generation_changed(previous, &config) {
+            self.store.remove_config().map_err(|err| {
+                mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err])
+            })?;
+            self.store.remove_credential().map_err(|err| {
+                mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_REMOVE_OLD_CREDENTIAL_FAILED,
+                    &[&err],
+                )
+            })?;
+            // 旧一代的发布授权随旧一代一起作废；删除失败时它还在，下一轮心跳照常。
             self.clear_stale_update();
-            // 删旧凭据与旧配置都只记日志：身份已经落盘，连接循环会用「没有凭据」
-            // 重签、用对不上的摘要把配置要回来；为一次删除把注册卡死在这里，
-            // 反而把用户推回「令牌已经用掉」的死路。
-            if let Err(err) = self.store.remove_credential() {
-                self.logf(
-                    "app",
-                    &mesh_text::format(
-                        mesh_text::id::ENGINE_TEXT_REMOVE_OLD_CREDENTIAL_FAILED,
-                        &[&err],
-                    ),
-                );
-            }
-            if let Err(err) = self.store.remove_config() {
-                self.logf(
-                    "app",
-                    &mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err]),
-                );
-            }
         }
-        // 设备名是 core 的启动参数，不会热更新：换了就得换一个进程，否则运行中的
-        // 那一代还在用旧名字。停不掉只记日志——下一轮连接循环会遇到同一个问题，
-        // 那时再停一次比在这里把注册结果判成失败有用。
-        let renamed = self
-            .client
-            .as_ref()
-            .map(|current| self.effective_hostname(current) != self.effective_hostname(config))
-            .unwrap_or(false);
-        if renamed && self.core.is_some() {
-            if let Err(err) = self.stop_core() {
-                self.logf(
-                    "app",
-                    &mesh_text::format(mesh_text::id::ENGINE_LOG_STOP_CORE_FAILED, &[&err]),
-                );
-            }
-        }
+        self.store.save_client(&config).map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_SAVE_SETTINGS_FAILED, &[&err])
+        })?;
+        self.client = Some(config);
         self.refresh_identity();
-        self.client = Some(config.clone());
         self.local_ip.clear();
-        self.set_status(Status::Connecting, String::new());
+        self.last_error.clear();
+        self.fault.clear();
+        self.rebind();
+        // 设备名、身份或凭据变了就是另一份规格：这里统一换进程，不再单开一条改名路径。
+        self.ensure_core_or_report();
+        Ok(())
     }
 
     /// 断开并清空本地身份与下发的配置，保留服务端地址、设备名等用户输入。
@@ -161,13 +134,20 @@ impl Engine {
         self.store.remove_config().map_err(|err| {
             mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err])
         })?;
-        let _ = self.store.remove_credential();
+        self.store.remove_credential().map_err(|err| {
+            mesh_text::format(
+                mesh_text::id::ENGINE_TEXT_REMOVE_OLD_CREDENTIAL_FAILED,
+                &[&err],
+            )
+        })?;
+        self.clear_stale_update();
         self.refresh_identity();
-        self.client = None;
         self.local_ip.clear();
         self.core_version.clear();
         self.network_name.clear();
-        self.set_status(Status::Unconfigured, String::new());
+        self.last_error.clear();
+        self.fault.clear();
+        self.unbind();
         self.logf(
             "app",
             mesh_text::get(mesh_text::id::ENGINE_LOG_LOCAL_CONFIG_DELETED),

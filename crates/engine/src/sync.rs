@@ -1,30 +1,22 @@
-//! 与控制面对齐：一次连接、配置应用、401 处理、身份摘要。
+//! 与控制面对齐：配置应用、401 处理、身份摘要。
 //!
-//! 对应 Go 的 `engine/connect|applyLocked|applyRemote|handleAuthRejected`。
+//! 一次连接与一轮心跳不再分开：请求由 [`crate::run`] 的心跳线程发出，响应统一由
+//! `Engine::on_beat` 处理，这里只保留“拿到响应之后怎么改本地状态”的判断。
 
 use crate::clock;
-use crate::run::HEARTBEAT_TIMEOUT;
 use crate::run::{
-    config_digest, Engine, IdentityMeta, Status, AUTH_CREDENTIAL, AUTH_FORMAL, NO_CREDENTIAL_ID,
+    config_digest, AuthMode, Engine, IdentityMeta, AUTH_CREDENTIAL, AUTH_FORMAL, NO_CREDENTIAL_ID,
 };
 use mesh_remote as remote;
 use mesh_state::hints::{parse_hints, ConfigHints};
 use mesh_state::ClientConfig;
 use std::net::SocketAddr;
-use std::path::Path;
-use std::sync::Arc;
 
 /// 本地状态的三种读法：读坏了、还没有身份、有身份。
 pub(crate) enum Loaded {
     Failed(String),
     Missing,
     Configured(ClientConfig),
-}
-
-/// 一次连接尝试的失败：身份失效要回设置页，其它按退避重试。
-pub(crate) enum ConnectError {
-    IdentityInvalid,
-    Failed(String),
 }
 
 /// 没有凭据时 core 不起：下一轮心跳拿到就会重试。
@@ -62,9 +54,6 @@ impl CredentialState {
     /// 写盘的私钥就去撤销 core 还在用的旧凭据，也不该在设备已经拿到凭据时再签一张。
     /// 正式节点同样报空串：它用 `network_secret` 认证，报 `none` 只会让服务端每轮
     /// 签一张用不上的。
-    ///
-    /// 空串因此同时覆盖「正式节点」与「持有但未确认」，服务端的行为相同；要让它
-    /// 们各自可辨（比如给未确认的凭据补签），需要协议里另有一个字段（见修复报告）。
     fn reported_id(&self) -> String {
         match self {
             CredentialState::Formal | CredentialState::Held(_) => String::new(),
@@ -85,145 +74,31 @@ impl Engine {
         }
     }
 
-    /// 打一次心跳把配置要回来：服务端在哈希对不上时直接随响应下发整份 `config.toml`，
-    /// 所以启动不需要单独的取配置接口。
-    pub(crate) fn connect(&mut self, config: &ClientConfig) -> Result<(), ConnectError> {
-        let key = self.store.signing_key().map_err(|err| {
-            ConnectError::Failed(mesh_text::format(
-                mesh_text::id::ENGINE_TEXT_READ_DEVICE_KEY_FAILED,
-                &[&err],
-            ))
-        })?;
-        let api = Arc::new(remote::Client::new(
-            &config.server_url,
-            &config.device_id,
-            key,
-        ));
-        self.api = Some(Arc::clone(&api));
-        let hash = self.hash();
-        let credential_id = self.credential_id();
-        let known = self.known_app_update();
-        let result = api.heartbeat(
-            &hash,
-            &self.config.self_version,
-            &credential_id,
-            known.as_deref(),
-            HEARTBEAT_TIMEOUT,
-        );
-        let heartbeat = match result {
-            Ok(heartbeat) => heartbeat,
-            Err(err) => {
-                if matches!(err, remote::Error::Unauthorized { .. }) {
-                    let cleared = self.handle_auth_rejected(&err);
-                    if cleared {
-                        return Err(ConnectError::IdentityInvalid);
-                    }
-                    // 不清身份就按普通连接失败退避重试，避免每次 401 都立刻重连。
-                    let reason = if self.last_error.is_empty() {
-                        err.to_string()
-                    } else {
-                        self.last_error.clone()
-                    };
-                    return Err(ConnectError::Failed(reason));
-                }
-                return Err(ConnectError::Failed(mesh_text::format(
-                    mesh_text::id::ENGINE_TEXT_CONNECT_SERVER_FAILED,
-                    &[&err],
-                )));
-            }
-        };
-        self.reset_auth_fails();
-        let heartbeat = heartbeat.unwrap_or_default();
-        // 首次心跳就可能带上凭据：先落盘，下面才有身份去起 core。少了这一步，第一轮
-        // 必然起不来，只能等三十秒后的下一次心跳。
-        if self.save_credential(&heartbeat) {
+    /// 应用一份配置。
+    ///
+    /// 文件内容不同才重写；写完由 `ensure_core` 按规格决定换不换进程。服务端给的
+    /// `configHash` 不参与判断：字节相同就是同一份配置，摘要算法换过也不必让已经
+    /// 跑对的设备抖一下。
+    pub(crate) fn apply_locked(&mut self, config: &ClientConfig, toml: &str) -> Result<(), String> {
+        self.client = Some(config.clone());
+        if self.store.read_config().ok().flatten().as_deref() != Some(toml) {
+            // 换配置只能换进程：先停旧的，再原子写，最后由规格比较启动。
+            self.stop_core()?;
+            self.store.write_config(toml).map_err(|err| {
+                mesh_text::format(mesh_text::id::ENGINE_TEXT_WRITE_CONFIG_FAILED, &[&err])
+            })?;
+            // 配置换了，认证方式、加密算法与修改时间都可能变。
+            self.refresh_identity();
+            self.local_ip.clear();
             self.logf(
                 "app",
-                mesh_text::get(mesh_text::id::ENGINE_LOG_CREDENTIAL_RECEIVED),
+                &mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_CONFIG_APPLIED,
+                    &[&short_hash(&config_digest(toml))],
+                ),
             );
         }
-        let (toml, hash) = if !heartbeat.config_b64.is_empty() {
-            let toml = heartbeat.config_toml().map_err(|err| {
-                ConnectError::Failed(mesh_text::format(
-                    mesh_text::id::ENGINE_TEXT_CONFIG_DECODE_FAILED,
-                    &[&err],
-                ))
-            })?;
-            (toml, heartbeat.config_hash.clone())
-        } else {
-            // 心跳没带配置：服务端认为本地已是最新，直接用磁盘上那份。
-            match self.store.read_config() {
-                Ok(Some(local)) => {
-                    let digest = config_digest(&local);
-                    (local, digest)
-                }
-                _ => {
-                    return Err(ConnectError::Failed(
-                        mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_CONFIG_LOCAL).to_string(),
-                    ))
-                }
-            }
-        };
-        self.apply_locked(config, &toml, &hash)
-            .map_err(ConnectError::Failed)
-    }
-
-    /// 应用一份配置（必要时重启 core）。
-    ///
-    /// 与磁盘逐字节相同、或摘要对得上时不重写文件：摘要对不上但内容相同只会出现在
-    /// 服务端换过摘要算法时，没必要让已经跑对的设备抖一下。
-    pub(crate) fn apply_locked(
-        &mut self,
-        config: &ClientConfig,
-        toml: &str,
-        hash: &str,
-    ) -> Result<(), String> {
-        self.client = Some(config.clone());
-        let local = self.store.read_config().ok().flatten();
-        let same_hash = !hash.is_empty()
-            && local
-                .as_deref()
-                .map(|local| config_digest(local) == hash)
-                .unwrap_or(false);
-        // `Some(toml)` 才算“磁盘上有且一模一样”；文件不存在时必须落盘。
-        let same_content = local.as_deref() == Some(toml);
-        let running = self.core_running();
-        if same_hash || same_content {
-            // 配置没变，core 却可能该动了：没在跑要补启动，拿着旧凭据要换进程
-            // ——凭据只在启动时读一次，core 不支持热更新。
-            if running && !self.credential_stale() {
-                return Ok(());
-            }
-            if self.start_core_or_report(running) {
-                self.logf(
-                    "app",
-                    &mesh_text::format(
-                        mesh_text::id::ENGINE_LOG_CONFIG_UNCHANGED_CORE_STARTED,
-                        &[&short_hash(hash)],
-                    ),
-                );
-            }
-            return Ok(());
-        }
-        if running {
-            self.stop_core()?;
-        }
-        self.store.write_config(toml).map_err(|err| {
-            mesh_text::format(mesh_text::id::ENGINE_TEXT_WRITE_CONFIG_FAILED, &[&err])
-        })?;
-        // 配置换了，认证方式、加密算法与修改时间都可能变。
-        self.refresh_identity();
-        self.local_ip.clear();
-        // 起不来就是起不来，不退回上一份：回滚只把设备留在旧配置上，服务端下一轮
-        // 心跳还会把同一份新配置发下来，除了多绕一圈没有任何作用。
-        self.start_core_or_report(true);
-        self.logf(
-            "app",
-            &mesh_text::format(
-                mesh_text::id::ENGINE_LOG_CONFIG_APPLIED,
-                &[&short_hash(hash)],
-            ),
-        );
+        self.ensure_core_or_report();
         Ok(())
     }
 
@@ -246,22 +121,14 @@ impl Engine {
             );
             return;
         }
-        if self.api.is_none() {
+        let Some(config) = self.client.clone() else {
             return;
-        }
-        let config = match self.store.load_client() {
-            Ok(Some(config)) => config,
-            _ => return,
         };
-        if let Err(err) = self.apply_locked(&config, &toml, &heartbeat.config_hash) {
+        if let Err(err) = self.apply_locked(&config, &toml) {
             // 不记“这份 hash 永久失败”：写配置失败往往是瞬时的（杀软扫描、备份占用、
             // rename 撞上 Access is denied），永久放弃只会让设备静默停在旧配置上。
-            self.set_status(Status::Error, err.clone());
+            self.fault = err.clone();
             self.logf("app", &err);
-            return;
-        }
-        if self.core_running() {
-            self.mark_online();
         }
     }
 
@@ -290,7 +157,7 @@ impl Engine {
                 self.reset_auth_fails();
                 let msg = mesh_text::format(mesh_text::id::ENGINE_TEXT_CLOCK_SKEW, &[&skew]);
                 self.logf("app", &msg);
-                self.set_status(Status::Degraded, msg);
+                self.last_error = msg;
                 return false;
             }
         }
@@ -304,11 +171,10 @@ impl Engine {
             self.handle_identity_invalid(err);
             return true;
         }
-        let msg = mesh_text::format(
+        self.last_error = mesh_text::format(
             mesh_text::id::ENGINE_TEXT_AUTH_REJECTED_RETRY,
             &[&failures, &AUTH_FAIL_LIMIT],
         );
-        self.set_status(Status::Degraded, msg);
         false
     }
 
@@ -344,17 +210,14 @@ impl Engine {
         // 本地凭据这时已经作废（服务端删设备是先撤销凭据再删记录），留着只是把一份
         // 再也用不上的私钥继续放在磁盘上。
         let _ = self.store.remove_credential();
+        self.clear_stale_update();
         self.refresh_identity();
-        self.client = None;
         self.local_ip.clear();
-        self.set_status(
-            Status::Unconfigured,
-            mesh_text::format(
-                mesh_text::id::ENGINE_TEXT_IDENTITY_INVALID_REGISTER,
-                &[&detail],
-            ),
+        self.unbind();
+        self.last_error = mesh_text::format(
+            mesh_text::id::ENGINE_TEXT_IDENTITY_INVALID_REGISTER,
+            &[&detail],
         );
-        self.trigger_restart();
     }
 
     /// 重读磁盘上的 `config.toml` 与 `credential.json`，重算身份摘要与提示字段。
@@ -400,11 +263,11 @@ impl Engine {
         if self.hints.formal() {
             return CredentialState::Formal;
         }
-        // core 实际加载的那张是唯一的「已确认」来源：它是启动时按配置取的，
-        // 收到 `Started` 之后才代表 core 真的带着它跑起来了。
-        if let Some(core) = self.core.as_ref().filter(|core| core.started) {
-            if !core.cred_id.is_empty() {
-                return CredentialState::Loaded(core.cred_id.clone());
+        // core 实际应用的那张规格是唯一的「已确认」来源：它是启动时按配置取的，
+        // 真的就绪之后才代表 core 带着它跑起来了。
+        if let Some(core) = self.core.as_ref().filter(|core| core.pid != 0) {
+            if let AuthMode::Credential(id) = &core.spec.auth {
+                return CredentialState::Loaded(id.clone());
             }
         }
         match self.disk_credential_id() {
@@ -426,22 +289,10 @@ impl Engine {
         self.credential_state().reported_id()
     }
 
-    /// 磁盘上的凭据是否已经不是 core 正在用的那张：换身份只能换进程。
-    ///
-    /// 持有但未确认（core 没起来）不算过期：那种情况本来就要启动 core，
-    /// 它会直接读磁盘上那张。
-    pub(crate) fn credential_stale(&self) -> bool {
-        match self.credential_state() {
-            CredentialState::Formal | CredentialState::Missing | CredentialState::Held(_) => false,
-            CredentialState::Loaded(id) => {
-                self.disk_credential_id().as_deref() != Some(id.as_str())
-            }
-        }
-    }
-
     /// 把心跳带来的凭据落盘，返回是否真的换了。
     ///
     /// 服务端只在签发的那一刻带私钥，其余时候只有 id；同 id 的重复下发直接忽略。
+    /// 落盘之后不需要在这里重启 core：`ensure_core` 会看到凭据 id 变了，换进程。
     pub(crate) fn save_credential(&mut self, heartbeat: &remote::Heartbeat) -> bool {
         if heartbeat.credential.is_empty() || heartbeat.credential_id.is_empty() {
             return false;
@@ -460,22 +311,10 @@ impl Engine {
         if let Err(err) = self.store.save_credential(&credential) {
             let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_SAVE_CREDENTIAL_FAILED, &[&err]);
             self.logf("app", &msg);
-            self.degrade(&msg);
+            self.last_error = msg;
             return false;
         }
         self.refresh_identity();
-        true
-    }
-
-    /// 保存新凭据并重启 core（core 不支持热更新，换身份只能换进程）。
-    pub(crate) fn apply_credential(&mut self, heartbeat: &remote::Heartbeat) -> bool {
-        if !self.save_credential(heartbeat) {
-            return false;
-        }
-        self.logf(
-            "app",
-            mesh_text::get(mesh_text::id::ENGINE_LOG_CREDENTIAL_RECEIVED_RESTART),
-        );
         true
     }
 }
@@ -509,23 +348,6 @@ pub(crate) fn rpc_whitelist() -> Option<String> {
         .map(|value| value.trim().to_string())
         .ok()
         .filter(|value| !value.is_empty())
-}
-
-/// 文件的完整 sha256（十六进制）。
-pub(crate) fn file_digest(path: &Path) -> Option<String> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0u8; 256 * 1024];
-    loop {
-        let read = file.read(&mut buffer).ok()?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Some(hex::encode(hasher.finalize()))
 }
 
 pub(crate) fn short_hash(hash: &str) -> String {

@@ -7,6 +7,7 @@
 //! 本 crate 不依赖 workspace 内任何其它 crate：它没有上层概念（不知道心跳、不知道面板），
 //! 只有“安装根长什么样、版本号怎么比、锁怎么拿”。
 
+pub mod artifact;
 pub mod failures;
 pub mod layout;
 pub mod lock;

@@ -4,7 +4,7 @@
 //! `client/frontend/src/api/types.ts`），所以字段名用 camelCase、字段集合逐条对齐。
 
 use crate::autostart;
-use crate::run::{Engine, Status};
+use crate::run::Engine;
 use mesh_etrpc::{Peer, Route};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -123,7 +123,7 @@ impl Engine {
     pub(crate) fn snapshot_with_hash(&self, hash: String) -> Snapshot {
         let core_running = self.core_running();
         let mut snapshot = Snapshot {
-            status: self.status.as_str().to_string(),
+            status: self.status().as_str().to_string(),
             server_url: String::new(),
             device_id: String::new(),
             hostname: self.config.hostname.clone(),
@@ -144,20 +144,32 @@ impl Engine {
             config_updated_at: self.identity.config_at,
             encryption: self.identity.encryption.clone(),
             last_heartbeat: self.last_hb,
-            last_error: self.last_error.clone(),
+            last_error: if self.fault.is_empty() {
+                self.last_error.clone()
+            } else {
+                self.fault.clone()
+            },
             app_version: self.config.self_version.clone(),
-            update_state: self.update.phase.as_str().to_string(),
-            update_version: self.update.version.clone(),
-            update_notes: self.update.notes.clone(),
-            update_error: self.update.error.clone(),
+            update_state: self.update.phase().as_str().to_string(),
+            update_version: self
+                .update
+                .offer
+                .as_ref()
+                .map(|offer| offer.version.clone())
+                .unwrap_or_default(),
+            update_notes: self
+                .update
+                .offer
+                .as_ref()
+                .map(|offer| offer.notes.clone())
+                .unwrap_or_default(),
+            update_error: self.update.error().to_string(),
             autostart_supported: autostart::SUPPORTED,
             autostart_enabled: self.autostart_on,
         };
         if let Some(core) = self.core.as_ref() {
             snapshot.core_pid = core.pid;
-            if core.started {
-                snapshot.core_started_at = core.started_unix;
-            }
+            snapshot.core_started_at = core.started_unix;
         }
         if let Some(client) = self.client.as_ref() {
             snapshot.server_url = client.server_url.clone();
@@ -167,15 +179,6 @@ impl Engine {
                 snapshot.hostname = client.hostname.clone();
             }
         }
-        // core 不在了就不能继续报在线：状态与存活必须一致，否则界面显示“在线”
-        // 而节点其实已经断了。
-        if !core_running && snapshot.status == Status::Online.as_str() {
-            snapshot.status = Status::Degraded.as_str().to_string();
-            if snapshot.last_error.is_empty() {
-                snapshot.last_error =
-                    mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_NOT_RUNNING).to_string();
-            }
-        }
         if snapshot.last_error.is_empty() && !self.log_error.is_empty() {
             snapshot.last_error = self.log_error.clone();
         }
@@ -183,7 +186,11 @@ impl Engine {
     }
 
     /// 发布一次快照。引擎每处理完一条消息调用它。
-    pub(crate) fn publish(&self) {
+    ///
+    /// 两个平面都恢复之后，上一次失败的原因在这里统一收口——状态本身已是推导值，
+    /// 快照不再事后修正任何字段。
+    pub(crate) fn publish(&mut self) {
+        self.settle();
         let hash = self.hash();
         let published = Published {
             snapshot: self.snapshot_with_hash(hash.clone()),
