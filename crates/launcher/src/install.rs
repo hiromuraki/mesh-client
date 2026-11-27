@@ -272,24 +272,35 @@ fn remove_dir(path: &Path) -> Result<(), String> {
     }
 }
 
-/// clear_backup 删掉上一版本与安装包。
+/// clear_backup 删掉上一版本的备份。
 ///
-/// 失败只记日志：这两样都是残留，下次启动会再试一次；它们是否还在不再影响
-/// `bin/` 的判定——那由事务状态决定。
+/// 只删 `bin.old`：它是安装的产物，没有在途安装时就是残留。安装包不是——那是
+/// 「请安装」的信号，客户端下完就退出，启动器的下一轮才去装它；在这里顺手删掉，
+/// Linux 上的自动更新就永远装不上了。
+///
+/// 失败只记日志：残留下次启动再试，它是否还在不再影响 `bin/` 的判定。
 fn clear_backup(root: &Path) {
-    for target in [root.join(BIN_OLD), root.join(UPDATE_FILE)] {
-        let outcome = if target.is_dir() {
-            fs::remove_dir_all(&target)
-        } else {
-            fs::remove_file(&target)
-        };
-        if let Err(e) = outcome {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::line(&mesh_text::format(
-                    id::LAUNCHER_TEXT_CLEANUP_FAILED,
-                    &[&target.display(), &e],
-                ));
-            }
+    remove_path(&root.join(BIN_OLD));
+}
+
+/// 删掉已经处理过的安装包（装上或明确丢弃）。失败只记日志：文件还留着的话，
+/// 下一轮会把它当成一个「不比当前新」的包再丢一次，不会重新装一遍。
+fn clear_package(root: &Path) {
+    remove_path(&root.join(UPDATE_FILE));
+}
+
+fn remove_path(target: &Path) {
+    let outcome = if target.is_dir() {
+        fs::remove_dir_all(target)
+    } else {
+        fs::remove_file(target)
+    };
+    if let Err(e) = outcome {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::line(&mesh_text::format(
+                id::LAUNCHER_TEXT_CLEANUP_FAILED,
+                &[&target.display(), &e],
+            ));
         }
     }
 }
@@ -388,10 +399,12 @@ fn swap_and_unpack(root: &Path, pkg: &Path, manifest: &Manifest, tx: Tx) -> Resu
 pub(crate) fn commit(root: &Path) -> Result<(), String> {
     if read_tx(root)?.is_none() {
         clear_backup(root);
+        clear_package(root);
         return Ok(());
     }
     write_tx(root, Tx::Committed)?;
     clear_backup(root);
+    clear_package(root);
     clear_tx(root)
 }
 
@@ -1215,6 +1228,41 @@ mod tests {
             recover(&root).is_err(),
             "认不出的状态不能猜：猜错就会拿错的前提删文件"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 待安装的包是「请安装」的信号，不是安装残留：启动时的自愈不能删掉它，
+    /// 否则 Linux 上客户端留下的更新永远装不上。
+    #[test]
+    fn recover_keeps_a_pending_package() {
+        let root = temp_root("recover-keeps-package");
+        fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        fs::write(root.join(layout::BIN).join("mesh-client"), b"client").unwrap();
+        fs::write(root.join(UPDATE_FILE), b"package").unwrap();
+
+        recover(&root).unwrap();
+
+        assert!(
+            root.join(UPDATE_FILE).is_file(),
+            "启动自愈删掉了待安装的包：这台机器再也装不上更新"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 装上之后包才算被消费掉。
+    #[test]
+    fn commit_removes_the_consumed_package() {
+        let root = temp_root("commit-drops-package");
+        fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        fs::create_dir_all(root.join(BIN_OLD)).unwrap();
+        fs::write(root.join(UPDATE_FILE), b"package").unwrap();
+        write_tx(&root, Tx::Installed).unwrap();
+
+        commit(&root).unwrap();
+
+        assert!(!root.join(UPDATE_FILE).exists(), "装完的包要删掉");
+        assert!(!root.join(BIN_OLD).exists());
+        assert_no_install_in_flight(&root);
         let _ = fs::remove_dir_all(&root);
     }
 
