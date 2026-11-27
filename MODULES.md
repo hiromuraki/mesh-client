@@ -142,7 +142,7 @@ pub fn parse_hints(toml: &str) -> ConfigHints;   // 解析失败给零值，不�
 
 ### 3.3 `mesh-remote`
 
-**职责**：设备面 HTTP。`/api/v1/register`、`/api/v1/heartbeat` 的组装与 Ed25519 签名、响应结构、错误码与 `Date` 头偏差、整包下载（带上限）。不知道磁盘布局，也不持有身份。
+**职责**：设备面 HTTP。`/api/v1/register`、`/api/v1/heartbeat` 的组装与 Ed25519 签名、响应结构、错误码与 `Date` 头偏差、整包下载（带上限），以及发布包的签名验证。不知道磁盘布局，也不持有身份。
 
 **对外 API**：
 
@@ -153,7 +153,8 @@ impl Client {
     pub fn register(&self, token: &str, hostname: &str, pubkey_b64: &str, timeout: Duration)
         -> Result<RegisterReply, Error>;
     pub fn heartbeat(&self, config_hash: &str, app_version: &str, credential_id: &str,
-                     timeout: Duration) -> Result<Option<Heartbeat>, Error>;  // None == 204
+                     app_update_known: Option<&str>, timeout: Duration)
+        -> Result<Option<Heartbeat>, Error>;  // None == 204
     pub fn download(&self, url: &str, dst: &Path, limit: u64, timeout: Duration)
         -> Result<u64, Error>;
 }
@@ -166,6 +167,8 @@ pub struct Heartbeat { config_hash, config_b64, app_update, launcher, credential
 ```
 
 **拥有的状态**：无。签名原文（`MESH2\n<method>\n<path>\n...`）在 `signing_string` 里现拼，字段顺序写死并有单测。
+
+**发布签名**：`signing` 子模块拼 `MESH3\n<slot>\n<platform>\n<version>\n<sha256>` 并验签，公钥是编进二进制的常量（`RELEASE_PUBLIC_KEY`）——控制面被拿下后改不了它，这是更新链的信任锚。`verify_release_with` 收公钥、`verify_release` 用常量；引擎传自己那份（生产是常量，测试是临时密钥对，否则「有效签名被接受」这条路径跑不到）。有一条固定向量单测盯着 Go 侧 `tools/signpkg` 签出来的字节。
 
 **依赖**：`mesh-install`（`platform::id()`）。
 
@@ -246,7 +249,8 @@ pub enum Notice { ActionFailed(String) }  // 用户动作失败 → client 弹�
 // 发布给其它线程的只读视图。除快照外还带两样别的线程要用、但不该回问引擎的东西：
 // 心跳线程组请求要的三个参数，以及面板自己查 core 时需要的 rpc 地址。
 pub struct Published { snapshot: Snapshot, beat: BeatInput, rpc: Option<SocketAddr> }
-pub struct BeatInput { config_hash: String, credential_id: String, app_version: String }
+pub struct BeatInput { config_hash: String, credential_id: String, app_version: String,
+                        app_update_known: Option<String> }
 pub struct StateCell(RwLock<Arc<Published>>);   // 面板与托盘同步只读它
 pub fn logs(path: &Path, n: usize) -> Vec<Line>;      // 纯函数，读文件
 pub fn events(path: &Path, n: usize) -> Vec<Line>;
@@ -255,7 +259,7 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
 
 **拥有的状态**：全部。`status`、`last_error`、`cfg`、`core_running`/`core_pid`/`core_cred_id`、`local_ip`、`stun`、`core_version`、`identity`、`update{phase,version,notes,url,sha256,path,sum,err}`、`auth_fails`、`revive_attempt`/`core_started_at`、`autostart_on`、`launcher_sum`/`launcher_tried`/`auto_tried`。**没有一个被 `Mutex` 保护**，因为只有引擎线程读写；对外只发布只读副本（`Published`）。
 
-`beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。
+`beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定、`app_update_known` 取内存里那份 offer 的摘要（`None` 时整个字段省略）。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。
 
 **依赖**：`mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`。
 
@@ -478,7 +482,7 @@ strip = true
 | `remote` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`sha2`、`hex`、`base64`、`ed25519-dalek`、`rand`、`ureq`（windows 加 `native-tls`，unix 加 `tls`） |
 | `etrpc` | `mesh-text`、`thiserror`（其余是 `std::net` + `std::io`） |
 | `core` | `mesh-etrpc`、`mesh-text`、`thiserror`；windows: `windows-sys`（`Win32_Foundation`、`Win32_System_JobObjects`、`Win32_System_Threading`）；unix: `libc` |
-| `engine` | `mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`、`serde`、`serde_json`、`sha2`、`hex`、`thiserror`、`rand`；不需要 windows-sys（自启只写 UTF-16 文件 + 起 `schtasks.exe`，隐藏窗口用 `CommandExt::creation_flags`） |
+| `engine` | `mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`、`serde`、`serde_json`、`sha2`、`hex`、`thiserror`、`rand`；不需要 windows-sys（自启只写 UTF-16 文件 + 起 `schtasks.exe`，隐藏窗口用 `CommandExt::creation_flags`）；dev: `ed25519-dalek`（给测试 offer 签名） |
 | `panel` | `mesh-engine`、`mesh-etrpc`、`tiny_http`、`include_dir`、`serde_json` |
 | `client` | `mesh-install`、`mesh-engine`、`mesh-panel`；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_UI_WindowsAndMessaging`、`Win32_Graphics_Gdi`、`Win32_System_LibraryLoader`、`Win32_System_Console`）+ `windows`（`Win32_UI_Shell` 的 `IShellDispatch`、`Win32_System_Com`）；unix: `signal-hook`；build: `winresource` |
 | `launcher` | `mesh-install`、`zstd`、`tar`、`sha2`、`serde_json`、`ureq`（windows: `native-tls`）；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_System_Threading`）；unix: 无（下载走系统 `curl`）；build: `winresource` |

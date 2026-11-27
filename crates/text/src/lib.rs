@@ -354,6 +354,7 @@ pub mod id {
     pub const ENGINE_LOG_LAUNCHER_DOWNLOAD: &str = "engine.log.launcher_download";
     pub const ENGINE_LOG_LAUNCHER_DOWNLOAD_FAILED: &str = "engine.log.launcher_download_failed";
     pub const ENGINE_LOG_LAUNCHER_REPLACE_FAILED: &str = "engine.log.launcher_replace_failed";
+    pub const ENGINE_LOG_LAUNCHER_SIGNATURE_INVALID: &str = "engine.log.launcher_signature_invalid";
     pub const ENGINE_LOG_LAUNCHER_THREAD_FAILED: &str = "engine.log.launcher_thread_failed";
     pub const ENGINE_LOG_LAUNCHER_UPDATE_FAILED: &str = "engine.log.launcher_update_failed";
     pub const ENGINE_LOG_LAUNCHER_UPDATED: &str = "engine.log.launcher_updated";
@@ -370,6 +371,7 @@ pub mod id {
     pub const ENGINE_LOG_SKIP_FAILED_VERSION: &str = "engine.log.skip_failed_version";
     pub const ENGINE_LOG_STOP_CORE_FAILED: &str = "engine.log.stop_core_failed";
     pub const ENGINE_LOG_UPDATE_READY_MANUAL: &str = "engine.log.update_ready_manual";
+    pub const ENGINE_LOG_UPDATE_SIGNATURE_INVALID: &str = "engine.log.update_signature_invalid";
     pub const ENGINE_LOG_UPDATE_URL_NOT_ABSOLUTE: &str = "engine.log.update_url_not_absolute";
 }
 
@@ -851,6 +853,7 @@ mod tests {
         id::ENGINE_LOG_LAUNCHER_DOWNLOAD,
         id::ENGINE_LOG_LAUNCHER_DOWNLOAD_FAILED,
         id::ENGINE_LOG_LAUNCHER_REPLACE_FAILED,
+        id::ENGINE_LOG_LAUNCHER_SIGNATURE_INVALID,
         id::ENGINE_LOG_LAUNCHER_THREAD_FAILED,
         id::ENGINE_LOG_LAUNCHER_UPDATE_FAILED,
         id::ENGINE_LOG_LAUNCHER_UPDATED,
@@ -867,6 +870,7 @@ mod tests {
         id::ENGINE_LOG_SKIP_FAILED_VERSION,
         id::ENGINE_LOG_STOP_CORE_FAILED,
         id::ENGINE_LOG_UPDATE_READY_MANUAL,
+        id::ENGINE_LOG_UPDATE_SIGNATURE_INVALID,
         id::ENGINE_LOG_UPDATE_URL_NOT_ABSOLUTE,
     ];
 

@@ -30,6 +30,11 @@ windows-sys = { workspace = true, features = [
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
+[dev-dependencies]
+# 测试要自己签一份 offer：发布私钥不在这台机器上，只有测试密钥对能让
+# 「有效签名被接受」这条路径跑到。
+ed25519-dalek = { workspace = true }
+
 # 测试里判断子进程还在不在（kill(pid, 0)）也要它。
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }

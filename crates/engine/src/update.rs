@@ -168,6 +168,25 @@ impl Engine {
             );
             return;
         }
+        // 摘要只证明内容没被换过，签名才证明它出自发布方：控制面被拿下时能改
+        // 摘要，却签不出新签名。这是整条更新链上唯一的信任锚。
+        if !remote::signing::verify_release_with(
+            &self.release_key,
+            remote::signing::SLOT_CLIENT,
+            mesh_install::platform::id(),
+            &info.version,
+            &info.sha256,
+            &info.signature,
+        ) {
+            self.logf(
+                "app",
+                &mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_UPDATE_SIGNATURE_INVALID,
+                    &[&info.version],
+                ),
+            );
+            return;
+        }
         // 正在下载/交接：这份状态由下载线程独占，心跳不要碰。
         if self.update.busy || self.update.phase == Phase::Downloading {
             return;
@@ -474,6 +493,22 @@ impl Engine {
             return;
         };
         if info.url.is_empty() || !is_full_digest(&info.sha256) {
+            return;
+        }
+        // 启动器以管理员权限替换自己，一次错误的替换要人工到场才能修好；
+        // 所以这里和客户端包一样，签名不过就不动本地文件。
+        if !remote::signing::verify_release_with(
+            &self.release_key,
+            remote::signing::SLOT_LAUNCHER,
+            mesh_install::platform::id(),
+            &info.version,
+            &info.sha256,
+            &info.signature,
+        ) {
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_LAUNCHER_SIGNATURE_INVALID),
+            );
             return;
         }
         // 判重与占位在同一处完成：同一台机器只尝试一次，换不掉就等下个版本。

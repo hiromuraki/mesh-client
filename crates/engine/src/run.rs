@@ -163,6 +163,9 @@ pub(crate) struct Engine {
     pub(crate) autostart_on: bool,
     pub(crate) identity: IdentityMeta,
     pub(crate) hints: ConfigHints,
+    /// 验发布签名用的公钥（hex）。生产就是编进 remote 的那一把，测试换成自己
+    /// 生成的密钥对——发布私钥不在这台机器上，只有这样才能测到接受路径。
+    pub(crate) release_key: String,
     pub(crate) local_ip: String,
     pub(crate) core_version: String,
     pub(crate) core_path_used: String,
@@ -261,6 +264,7 @@ pub fn spawn(
         autostart_on: false,
         identity: IdentityMeta::default(),
         hints: ConfigHints::default(),
+        release_key: remote::signing::RELEASE_PUBLIC_KEY.to_string(),
         local_ip: String::new(),
         core_version: String::new(),
         core_path_used: String::new(),

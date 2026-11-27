@@ -6,6 +6,8 @@
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
+
+pub mod signing;
 use mesh_install::platform;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
@@ -222,6 +224,9 @@ pub struct LauncherInfo {
     pub version: String,
     pub url: String,
     pub sha256: String,
+    /// 离线发布私钥对「{launcher, 平台, 版本, 摘要}」的签名（hex）。客户端验不过
+    /// 就不替换；字段缺失按无效处理。
+    pub signature: String,
 }
 
 /// 服务端下发的客户端更新信息，只在设备版本更旧时出现。
@@ -241,6 +246,10 @@ pub struct UpdateInfo {
     /// 发布包的完整摘要，空串表示服务端没有登记（早期记录）。
     /// 精简形状里**没有**这个字段：客户端手上的那份就是它，不必再发。
     pub sha256: String,
+    /// 离线发布私钥对「{client, 平台, 版本, 摘要}」的签名（hex）。摘要只说明
+    /// 内容没被换过，签名才说明这份内容出自发布方；精简形状里没有它，也不需要
+    /// ——那份 offer 当初就是验过签才记住的。
+    pub signature: String,
     /// 包级开关：这个版本该不该自己装，由发布方决定；本地
     /// `--disable-auto-update` 可以一票否决。缺失按手动处理。
     pub auto_update: bool,

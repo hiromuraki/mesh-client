@@ -109,6 +109,7 @@ fn harness(tag: &str) -> Harness {
         autostart_on: false,
         identity: Default::default(),
         hints: Default::default(),
+        release_key: release_key_hex(),
         local_ip: String::new(),
         core_version: String::new(),
         core_path_used: String::new(),
@@ -653,12 +654,38 @@ fn digest(tag: u8) -> String {
     format!("{tag:02x}").repeat(32)
 }
 
+/// 测试用的发布私钥。真正的发布私钥不在这台机器上，所以测试自己生成一把：
+/// 公钥交给引擎，私钥用来签 offer——「有效签名被接受」这条路径才测得到。
+fn release_signing_key() -> ed25519_dalek::SigningKey {
+    ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+}
+
+/// 引擎验签用的那一半。
+fn release_key_hex() -> String {
+    hex::encode(release_signing_key().verifying_key().to_bytes())
+}
+
+/// 按发布私钥的规矩给一个槽位签出签名（hex）。
+fn sign_release(slot: &str, version: &str, sha256: &str) -> String {
+    use ed25519_dalek::Signer;
+    let message =
+        remote::signing::signing_string(slot, mesh_install::platform::id(), version, sha256);
+    hex::encode(release_signing_key().sign(message.as_bytes()).to_bytes())
+}
+
+/// 改了 offer 的版本或摘要之后重新签一次，否则验签会先把它拦下来。
+fn resign(info: &mut remote::UpdateInfo) {
+    info.signature = sign_release(remote::signing::SLOT_CLIENT, &info.version, &info.sha256);
+}
+
 fn update_info(version: &str) -> remote::UpdateInfo {
+    let sha256 = digest(0xab);
     remote::UpdateInfo {
         version: version.to_string(),
         url: "http://127.0.0.1:1/pkg.tar.zst".to_string(),
         notes: String::new(),
-        sha256: digest(0xab),
+        signature: sign_release(remote::signing::SLOT_CLIENT, version, &sha256),
+        sha256,
         auto_update: false,
         unchanged: false,
     }
@@ -671,6 +698,7 @@ fn slim_update_info(version: &str, auto_update: bool) -> remote::UpdateInfo {
         url: String::new(),
         notes: String::new(),
         sha256: String::new(),
+        signature: String::new(),
         auto_update,
         unchanged: true,
     }
@@ -923,6 +951,66 @@ fn clearing_the_offer_stops_reporting_it() {
 }
 
 #[test]
+fn an_unsigned_offer_is_ignored() {
+    let mut harness = harness("update-unsigned");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    let mut info = update_info("2026.11.26-2");
+    info.signature.clear();
+    harness.engine.offer_update(&api, Some(&info));
+    // 摘要与版本都合法，只有签名缺席：那也不能记下来，否则下一轮心跳会把它
+    // 当成“已就绪”交给启动器。
+    assert_eq!(harness.engine.update.phase, Phase::Idle);
+    assert!(harness.engine.update.version.is_empty());
+}
+
+#[test]
+fn a_signature_for_another_slot_is_ignored() {
+    let mut harness = harness("update-wrong-slot");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    let mut info = update_info("2026.11.26-2");
+    // 槽位是签名串的一行：同一份字节签成启动器槽位，客户端包这边就不该通过。
+    info.signature = sign_release(remote::signing::SLOT_LAUNCHER, &info.version, &info.sha256);
+    harness.engine.offer_update(&api, Some(&info));
+    assert_eq!(harness.engine.update.phase, Phase::Idle);
+    assert!(harness.engine.update.version.is_empty());
+}
+
+#[test]
+fn a_launcher_with_an_invalid_signature_is_not_replaced() {
+    let mut harness = harness("launcher-signature");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    let sum = digest(0xcd);
+    let info = remote::LauncherInfo {
+        version: "2026.11.26-2".to_string(),
+        url: "http://127.0.0.1:1/mesh.exe".to_string(),
+        sha256: sum.clone(),
+        signature: sign_release(remote::signing::SLOT_CLIENT, "2026.11.26-2", &sum),
+    };
+    harness.engine.apply_launcher(&api, Some(&info));
+    // 没进替换流程：tried 只在验签通过之后才占位。
+    assert!(harness.engine.launcher_tried.is_none());
+}
+
+#[test]
+fn a_signed_launcher_is_offered_for_replacement() {
+    let mut harness = harness("launcher-signed");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    let sum = digest(0xce);
+    let info = remote::LauncherInfo {
+        version: "2026.11.26-2".to_string(),
+        url: "http://127.0.0.1:1/mesh.exe".to_string(),
+        sha256: sum.clone(),
+        signature: sign_release(remote::signing::SLOT_LAUNCHER, "2026.11.26-2", &sum),
+    };
+    harness.engine.apply_launcher(&api, Some(&info));
+    assert_eq!(harness.engine.launcher_tried.as_deref(), Some(sum.as_str()));
+}
+
+#[test]
 fn a_republished_version_replaces_the_offer() {
     let mut harness = harness("known-republish");
     let key = harness.engine.store.signing_key().unwrap();
@@ -932,6 +1020,7 @@ fn a_republished_version_replaces_the_offer() {
     let mut info = update_info("2026.11.26-2");
     info.sha256 = digest(0xbb);
     info.url = "http://127.0.0.1:1/new.tar.zst".to_string();
+    resign(&mut info);
     harness.engine.offer_update(&api, Some(&info));
     assert_eq!(harness.engine.update.sha256, digest(0xbb));
     assert_eq!(harness.engine.update.url, "http://127.0.0.1:1/new.tar.zst");
