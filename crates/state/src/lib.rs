@@ -222,7 +222,8 @@ impl Store {
             return Ok(key.clone());
         }
         let key = match fs::read(&path) {
-            Ok(bytes) => {
+            Ok(stored) => {
+                let bytes = open_key(&path, &stored)?;
                 if bytes.len() != SEED_LEN {
                     return Err(Error::KeyLength {
                         path,
@@ -237,7 +238,8 @@ impl Store {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let mut seed = [0u8; SEED_LEN];
                 rand::rngs::OsRng.fill_bytes(&mut seed);
-                atomic_replace(&path, &seed, 0o600).map_err(|err| Error::io(&path, err))?;
+                let sealed = seal_key(&path, &seed)?;
+                atomic_replace(&path, &sealed, 0o600).map_err(|err| Error::io(&path, err))?;
                 SigningKey::from_bytes(&seed)
             }
             Err(err) => return Err(Error::io(&path, err)),
@@ -256,21 +258,24 @@ impl Store {
         if let Some(key) = keys.secure.as_ref() {
             return Ok(key.clone());
         }
-        let key = match fs::read_to_string(&path) {
-            Ok(text) => {
-                let key = text.trim().to_string();
-                if key.is_empty() {
-                    return Err(Error::parse(&path, "文件为空"));
+        let key = match fs::read(&path) {
+            Ok(stored) => {
+                let bytes = open_key(&path, &stored)?;
+                if bytes.len() != SECURE_KEY_LEN {
+                    return Err(Error::KeyLength {
+                        path,
+                        len: bytes.len(),
+                        expected: SECURE_KEY_LEN,
+                    });
                 }
-                key
+                BASE64.encode(bytes)
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
                 let mut secret = [0u8; SECURE_KEY_LEN];
                 rand::rngs::OsRng.fill_bytes(&mut secret);
-                let key = BASE64.encode(secret);
-                atomic_replace(&path, key.as_bytes(), 0o600)
-                    .map_err(|err| Error::io(&path, err))?;
-                key
+                let sealed = seal_key(&path, &secret)?;
+                atomic_replace(&path, &sealed, 0o600).map_err(|err| Error::io(&path, err))?;
+                BASE64.encode(secret)
             }
             Err(err) => return Err(Error::io(&path, err)),
         };
@@ -362,6 +367,42 @@ impl Store {
     }
 }
 
+/// 密钥文件的封装头。Windows 上是 DPAPI 密文的标记；Unix 上不写（靠 0600）。
+const SEALED_MAGIC: &[u8; 8] = b"MESHKEY1";
+
+/// 私钥落盘前的封装。Windows 上包一层 DPAPI：文件被拷到别的机器或别的账户名下
+/// 就解不开；Unix 上原样落盘，权限由 0600 保证。
+#[cfg(windows)]
+fn seal_key(path: &Path, raw: &[u8]) -> Result<Vec<u8>, Error> {
+    let blob = win::protect(raw).map_err(|err| Error::io(path, err))?;
+    let mut out = Vec::with_capacity(SEALED_MAGIC.len() + blob.len());
+    out.extend_from_slice(SEALED_MAGIC);
+    out.extend_from_slice(&blob);
+    Ok(out)
+}
+
+#[cfg(not(windows))]
+fn seal_key(_path: &Path, raw: &[u8]) -> Result<Vec<u8>, Error> {
+    Ok(raw.to_vec())
+}
+
+/// seal_key 的逆操作。没有封装头就报错，不去猜「这大概是一把裸密钥」——
+/// 旧格式只会出现在手抄或跨平台搬运的目录里，猜错的后果是换掉设备身份。
+#[cfg(windows)]
+fn open_key(path: &Path, stored: &[u8]) -> Result<Vec<u8>, Error> {
+    let Some(blob) = stored.strip_prefix(SEALED_MAGIC.as_slice()) else {
+        return Err(Error::parse(
+            path,
+            "密钥是明文存的：删掉这个文件，重新注册这台设备",
+        ));
+    };
+    win::unprotect(blob).map_err(|err| Error::io(path, err))
+}
+
+#[cfg(not(windows))]
+fn open_key(_path: &Path, stored: &[u8]) -> Result<Vec<u8>, Error> {
+    Ok(stored.to_vec())
+}
 /// 凭据私钥落盘前的编码。返回 (写进 secret 的值, protect 标记)。
 ///
 /// 入参出参都是 base64 的 32 字节私钥（线上格式），这里只负责「落盘形态」。
@@ -485,7 +526,12 @@ mod tests {
         }
         let reopened = Store::open(&root).unwrap();
         assert_eq!(reopened.signing_key().unwrap().to_bytes(), seeds[0]);
-        assert_eq!(fs::read(store.key_path()).unwrap().len(), SEED_LEN);
+        // Unix 上就是 32 字节裸 seed；Windows 上多一层 DPAPI 封装。
+        let stored = fs::read(store.key_path()).unwrap().len();
+        #[cfg(not(windows))]
+        assert_eq!(stored, SEED_LEN);
+        #[cfg(windows)]
+        assert!(stored > SEED_LEN, "封装后的文件应当比 seed 长");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -494,9 +540,10 @@ mod tests {
         let root = temp_root("key-bad");
         let store = Store::open(&root).unwrap();
         fs::write(store.key_path(), b"too short").unwrap();
+        // 裸字节在 Windows 上先被判成「没封装」，长度检查因此轮不到；两种都算拒绝。
         assert!(matches!(
             store.signing_key(),
-            Err(Error::KeyLength { len: 9, .. })
+            Err(Error::KeyLength { len: 9, .. }) | Err(Error::Parse { .. })
         ));
         assert_eq!(fs::read(store.key_path()).unwrap(), b"too short");
         let _ = fs::remove_dir_all(&root);
@@ -617,5 +664,37 @@ mod tests {
         assert_eq!(loaded.id, "cred-1");
         assert_eq!(loaded.expires_at, 42);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// 两把密钥落盘都是 DPAPI 密文：文件里看不到私钥明文，读回来还是同一把。
+    #[cfg(windows)]
+    #[test]
+    fn both_keys_are_encrypted_at_rest() {
+        let root = temp_root("sealed-keys");
+        let store = Store::open(&root).unwrap();
+        let signing = store.signing_key().unwrap();
+        let secure = store.secure_key().unwrap();
+
+        for path in [store.key_path(), store.secure_key_path()] {
+            let bytes = fs::read(&path).unwrap();
+            assert!(
+                bytes.starts_with(b"MESHKEY1"),
+                "{} 缺少封装头",
+                path.display()
+            );
+        }
+        let raw_seed = fs::read(store.key_path()).unwrap();
+        assert!(
+            !raw_seed[8..].windows(32).any(|w| w == signing.to_bytes()),
+            "client.key 里出现了明文 seed"
+        );
+
+        // 重新打开之后还是同一把：封装是幂等的。
+        let reopened = Store::open(&root).unwrap();
+        assert_eq!(
+            reopened.signing_key().unwrap().to_bytes(),
+            signing.to_bytes()
+        );
+        assert_eq!(reopened.secure_key().unwrap(), secure);
+        let _ = fs::remove_dir_all(&root);
     }
 }
