@@ -1011,6 +1011,38 @@ fn a_signed_launcher_is_offered_for_replacement() {
 }
 
 #[test]
+fn a_failed_download_is_retried_on_a_slim_offer() {
+    let mut harness = harness("slim-retry");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    // 下载失败过：客户端照旧把这份 offer 的摘要报给服务端，服务端于是回精简形状。
+    // 重试必须在这里发生，否则最常见的失败路径永远没有第二次机会。
+    let mut offer = ready_offer("2026.11.26-2", &digest(0xab));
+    offer.phase = Phase::Failed;
+    offer.attempts = 1;
+    offer.retry_at = Some(Instant::now());
+    harness.engine.update = offer;
+
+    harness
+        .engine
+        .offer_update(&api, Some(&slim_update_info("2026.11.26-2", false)));
+    assert_eq!(harness.engine.update.phase, Phase::Downloading);
+}
+
+#[test]
+fn a_ready_offer_is_left_alone_by_a_slim_offer() {
+    let mut harness = harness("slim-ready");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    harness.engine.update = ready_offer("2026.11.26-2", &digest(0xab));
+    harness
+        .engine
+        .offer_update(&api, Some(&slim_update_info("2026.11.26-2", false)));
+    // 已就绪的那份不该因为「服务端说你已经知道」被重下或重置。
+    assert_eq!(harness.engine.update.phase, Phase::Ready);
+}
+
+#[test]
 fn a_republished_version_replaces_the_offer() {
     let mut harness = harness("known-republish");
     let key = harness.engine.store.signing_key().unwrap();

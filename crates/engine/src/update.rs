@@ -115,6 +115,13 @@ impl Engine {
         // 不写日志（这正是要省掉的那份每 30 秒重复），不碰 update 的 phase/version/
         // notes/sha256/path（否则会把“已知”错当成“新下发”，把已就绪的包重置成待下载）。
         if info.unchanged {
+            // 下载失败过的 offer 仍要按退避重试。客户端上报的「我有哪一份」与
+            // 进度无关（Failed 也照报），服务端据此一直回精简形状，重试分支
+            // 一次都进不去——最常见的失败（文件服务抖一下）就永远等不到第二次
+            // 机会，界面停在错误上直到有人手动点重试。
+            if self.update.phase == Phase::Failed {
+                self.retry_failed_download(api);
+            }
             return;
         }
         // 版本号会被拼进安装目录里的路径，先按 layout 的规则挡掉非法值。

@@ -132,6 +132,9 @@ fn is_zero(value: &i64) -> bool {
 pub struct Store {
     root: PathBuf,
     keys: Mutex<Keys>,
+    /// 收紧 `config/` 权限失败的原因；`None` 表示收紧成功（或不在 Windows 上）。
+    /// 失败不阻止启动——起不来比留一个旧 ACE 更糟——但必须有人把它说出来。
+    harden_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -149,16 +152,24 @@ impl Store {
         let dir = root.join(layout::CONFIG);
         fs::create_dir_all(&dir).map_err(|err| Error::io(&dir, err))?;
         // 目录一建好就收权限，赶在写任何密钥之前：继承来的 ACL 可能对本地所有账户
-        // 开放，晚一步就等于先把私钥暴露过一次。
-        harden_dir(&dir).map_err(|err| Error::io(&dir, err))?;
+        // 开放，晚一步就等于先把私钥暴露过一次。收紧失败（FAT32、网络盘、子项被
+        // 别的账户占着）只记原因不返回错误：客户端因为「加固没做完」而起不来，
+        // 用户看到的只是「打不开」，反而更容易去乱删文件。
+        let harden_error = harden_dir(&dir).err().map(|err| err.to_string());
         Ok(Store {
             root: root.to_path_buf(),
             keys: Mutex::new(Keys::default()),
+            harden_error,
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 收紧 `config/` 权限失败的原因；启动时由引擎写进日志。
+    pub fn harden_error(&self) -> Option<&str> {
+        self.harden_error.as_deref()
     }
 
     /// `config/` 目录。
@@ -235,13 +246,17 @@ impl Store {
         }
         let key = match fs::read(&path) {
             Ok(stored) => {
-                let bytes = open_key(&path, &stored)?;
+                let (bytes, legacy) = open_key(&path, &stored, SEED_LEN)?;
                 if bytes.len() != SEED_LEN {
                     return Err(Error::KeyLength {
                         path,
                         len: bytes.len(),
                         expected: SEED_LEN,
                     });
+                }
+                if legacy {
+                    let sealed = seal_key(&path, &bytes)?;
+                    atomic_replace(&path, &sealed, 0o600).map_err(|err| Error::io(&path, err))?;
                 }
                 let mut seed = [0u8; SEED_LEN];
                 seed.copy_from_slice(&bytes);
@@ -272,13 +287,17 @@ impl Store {
         }
         let key = match fs::read(&path) {
             Ok(stored) => {
-                let bytes = open_key(&path, &stored)?;
+                let (bytes, legacy) = open_key(&path, &stored, SECURE_KEY_LEN)?;
                 if bytes.len() != SECURE_KEY_LEN {
                     return Err(Error::KeyLength {
                         path,
                         len: bytes.len(),
                         expected: SECURE_KEY_LEN,
                     });
+                }
+                if legacy {
+                    let sealed = seal_key(&path, &bytes)?;
+                    atomic_replace(&path, &sealed, 0o600).map_err(|err| Error::io(&path, err))?;
                 }
                 BASE64.encode(bytes)
             }
@@ -308,8 +327,13 @@ impl Store {
         if credential.secret.is_empty() {
             return Ok(None);
         }
-        credential.secret = open_secret(&path, &credential.secret, &credential.protect)?;
+        let (secret, legacy) = open_secret(&path, &credential.secret, &credential.protect)?;
+        credential.secret = secret;
         credential.protect.clear();
+        if legacy {
+            // 旧格式的私钥在磁盘上是明文：读到就地重封装一次，之后不会再走这条路。
+            self.save_credential(&credential)?;
+        }
         Ok(Some(credential))
     }
 
@@ -406,22 +430,52 @@ fn seal_key(_path: &Path, raw: &[u8]) -> Result<Vec<u8>, Error> {
     Ok(raw.to_vec())
 }
 
-/// seal_key 的逆操作。没有封装头就报错，不去猜「这大概是一把裸密钥」——
-/// 旧格式只会出现在手抄或跨平台搬运的目录里，猜错的后果是换掉设备身份。
+/// seal_key 的逆操作。
+///
+/// 返回 `(明文, 要不要按当前格式重写)`。没有封装头时按**旧格式**处理：本仓库
+/// `d9aa922` 及更早的版本直接写裸字节（`client.key`）或裸 base64 文本
+/// （`secure.key`），换成 DPAPI 封装之后没有留迁移路径，那些文件就读不出来了。
+/// 读到旧格式要照用并就地重封装一次——拒绝的后果不是「提示用户修一下」，而是
+/// 进程照常起来、心跳永远发不出去、启动器还照样 commit，自动回滚也不会触发。
 #[cfg(windows)]
-fn open_key(path: &Path, stored: &[u8]) -> Result<Vec<u8>, Error> {
-    let Some(blob) = stored.strip_prefix(SEALED_MAGIC.as_slice()) else {
-        return Err(Error::parse(
-            path,
-            mesh_text::get(mesh_text::id::STATE_ERROR_KEY_NOT_SEALED),
-        ));
-    };
-    win::unprotect(blob).map_err(|err| Error::io(path, err))
+fn open_key(path: &Path, stored: &[u8], expected: usize) -> Result<(Vec<u8>, bool), Error> {
+    if let Some(blob) = stored.strip_prefix(SEALED_MAGIC.as_slice()) {
+        let raw = win::unprotect(blob).map_err(|err| Error::io(path, err))?;
+        return Ok((raw, false));
+    }
+    Ok((legacy_key(path, stored, expected)?, true))
 }
 
 #[cfg(not(windows))]
-fn open_key(_path: &Path, stored: &[u8]) -> Result<Vec<u8>, Error> {
-    Ok(stored.to_vec())
+fn open_key(path: &Path, stored: &[u8], expected: usize) -> Result<(Vec<u8>, bool), Error> {
+    // Unix 上没有封装头，裸字节就是当前格式；只有旧版 `secure.key` 的 base64
+    // 文本需要认一下，认出来就顺手改写成本格式。
+    if stored.len() == expected {
+        return Ok((stored.to_vec(), false));
+    }
+    Ok((legacy_key(path, stored, expected)?, true))
+}
+
+/// 认旧格式：裸字节，或旧版 `secure.key` 那种 base64 文本。两者长度都不对就报错，
+/// 不去猜「这大概是一把密钥」——猜错的后果是换掉设备身份。
+fn legacy_key(path: &Path, stored: &[u8], expected: usize) -> Result<Vec<u8>, Error> {
+    if stored.len() == expected {
+        return Ok(stored.to_vec());
+    }
+    if let Ok(text) = std::str::from_utf8(stored) {
+        if let Ok(raw) = BASE64.decode(text.trim()) {
+            if raw.len() == expected {
+                return Ok(raw);
+            }
+        }
+    }
+    Err(Error::parse(
+        path,
+        mesh_text::format(
+            mesh_text::id::STATE_ERROR_KEY_UNRECOGNIZED,
+            &[&stored.len(), &expected],
+        ),
+    ))
 }
 /// 凭据私钥落盘前的编码。返回 (写进 secret 的值, protect 标记)。
 ///
@@ -444,36 +498,54 @@ fn seal_secret(_path: &Path, secret: &str) -> Result<(String, String), Error> {
 }
 
 /// seal_secret 的逆操作：把磁盘上的形态解回 base64 私钥。
+///
+/// 返回 `(base64 私钥, 要不要重写)`。`protect` 为空是旧格式（`d9aa922` 及更早
+/// 没有这个字段），那种文件里的 `secret` 就是明文 base64，读出来照用并重封装。
 #[cfg(windows)]
-fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<String, Error> {
-    if protect != "dpapi" {
-        return Err(Error::parse(
-            path,
-            mesh_text::get(mesh_text::id::STATE_ERROR_CREDENTIAL_PLAINTEXT),
-        ));
+fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<(String, bool), Error> {
+    if protect == "dpapi" {
+        let blob = BASE64.decode(stored).map_err(|err| {
+            Error::parse(
+                path,
+                mesh_text::format(
+                    mesh_text::id::STATE_ERROR_CREDENTIAL_CIPHER_NOT_BASE64,
+                    &[&err],
+                ),
+            )
+        })?;
+        let raw = win::unprotect(&blob).map_err(|err| Error::io(path, err))?;
+        return Ok((BASE64.encode(raw), false));
     }
-    let blob = BASE64.decode(stored).map_err(|err| {
-        Error::parse(
-            path,
-            mesh_text::format(
-                mesh_text::id::STATE_ERROR_CREDENTIAL_CIPHER_NOT_BASE64,
-                &[&err],
-            ),
-        )
-    })?;
-    let raw = win::unprotect(&blob).map_err(|err| Error::io(path, err))?;
-    Ok(BASE64.encode(raw))
+    if protect.is_empty() {
+        let raw = BASE64.decode(stored).map_err(|err| {
+            Error::parse(
+                path,
+                mesh_text::format(mesh_text::id::STATE_ERROR_CREDENTIAL_NOT_BASE64, &[&err]),
+            )
+        })?;
+        if raw.len() == SECURE_KEY_LEN {
+            return Ok((BASE64.encode(raw), true));
+        }
+    }
+    Err(Error::parse(
+        path,
+        mesh_text::format(
+            mesh_text::id::STATE_ERROR_CREDENTIAL_PLAINTEXT,
+            &[&stored.len()],
+        ),
+    ))
 }
 
 #[cfg(not(windows))]
-fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<String, Error> {
+fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<(String, bool), Error> {
+    // Unix 上 DPAPI 不可用，带保护标记的文件只可能是从 Windows 拷过来的。
     if !protect.is_empty() {
         return Err(Error::parse(
             path,
             mesh_text::get(mesh_text::id::STATE_ERROR_CREDENTIAL_DPAPI_UNREADABLE),
         ));
     }
-    Ok(stored.to_string())
+    Ok((stored.to_string(), false))
 }
 
 /// 注册用的 base64 公钥。
@@ -586,6 +658,89 @@ mod tests {
         let raw = BASE64.decode(&key).unwrap();
         assert_eq!(raw.len(), SECURE_KEY_LEN);
         assert_eq!(Store::open(&root).unwrap().secure_key().unwrap(), key);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bare_seed_key_is_used_and_resealed() {
+        // 本仓库 d9aa922 及更早写的是裸 32 字节。读到必须照用并就地重封装：拒绝
+        // 的后果是那台设备升级后再也拿不到自己的身份——进程照常起来、心跳发不
+        // 出去、启动器还照样 commit，自动回滚也不会触发。
+        let root = temp_root("key-legacy");
+        let store = Store::open(&root).unwrap();
+        let mut seed = [0u8; SEED_LEN];
+        for (index, byte) in seed.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        fs::write(store.key_path(), seed).unwrap();
+
+        let key = store.signing_key().unwrap();
+        assert_eq!(key.to_bytes(), seed, "旧格式的密钥必须照用，不能换一把");
+        let stored = fs::read(store.key_path()).unwrap();
+        #[cfg(windows)]
+        assert!(
+            stored.starts_with(SEALED_MAGIC),
+            "读到旧格式之后应当就地重封装"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(stored, seed, "Unix 上重写只是格式归一，内容不变");
+        // 幂等：再开一次还是同一把。
+        assert_eq!(
+            Store::open(&root)
+                .unwrap()
+                .signing_key()
+                .unwrap()
+                .to_bytes(),
+            seed
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_base64_secure_key_is_used_and_resealed() {
+        // 旧版 `secure.key` 存的是 base64 文本，不是裸字节。
+        let root = temp_root("secure-legacy");
+        let store = Store::open(&root).unwrap();
+        let raw = [9u8; SECURE_KEY_LEN];
+        fs::write(store.secure_key_path(), BASE64.encode(raw)).unwrap();
+
+        assert_eq!(store.secure_key().unwrap(), BASE64.encode(raw));
+        let stored = fs::read(store.secure_key_path()).unwrap();
+        #[cfg(windows)]
+        assert!(stored.starts_with(SEALED_MAGIC));
+        #[cfg(not(windows))]
+        assert_eq!(stored, raw, "Unix 上应当从 base64 文本改成裸字节");
+        assert_eq!(
+            Store::open(&root).unwrap().secure_key().unwrap(),
+            BASE64.encode(raw)
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_plaintext_credential_is_used_and_resealed() {
+        // 旧格式没有 `protect` 字段，`secret` 就是明文 base64。
+        let root = temp_root("credential-legacy");
+        let store = Store::open(&root).unwrap();
+        let secret = BASE64.encode([3u8; SECURE_KEY_LEN]);
+        let text = serde_json::json!({
+            "id": "legacy-1",
+            "secret": secret,
+            "expires_at": 1_700_000_000i64,
+        })
+        .to_string();
+        fs::write(store.credential_path(), text).unwrap();
+
+        let loaded = store.load_credential().unwrap().unwrap();
+        assert_eq!(loaded.secret, secret);
+        assert!(loaded.protect.is_empty(), "内存里不该留下保护标记");
+        // 磁盘上已经换成当前格式，再读一次仍然解得开。
+        let again = Store::open(&root)
+            .unwrap()
+            .load_credential()
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.secret, secret);
         let _ = fs::remove_dir_all(&root);
     }
 

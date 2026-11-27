@@ -33,12 +33,15 @@ pub fn harden_dir(dir: &Path) -> io::Result<()> {
     let system = well_known_sid(WinLocalSystemSid)?;
     let admins = well_known_sid(WinBuiltinAdministratorsSid)?;
 
-    // 三条 ACE 远小于 1 KiB；ACL 结构要求 4 字节对齐，Vec<u8> 的分配满足这一点。
-    let mut acl_buf = vec![0u8; 512];
+    // 三条 ACE 远小于 1 KiB。缓冲区用 u64 数组而不是 Vec<u8>：ACL 要求 4 字节
+    // 对齐，而 Vec<u8> 只保证 1 字节——今天能跑只是分配器恰好给了对齐的地址，
+    // 换分配器或换个切片来源就会静默写坏内存。
+    let mut acl_buf = [0u64; 64];
     let acl = acl_buf.as_mut_ptr() as *mut ACL;
+    let mut last_error: Option<io::Error> = None;
     let mut wide = wide_path(dir);
     unsafe {
-        if InitializeAcl(acl, acl_buf.len() as u32, ACL_REVISION) == 0 {
+        if InitializeAcl(acl, std::mem::size_of_val(&acl_buf) as u32, ACL_REVISION) == 0 {
             return Err(io::Error::last_os_error());
         }
         for sid in [&user, &system, &admins] {
@@ -79,13 +82,22 @@ pub fn harden_dir(dir: &Path) -> io::Result<()> {
                     acl,
                     std::ptr::null(),
                 );
-                if rc != ERROR_SUCCESS {
-                    return Err(io::Error::from_raw_os_error(rc as i32));
+                if rc == ERROR_SUCCESS {
+                    continue;
                 }
+                // 子项改不动不算致命：目录本身已经切断继承，改不动的那一项多半
+                // 被别的账户占着或落在不支持的卷上。老板的密钥文件仍是旧 ACE，
+                // 这一点由调用方按 harden_error 记日志，不拦着客户端启动。
+                last_error = Some(io::Error::from_raw_os_error(rc as i32));
             }
         }
     }
-    Ok(())
+    // 目录本身改成功、个别子项没改成功时仍然返回 Err：权限确实没收全，调用方
+    // 要把它说出来。但那是「记一条日志」的事，不是「起不来」的事。
+    match last_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// 用当前用户的 DPAPI 密钥加密一段字节。解密的只有同一台机器上的同一用户。

@@ -191,12 +191,11 @@ pub fn spawn(
     shutdown: Arc<Shutdown>,
 ) -> (Sender<Cmd>, JoinHandle<()>) {
     let (tx, inbox) = channel();
+    // 打不开 `config/` 就没法做任何事，也不该假装能跑：这里直接让进程死掉，
+    // 由启动器按「启动确认失败」回滚（桌面端还会弹一次错误框）。
     let store = match Store::open(&config.root) {
         Ok(store) => store,
-        Err(err) => {
-            // 没有 config/ 就没法做任何事：把原因写进快照后照常起线程，让面板能显示它。
-            panic!("打开状态目录失败: {err}");
-        }
+        Err(err) => panic!("打开状态目录失败: {err}"),
     };
     let log_path = config.root.join(layout::LOG).join("client.log");
     let (log, log_error) = match Log::open(&log_path) {
@@ -207,6 +206,14 @@ pub fn spawn(
         ),
     };
     let log = Arc::new(log);
+    // 收紧 `config/` 权限失败不拦启动，但必须有人说出来：密钥文件可能仍带着
+    // 安装根继承来的宽权限，而用户看不到任何异常。
+    if let Some(err) = store.harden_error() {
+        log.add(
+            "app",
+            &mesh_text::format(mesh_text::id::ENGINE_LOG_CONFIG_HARDEN_FAILED, &[&err]),
+        );
+    }
 
     // core 事件包成 Cmd::Core 投回引擎；core 输出的每一行先去掉时间戳、打码再落盘。
     let inbox_tx = tx.clone();
