@@ -385,7 +385,9 @@ impl Store {
     }
 }
 
-/// 密钥文件的封装头。Windows 上是 DPAPI 密文的标记；Unix 上不写（靠 0600）。
+/// 密钥文件的封装头。Windows 上是 DPAPI 密文的标记；Unix 上不写（靠 0600），
+/// 所以这个常量也只在 Windows 上存在。
+#[cfg(windows)]
 const SEALED_MAGIC: &[u8; 8] = b"MESHKEY1";
 
 /// 私钥落盘前的封装。Windows 上包一层 DPAPI：文件被拷到别的机器或别的账户名下
