@@ -116,6 +116,7 @@ fn harness(tag: &str) -> Harness {
         network_name: String::new(),
         stun: Default::default(),
         hb_stop: None,
+        hb_gen: 0,
         stun_stop: None,
         closed: false,
     };
@@ -612,7 +613,7 @@ fn heartbeat_without_a_running_core_asks_for_a_reconnect() {
         "dev-1",
         key,
     )));
-    harness.engine.on_heartbeat(Ok(None));
+    harness.engine.on_heartbeat(harness.engine.hb_gen, Ok(None));
     match harness.engine.inbox.try_recv() {
         Ok(Cmd::Reconnect) => {}
         Ok(_) => panic!("应当排一个重连命令"),
@@ -633,7 +634,7 @@ fn a_successful_heartbeat_recovers_the_status() {
     harness
         .engine
         .set_status(Status::Error, "上一次失败".to_string());
-    harness.engine.on_heartbeat(Ok(None));
+    harness.engine.on_heartbeat(harness.engine.hb_gen, Ok(None));
     let snapshot = harness.engine.snapshot();
     assert_eq!(snapshot.status, "online");
     assert_eq!(snapshot.last_error, "");
@@ -650,17 +651,52 @@ fn a_heartbeat_401_does_not_clear_the_identity_on_the_first_strike() {
         key,
     )));
     saved_client(&harness);
-    harness
-        .engine
-        .on_heartbeat(Err(remote::Error::Unauthorized {
+    harness.engine.on_heartbeat(
+        harness.engine.hb_gen,
+        Err(remote::Error::Unauthorized {
             code: "unauthorized".to_string(),
             server_time: None,
-        }));
+        }),
+    );
     let client = harness.engine.store.load_client().unwrap().unwrap();
     assert_eq!(client.device_id, "dev-1");
     assert_eq!(harness.engine.snapshot().status, "degraded");
 }
 
+/// 上一代心跳线程带回来的结果属于旧连接：重连之后它不能再改状态、不能再下发。
+#[test]
+fn a_stale_heartbeat_result_is_ignored() {
+    let mut harness = harness("hb-stale");
+    let key = harness.engine.store.signing_key().unwrap();
+    harness.engine.api = Some(Arc::new(remote::Client::new(
+        "http://127.0.0.1:1",
+        "dev-1",
+        key,
+    )));
+    harness.engine.core = Some(running_core());
+    harness
+        .engine
+        .set_status(Status::Error, "上一次失败".to_string());
+    // 重连过一次：当前代次是 2，代次 1 的结果已经过期。
+    harness.engine.hb_gen = 2;
+
+    harness.engine.on_heartbeat(1, Ok(None));
+
+    assert_eq!(
+        harness.engine.snapshot().status,
+        "error",
+        "旧连接的心跳不能把状态改回 online"
+    );
+    assert_eq!(
+        harness.engine.snapshot().last_heartbeat,
+        0,
+        "旧连接的心跳不该刷新 last_heartbeat"
+    );
+
+    // 当前代次照常生效。
+    harness.engine.on_heartbeat(2, Ok(None));
+    assert_eq!(harness.engine.snapshot().status, "online");
+}
 // ------------------------------------------------------------ 更新
 
 /// 合法的完整摘要（64 位十六进制）。发布链要求摘要必填，测试里的 offer 必须带它。

@@ -64,7 +64,11 @@ impl Status {
 /// 引擎的入队点。后台路径只是“把结果交回来”，所有判断都在引擎线程里做。
 pub enum Cmd {
     /// 心跳线程只负责取样，401 的分类处理在引擎里。
-    Heartbeat(Result<Option<remote::Heartbeat>, remote::Error>),
+    Heartbeat {
+        /// 发这条结果的心跳代次。重连之后的旧结果由引擎丢掉（见 `on_heartbeat`）。
+        gen: u64,
+        result: Result<Option<remote::Heartbeat>, remote::Error>,
+    },
     Core(mesh_core::Event),
     Stun(mesh_etrpc::StunInfo),
     Download {
@@ -175,6 +179,9 @@ pub(crate) struct Engine {
     pub(crate) network_name: String,
     pub(crate) stun: mesh_etrpc::StunInfo,
     pub(crate) hb_stop: Option<Sender<()>>,
+    /// 心跳代次：每起一代心跳线程加一。上一代线程卡在请求里的时候重连了，它带回来
+    /// 的结果属于旧连接（旧控制面、旧 URL、旧凭据），必须丢掉，不能当成这一次心跳。
+    pub(crate) hb_gen: u64,
     /// STUN 刷新线程的停止通道。与心跳一样按连接循环的生命周期管理：每次重连新起
     /// 一个而不停旧的，线程就会按心跳的节奏无限累积（core 长期起不来时 2 个/分钟）。
     pub(crate) stun_stop: Option<Sender<()>>,
@@ -292,6 +299,7 @@ pub fn spawn(
         network_name: String::new(),
         stun: mesh_etrpc::StunInfo::default(),
         hb_stop: None,
+        hb_gen: 0,
         stun_stop: None,
         closed: false,
         config,
@@ -514,8 +522,8 @@ impl Engine {
     /// 处理一条命令；返回 true 表示要重新走一遍连接循环。
     pub(crate) fn handle(&mut self, cmd: Cmd) -> bool {
         match cmd {
-            Cmd::Heartbeat(result) => {
-                self.on_heartbeat(result);
+            Cmd::Heartbeat { gen, result } => {
+                self.on_heartbeat(gen, result);
                 false
             }
             Cmd::Core(event) => {
@@ -578,10 +586,18 @@ impl Engine {
     }
 
     /// 心跳结果的处理：恢复状态、下发配置/更新/凭据、必要时让主循环重连。
+    ///
+    /// `gen` 不是当前代次就直接丢掉：那条结果说的是另一条连接上的事——它可能把
+    /// 状态改回 online、用旧响应里的 URL 去下载、把旧控制面的配置与凭据落盘，甚至
+    /// 按旧连接的 401 清掉刚换好的身份。
     pub(crate) fn on_heartbeat(
         &mut self,
+        gen: u64,
         result: Result<Option<remote::Heartbeat>, remote::Error>,
     ) {
+        if gen != self.hb_gen {
+            return;
+        }
         let api = match self.api.clone() {
             Some(api) => api,
             None => return,
@@ -1012,6 +1028,8 @@ impl Engine {
         let Some(api) = self.api.clone() else {
             return;
         };
+        self.hb_gen = self.hb_gen.wrapping_add(1);
+        let gen = self.hb_gen;
         let cell = Arc::clone(&self.cell);
         let tx = self.self_tx.clone();
         let (stop_tx, stop_rx) = channel();
@@ -1033,7 +1051,7 @@ impl Engine {
                     published.beat.app_update_known.as_deref(),
                     HEARTBEAT_TIMEOUT,
                 );
-                if tx.send(Cmd::Heartbeat(result)).is_err() {
+                if tx.send(Cmd::Heartbeat { gen, result }).is_err() {
                     return;
                 }
             })

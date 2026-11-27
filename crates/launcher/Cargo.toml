@@ -31,10 +31,12 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
-# 只用系统自带的 TLS（Windows 上是 schannel）：rustls + ring 会给 exe 多加
-# 半兆，而这个启动器只下一个包，不需要自带一套 TLS 实现。
-# Linux 版不引它：那边用系统的 curl，静态 musl 下把 openssl 链进来不值得。
-ureq = { workspace = true, features = ["native-tls"] }
+# 与客户端同一套：`tls`（rustls）+ `native-certs`（读系统信任库）。
+# 只开 `native-tls` 是不够的——它只把 schannel 编进来，不会成为 `ureq::get` 的
+# 默认 provider，请求会以「no TLS backend is configured」失败（2026-11-26 就是这么
+# 炸的）。启动器的 `--url` 安装走 https 时必须能下。
+# Linux 版仍然用系统的 curl，静态 musl 下把 openssl 链进来不值得。
+ureq = { workspace = true, features = ["tls", "native-certs"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
