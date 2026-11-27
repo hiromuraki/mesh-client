@@ -211,6 +211,7 @@ launcher.text.update_unusable = The update package is unusable and was discarded
 launcher.text.install_failed_keep_running = Installation failed: {0}; continuing with the current version
 launcher.text.cleanup_failed = Cleaning up {0} failed: {1}
 launcher.text.version_record_failed = Recording the launcher version ({0}) failed: {1}
+launcher.text.build_version_invalid = The launcher version {0} is not a release version (YYYY.MM.DD-N); not recording it
 launcher.error.client_exited_immediately = The client exited immediately after starting ({0})
 launcher.error.wait_client = Waiting for the client failed: {0}
 launcher.error.boot_timeout = The client did not confirm its startup within {0}s

@@ -209,6 +209,7 @@ launcher.text.update_unusable = 更新包不可用，已丢弃：{0}
 launcher.text.install_failed_keep_running = 安装失败：{0}，继续启动当前版本
 launcher.text.cleanup_failed = 清理 {0} 失败：{1}
 launcher.text.version_record_failed = 记下启动器版本失败（{0}）：{1}
+launcher.text.build_version_invalid = 启动器版本号 {0} 不是发布版本号（YYYY.MM.DD-N），不记录
 launcher.error.client_exited_immediately = 客户端启动后立即退出（{0}）
 launcher.error.wait_client = 等待客户端失败：{0}
 launcher.error.boot_timeout = 客户端 {0}s 内没有确认启动

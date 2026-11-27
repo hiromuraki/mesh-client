@@ -70,6 +70,16 @@ const BUILD_VERSION: &str = env!("MESH_LAUNCHER_BUILD_VERSION");
 ///
 /// 写不进去只记日志：它只影响下一次替换的判重，不该拦住启动。
 fn record_version(root: &Path) {
+    // 开发构建里编进来的是 crate 版本（`0.1.0`），不是发布版本号。把它写进
+    // launcher.json 会让客户端把之后每一份正式启动器都判成「不比它新」，从此再也
+    // 换不动启动器——所以认不出的版本号干脆不写，客户端按「没有记录」放行。
+    if !mesh_install::version::valid(BUILD_VERSION) {
+        log::line(&mesh_text::format(
+            mesh_text::id::LAUNCHER_TEXT_BUILD_VERSION_INVALID,
+            &[&BUILD_VERSION],
+        ));
+        return;
+    }
     if let Err(e) = mesh_install::layout::write_launcher_version(root, BUILD_VERSION) {
         log::line(&mesh_text::format(
             mesh_text::id::LAUNCHER_TEXT_VERSION_RECORD_FAILED,
