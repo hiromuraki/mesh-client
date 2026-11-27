@@ -39,7 +39,7 @@ stateDiagram-v2
 7. 选槽顺序：`current` 有效就用它；否则在有效槽里取目录名字典序最大的（`bob` 优先于 `alice`）；若那个槽无效则取另一个；两个都无效即没有可启动版本（首次安装或需要人工）。依据是名字的字典序，不是目录时间，也不是清单里的版本号——这一刻的诉求是确定性、不需要解包；选错也能从日志看出选了谁。
 8. 启动确认：拉起之后等 `current` 变成正在跑的那个槽即为成功；60 秒内没变或子进程退出即为失败。
 9. 失败时不改 `current`、不删候选槽。失败按版本计次（沿用 `Failures` 的 `LIMIT`），同一版本连续失败到上限就跳过它：「起不来」不一定是版本的问题（网络、凭据过期、TUN 冲突、UAC 没点同意），计数必须按版本记，不能按槽记。候选槽的 `version.json` 读不出或验不过时另走一条：丢弃候选槽、删除 `update.tar.zst`、记一条日志，不计次。
-10. 清理时机：只有一处触发——启动器拿到 `install.lock`、选槽之前，若 `current` 有效且另一个槽也有效，就删另一个槽，并清掉旧布局残留（`bin.old/`、`bin.stale/`、`install.state` 若存在）。不在确认成功那一瞬删：那一刻客户端刚写完 `current`，删东西只会制造竞态。客户端可能晚于 60 秒才写 `current`，启动器若在确认过程中先删候选，就会出现 `current` 指向一个不存在的槽；Windows 上运行中的 exe 删不掉、Linux 上能 unlink，这种平台差异会把竞态变成只在 Linux 上出现的砖。
+10. 清理时机：只有一处触发——确认成功之后删旧槽（此刻 `current` 已指向新槽）。选槽时不删任何槽：启动器分不清「上一次提交留下的旧槽」与「这一次刚装好、还没确认的候选槽」，按「另一个槽有效就删」会抹掉刚失败的那次安装。旧布局残留（`bin.old/`、`bin.stale/`、`install.state`）启动时顺手清掉。不在确认成功那一瞬删：那一刻客户端刚写完 `current`，删东西只会制造竞态。客户端可能晚于 60 秒才写 `current`，启动器若在确认过程中先删候选，就会出现 `current` 指向一个不存在的槽；Windows 上运行中的 exe 删不掉、Linux 上能 unlink，这种平台差异会把竞态变成只在 Linux 上出现的砖。
 
 两把锁回答两个问题，互不替代：
 
@@ -57,7 +57,7 @@ stateDiagram-v2
 3. 提交与修复分离：只有客户端提交；启动器只在缺失、非法或无效时修复一次。
 4. 启动确认只认 `current` 变成正在跑的槽，不认别的信号。
 5. 失败不改 `current`、不删候选槽；计数按版本，不按槽。
-6. 清理只在选槽之前发生：`current` 与另一个槽都有效时删另一个槽；确认过程不删任何槽。
+6. 清理只在确认成功之后发生，删的是旧槽；选槽不删任何槽。
 
 依据：`client/crates/launcher/src/install.rs` 的 `Owner`（`own`、`prepare`、`valid_slot`、`migrate_flat_layout`、`clean_legacy`、`install`、`discard_candidate`、`apply_pending`、`boot_candidate`、`candidate_failed`、`confirm`、`start`、`client_running`）与 `candidate`、`other_slot`、`wait_current`；`client/crates/install/src/layout.rs` 的 `BIN`、`SLOT_ALICE`、`SLOT_BOB`、`CURRENT`、`slot_name`、`slot_dir`、`read_current`、`write_current`、`MANIFEST`、`UPDATE_FILE`、`LOCK`、`INSTALL_LOCK`；`client/crates/install/src/lock.rs` 的 `Lock::path`、`Lock::owner_path`；提交对应 `client/crates/client/src/commit.rs` 的 `commit_current` 与 `client/src/main.rs` 的 `boot_ready`。
 
@@ -99,7 +99,7 @@ stateDiagram-v2
 
 ## 3. 启动器监督与启动确认
 
-启动器只做一件事：把选中的槽拉到确定的结局，即校验、拉起、等 `current` 变成该槽。清理旧槽发生在选槽之前，不在确认过程里。四个入口（安装之后、普通启动、确认被打断后的下一次启动、Linux 常驻监督）走同一条 `boot_and_settle`，两个平台只差进程怎么托管。
+启动器只做一件事：把选中的槽拉到确定的结局，即校验、拉起、等 `current` 变成该槽。清理旧槽发生在确认成功之后，删的是旧槽；选槽不删任何槽。四个入口（安装之后、普通启动、确认被打断后的下一次启动、Linux 常驻监督）走同一条 `boot_and_settle`，两个平台只差进程怎么托管。
 
 ```mermaid
 flowchart TD
@@ -115,7 +115,7 @@ flowchart TD
   F -- 通过 --> I["拉起槽内 mesh-client，带 --root"]
   I -- 创建失败 --> H
   I --> J["等 bin/current 变成该槽名，上限 60s"]
-  J -- 看到变化 --> K["清掉该版本的失败计数；旧槽留到下一次选槽前清理"]
+  J -- 看到变化 --> K["清掉该版本的失败计数；删掉旧槽"]
   J -- 进程提前退出或超时 --> L["先停掉候选槽并确认它退出"]
   L -- 停不下来 --> M["不动 current，保留候选槽，下一轮接着判"]
   L -- 已退出 --> H
@@ -128,7 +128,7 @@ flowchart TD
 | 进程创建失败 | 同上 | 同上 |
 | 确认超时或提前退出 | 停掉候选槽、记一次失败 | 同上 |
 | 停不掉候选槽 | 不动文件 | `current` 不动，候选槽保留，下一轮接着判 |
-| 确认成功 | 清失败计数；旧槽留到下一次选槽前清理 | `current` 已由客户端写成该槽 |
+| 确认成功 | 清失败计数；删掉旧槽 | `current` 已由客户端写成该槽 |
 
 启动确认没有独立标记：客户端在引擎、面板（桌面形态还含托盘）就位时原子写 `bin/current`，启动器只观察这个文件。写失败只影响这一次提交，`current` 保持旧值，下一轮按选槽判据重试。
 

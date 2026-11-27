@@ -123,18 +123,6 @@ impl Owner {
         let alice = self.valid_slot(layout::SLOT_ALICE);
         let bob = self.valid_slot(layout::SLOT_BOB);
 
-        // 清理只有这一处：`current` 有效、另一个槽也有效，另一个槽才是提交前留在盘上
-        // 的旧版本。`current` 缺失或无效时不动任何槽——那一份可能是唯一的启动材料。
-        if let Some(slot) = current {
-            let other = other_slot(slot);
-            if slot_version(&alice, &bob, slot).is_some()
-                && slot_version(&alice, &bob, other).is_some()
-            {
-                log::line(&mesh_text::format(id::LAUNCHER_TEXT_CLEAN_SLOT, &[&other]));
-                remove_path(&layout::slot_dir(&self.root, other));
-            }
-        }
-
         // 选槽：`current` 有效就用它；否则在有效槽里取目录名字典序最大的（bob 优先）。
         // 只看名字，不看目录时间，也不看清单里的版本号。
         let chosen = match current {
@@ -335,6 +323,7 @@ impl Owner {
         match self.confirm(installed.name, &mut client) {
             Ok(()) => {
                 clear_failure(&self.root, &installed.version);
+                self.drop_old_slot(installed.name);
                 Ok(client)
             }
             Err(reason) => {
@@ -345,6 +334,20 @@ impl Owner {
                 self.candidate_failed(installed, client.stop());
                 Err(reason)
             }
+        }
+    }
+
+    /// 提交之后旧槽才是可丢的：此刻 `current` 已经指向新槽，旧槽既不是在跑的那一份，
+    /// 也不是回滚材料。
+    ///
+    /// 只能在这里删：启动器无法区分一个有效槽是「上一次提交留下的旧版本」，还是
+    /// 「这一次刚装好、还没确认的候选槽」——按「另一个槽有效就删」去做，会把刚失败
+    /// 的候选槽一起删掉，那次安装从此无法重试。
+    fn drop_old_slot(&self, keep: &str) {
+        let old = other_slot(keep);
+        if layout::slot_dir(&self.root, old).exists() {
+            log::line(&mesh_text::format(id::LAUNCHER_TEXT_CLEAN_SLOT, &[&old]));
+            remove_path(&layout::slot_dir(&self.root, old));
         }
     }
 
@@ -385,7 +388,7 @@ impl Owner {
 }
 
 /// 两个槽互为候选：非当前槽就是候选槽，不需要任何记录。
-fn other_slot(slot: &'static str) -> &'static str {
+fn other_slot(slot: &str) -> &'static str {
     if slot == layout::SLOT_ALICE {
         layout::SLOT_BOB
     } else {
@@ -766,6 +769,16 @@ fn unpack(pkg: &Path, dest: &Path, budget: Budget) -> Result<(), String> {
             }
             out.write_all(&buf[..n]).map_err(|e| {
                 mesh_text::format(id::LAUNCHER_ERROR_WRITE_FILE, &[&target.display(), &e])
+            })?;
+        }
+        // 包里每一项都是要执行的东西（清单除外，设了也无害）。文件是逐字节写出来的，
+        // 权限得自己给：少了可执行位，拉起就是 EACCES，而清单与文件集合全都是对的，
+        // 排查时最容易看错方向。
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).map_err(|e| {
+                mesh_text::format(id::LAUNCHER_ERROR_CREATE_FILE, &[&target.display(), &e])
             })?;
         }
     }
@@ -1395,10 +1408,12 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 清理只在 `current` 有效且另一个槽也有效时删另一个槽。
+    /// 选槽不删任何槽：启动器分不清「上一次提交留下的旧槽」与「这一次刚装好、
+    /// 还没确认的候选槽」，按「另一个槽有效就删」去收拾，会把失败的那次安装从盘上抹掉
+    /// （真机上就是这么把候选槽删掉、然后永远重试旧版本的）。
     #[test]
-    fn cleanup_removes_the_other_slot_only_when_both_are_valid() {
-        let root = temp_root("cleanup-both");
+    fn selection_never_removes_a_slot() {
+        let root = temp_root("select-keeps");
         let key = test_key();
         write_slot(
             &root,
@@ -1418,13 +1433,17 @@ mod tests {
         let selected = owner(&root).prepare().unwrap().expect("alice 有效");
         assert_eq!(selected.name, layout::SLOT_ALICE);
         assert!(
-            !layout::slot_dir(&root, layout::SLOT_BOB).exists(),
-            "提交之后留下的旧槽应当在选槽之前清掉"
+            layout::slot_dir(&root, layout::SLOT_BOB).is_dir(),
+            "选槽不能碰另一个槽"
         );
         let _ = fs::remove_dir_all(&root);
+    }
 
-        // 另一个槽无效时不清：它可能是唯一的启动材料。
-        let root = temp_root("cleanup-one");
+    /// 清理只在确认成功之后发生：删的是已经不该再用的旧槽。
+    #[test]
+    fn cleanup_drops_the_old_slot_after_a_confirmed_install() {
+        let root = temp_root("cleanup-after-confirm");
+        let key = test_key();
         write_slot(
             &root,
             layout::SLOT_ALICE,
@@ -1432,9 +1451,18 @@ mod tests {
             "2026.11.27-1",
             &required_entries(),
         );
-        fs::create_dir_all(layout::slot_dir(&root, layout::SLOT_BOB)).unwrap();
-        set_current(&root, layout::SLOT_ALICE);
-        owner(&root).prepare().unwrap();
+        write_slot(
+            &root,
+            layout::SLOT_BOB,
+            &key,
+            "2026.11.27-2",
+            &required_entries(),
+        );
+        set_current(&root, layout::SLOT_BOB);
+        owner(&root).drop_old_slot(layout::SLOT_BOB);
+        assert!(!layout::slot_dir(&root, layout::SLOT_ALICE).exists());
+        // 旧槽本来就不在时是无副作用的 no-op。
+        owner(&root).drop_old_slot(layout::SLOT_BOB);
         assert!(layout::slot_dir(&root, layout::SLOT_BOB).is_dir());
         let _ = fs::remove_dir_all(&root);
     }
@@ -1468,7 +1496,7 @@ mod tests {
         let _ = fs::remove_dir_all(&src);
     }
 
-    /// 客户端提交之后，下一次启动把新槽当作当前槽，并清掉旧槽。
+    /// 客户端提交之后，下一次启动把新槽当作当前槽；旧槽留到确认那一刻才删。
     #[test]
     fn a_committed_candidate_becomes_current_on_the_next_start() {
         let root = temp_root("commit-next-start");
@@ -1493,9 +1521,11 @@ mod tests {
         assert_eq!(selected.name, layout::SLOT_BOB);
         assert_eq!(selected.version, "2026.11.27-2");
         assert!(
-            !layout::slot_dir(&root, layout::SLOT_ALICE).exists(),
-            "确认之后旧槽才轮到删"
+            layout::slot_dir(&root, layout::SLOT_ALICE).is_dir(),
+            "选槽只挑当前槽，删旧槽是确认那一步的事"
         );
+        owner(&root).drop_old_slot(layout::SLOT_BOB);
+        assert!(!layout::slot_dir(&root, layout::SLOT_ALICE).exists());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }
@@ -1640,6 +1670,25 @@ mod tests {
             .is_err());
         assert!(!layout::slot_dir(&root, layout::SLOT_BOB).exists());
         assert_eq!(count_failures(&root, "2026.11.27-2"), 0);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 解包出来的每一项都要可执行：少了可执行位，拉起就是 EACCES，而清单与文件集合
+    /// 全都是"对"的，排查时最容易看错方向。
+    #[cfg(unix)]
+    #[test]
+    fn unpacked_files_are_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("unpack-mode");
+        let src = temp_root("unpack-mode-src");
+        let pkg = valid_package(&src, "2026.11.27-1", &required_entries());
+        owner(&root)
+            .install(&pkg, layout::SLOT_ALICE, None, true)
+            .unwrap();
+        let exe = layout::slot_dir(&root, layout::SLOT_ALICE).join(platform::client_exe());
+        let mode = fs::metadata(&exe).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "解包出来的客户端必须可执行");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }

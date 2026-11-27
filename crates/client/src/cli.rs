@@ -86,6 +86,12 @@ pub(crate) fn parse(argv: &[String]) -> Result<Options, ParseError> {
             "server" => options.server = value(argv, &mut index, inline, name)?,
             "token" => options.token = value(argv, &mut index, inline, name)?,
             "name" => options.name = value(argv, &mut index, inline, name)?,
+            // 一次性兼容：旧启动器在安装交接时会传 `--boot-check <标记>`。新客户端不再
+            // 需要标记（提交由 `bin/current` 表达），但必须接受它——否则「先发客户端、
+            // 后发启动器」的那一步会让新客户端卡在参数解析上。**下一版删除。**
+            "boot-check" => {
+                let _ = value(argv, &mut index, inline, name)?;
+            }
             other => {
                 return Err(ParseError::Invalid(mesh_text::format(
                     id::CLIENT_ERROR_UNKNOWN_OPTION,

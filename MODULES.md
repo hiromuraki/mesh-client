@@ -318,7 +318,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.9 `mesh-launcher`（bin `mesh`）
 
-**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽），带 `--file`/`--url` 是 `Install`（装进候选槽）。改动安装根的动作全部在 `Owner` 之内：选槽之前清理有效旧槽、解包、校验、拉起、等 `current` 确认。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
+**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽），带 `--file`/`--url` 是 `Install`（装进候选槽）。改动安装根的动作全部在 `Owner` 之内：确认成功后删旧槽（选槽时不删任何槽）、解包、校验、拉起、等 `current` 确认。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
 
 **对外 API**：
 
@@ -332,7 +332,7 @@ pub(crate) fn own(root: &Path) -> Result<Owner, String>;            // install.l
 impl Owner {
     pub(crate) fn recover(&self) -> Result<(), String>;             // 按 current 与槽的有效性决定启动哪一份
     pub(crate) fn abort(&self) -> Result<(), String>;               // 放弃未确认的安装：停候选槽，保留 current 与候选槽
-    pub(crate) fn commit(&self) -> Result<(), String>;              // 收尾：删本次待装包；旧槽留到下一次选槽前清理
+    pub(crate) fn commit(&self) -> Result<(), String>;              // 收尾：删本次待装包
     pub(crate) fn install(&self, pkg: &Path, force: bool) -> Result<(), String>;  // 清空候选槽、解包、校验
     pub(crate) fn verify_current(&self) -> Result<(), String>;      // 校验某槽与清单同一集合
     pub(crate) fn boot_and_settle(&self) -> Result<launch::Client, String>;  // 拉起选中的槽，等 current 变成它
@@ -369,7 +369,7 @@ pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>
 2. 候选槽 = 非当前槽；清空候选槽。
 3. 解包到候选槽，按最终落盘的内容校验该槽的 `version.json` 与文件集合。
 4. 拉起候选槽的 `mesh-client`，等 `bin/current` 变成该槽名（60 秒）；没变或子进程退出即失败。
-5. 成功：客户端已提交 `current`；旧槽留到下一次启动、选槽之前清理。
+5. 成功：客户端已提交 `current`，随即删掉旧槽。
 6. 失败：停掉候选槽；`current` 不动、候选槽保留；按版本记一次失败。
 
 **四个入口、一个出口**：`boot_and_settle` 负责选槽、校验、拉起与等待 `current`——Windows 的安装后与普通启动（`run`、`launch_installed` → `boot_or_restore`）、确认被打断后的下一次启动、Linux 常驻监督（`supervisor::run`）。Linux 的手动安装同样拉起候选槽并等 `current`；确认失败就保留候选、不改 `current`。
@@ -379,7 +379,7 @@ pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>
 | 验证不过、进程创建失败 | 记一次失败；`current` 不动，候选槽保留 |
 | 确认超时或进程提前退出 | 先 `Client::stop` 并确认退出，再记一次失败；`current` 不动，候选槽保留 |
 | `stop` 失败（停不下来） | 不动 `current`，保留候选槽，下一轮接着判 |
-| 确认成功 | 清失败计数；旧槽留到下一次选槽前清理 |
+| 确认成功 | 清失败计数；删掉旧槽 |
 
 **谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——读包里的版本，不比当前槽新、或清单读不出来都当场删掉，否则装它再删。Windows 上没有人按固定名去读：客户端把同一个路径作为 `--file` 交给启动器，由这次安装按 `downloaded` 判据处理——提交成功时 `commit` 删，安装失败时 `run` 删。客户端自己从不删固定路径上的这个文件。
 
