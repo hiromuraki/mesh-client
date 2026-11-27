@@ -75,6 +75,8 @@ fn root_dir() -> Result<PathBuf, String> {
 fn launch_installed(root: &Path) -> Result<i32, String> {
     // 上次安装没走完会留下 bin.old，先回到那一套再启动。
     install::recover(root)?;
+    // 拉起客户端就等于执行 `bin/` 里的代码，先确认它和清单对得上。
+    install::verify_current(root)?;
     let exe = root.join("bin").join(launch::CLIENT_EXE);
     if !exe.is_file() {
         return Err(mesh_text::format(

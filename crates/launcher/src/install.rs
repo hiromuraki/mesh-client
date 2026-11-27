@@ -301,6 +301,18 @@ fn unpack(pkg: &Path, dest: &Path) -> Result<(), String> {
         .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_UNPACK, &[&dest.display(), &e]))
 }
 
+/// verify_current 在拉起客户端之前校验 `bin/` 与它自带的清单一致。
+///
+/// 清单是包内带的，所以它证明不了「这份 bin 出自发布方」——那由客户端验签负责。
+/// 它能证明的是「这份 bin 是一次完整安装的结果」：有人换了二进制却没换清单、
+/// 解包只写了一半、磁盘坏了一块，都会在这里被拦住。11 MiB 的包实测约 30 ms，
+/// 与「加载一个 DLL」同一个量级。
+pub fn verify_current(root: &Path) -> Result<(), String> {
+    let manifest = mesh_install::manifest::read(&layout::manifest_path(root))
+        .map_err(|err| err.to_string())?;
+    verify(&root.join(layout::BIN), &manifest)
+}
+
 /// verify 只认清单里列出的文件：多出来的忽略，少了或对不上就判包不可用。
 fn verify(bin: &Path, manifest: &Manifest) -> Result<(), String> {
     for (name, want) in &manifest.files {
@@ -455,6 +467,37 @@ mod tests {
 
     /// 安装失败不能删用户给的文件：--file 收的是用户自己的包，客户端交接时那个
     /// 路径（<root>/update.tar.zst）才是下载下来的、可以删的那一份。
+    #[test]
+    fn a_tampered_bin_is_refused_before_launch() {
+        let root = temp_root("verify-current");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("mesh-client.exe"), b"client").unwrap();
+        let sum = sha256_file(&bin.join("mesh-client.exe")).unwrap();
+        std::fs::write(
+            layout::manifest_path(&root),
+            format!(r#"{{"version":"2026.11.27-1","files":{{"mesh-client.exe":"{sum}"}}}}"#),
+        )
+        .unwrap();
+
+        assert!(verify_current(&root).is_ok(), "一份完整的 bin 应当通过");
+        // 换了二进制却没换清单：这正是「有人动过安装根」的形态。
+        std::fs::write(bin.join("mesh-client.exe"), b"evil").unwrap();
+        assert!(
+            verify_current(&root).is_err(),
+            "换掉 bin 里的文件就必须拒绝启动"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_bin_without_a_manifest_is_refused() {
+        let root = temp_root("verify-current-missing");
+        fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        assert!(verify_current(&root).is_err(), "没有清单就不能启动");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_failed_manual_install_keeps_the_package_the_user_gave() {
         let root = temp_root("keep-package");

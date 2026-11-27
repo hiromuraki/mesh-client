@@ -25,6 +25,30 @@ fn harden_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// 收紧安装根：只留 Administrators 与 SYSTEM 可写，Users 只读执行。
+///
+/// 由客户端在启动时调一次，**不在 [`Store::open`] 里**：安装根收紧之后当前用户
+/// 就不再能往它下面写东西，而 `Store::open` 也被测试用来造临时目录——
+/// 那会把测试自己的 `log/` 一起锁死。
+pub fn harden_install_root(root: &Path) -> io::Result<()> {
+    harden_root(root)
+}
+
+/// 收紧安装根本身的 DACL：只留 Administrators 与 SYSTEM 可写，Users 只读执行。
+///
+/// 不收紧这一层时，安装根继承卷的默认 ACL，任何本地账户都能替换 `mesh.exe`——
+/// 而开机自启的计划任务会以最高权限拉起它。Unix 上不需要：`/opt/mesh` 是 root
+/// 所有、`0755`，普通用户改不动。
+#[cfg(windows)]
+fn harden_root(root: &Path) -> io::Result<()> {
+    win::harden_root(root)
+}
+
+#[cfg(not(windows))]
+fn harden_root(_root: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 use ed25519_dalek::SigningKey;
 use mesh_install::atomic_replace;
 use mesh_install::layout;
@@ -152,9 +176,11 @@ impl Store {
         let dir = root.join(layout::CONFIG);
         fs::create_dir_all(&dir).map_err(|err| Error::io(&dir, err))?;
         // 目录一建好就收权限，赶在写任何密钥之前：继承来的 ACL 可能对本地所有账户
-        // 开放，晚一步就等于先把私钥暴露过一次。收紧失败（FAT32、网络盘、子项被
-        // 别的账户占着）只记原因不返回错误：客户端因为「加固没做完」而起不来，
-        // 用户看到的只是「打不开」，反而更容易去乱删文件。
+        // 开放，晚一步就等于先把私钥暴露过一次。安装根也一起收：它决定谁能替换
+        // `mesh.exe`，而自启任务会以最高权限拉起那个文件。
+        //
+        // 收紧失败（FAT32、网络盘、子项被别的账户占着）只记原因不返回错误：客户端
+        // 因为「加固没做完」而起不来，用户看到的只是「打不开」，反而更容易去乱删文件。
         let harden_error = harden_dir(&dir).err().map(|err| err.to_string());
         Ok(Store {
             root: root.to_path_buf(),

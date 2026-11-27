@@ -24,6 +24,9 @@ pub fn run(root: &Path) -> Result<i32, String> {
     loop {
         // 有待装的包就装（update.tar.zst 存在就是信号）。
         apply_pending(root);
+        // 拉开客户端之前确认 `bin/` 与清单一致：启动器是这台机器上以 root 身份、
+        // 在客户端之前运行的唯一东西，它不查就没有人查了。
+        install::verify_current(root)?;
 
         let version = install::installed_version(&bin).ok_or_else(|| {
             mesh_text::format(

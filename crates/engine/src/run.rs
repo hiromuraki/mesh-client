@@ -206,12 +206,20 @@ pub fn spawn(
         ),
     };
     let log = Arc::new(log);
-    // 收紧 `config/` 权限失败不拦启动，但必须有人说出来：密钥文件可能仍带着
-    // 安装根继承来的宽权限，而用户看不到任何异常。
+    // 安装根只留 Administrators 与 SYSTEM 可写：不收紧时任何本地账户都能替换
+    // `mesh.exe`，而自启任务会以最高权限拉起它。失败不拦启动，但要留痕。
+    if let Err(err) = mesh_state::harden_install_root(&config.root) {
+        log.add(
+            "app",
+            &mesh_text::format(mesh_text::id::ENGINE_LOG_HARDEN_FAILED, &[&err]),
+        );
+    }
+    // 收紧 `config/` 权限失败同样只记一条：密钥文件可能仍带着继承来的宽权限，
+    // 而用户看不到任何异常。
     if let Some(err) = store.harden_error() {
         log.add(
             "app",
-            &mesh_text::format(mesh_text::id::ENGINE_LOG_CONFIG_HARDEN_FAILED, &[&err]),
+            &mesh_text::format(mesh_text::id::ENGINE_LOG_HARDEN_FAILED, &[&err]),
         );
     }
 
