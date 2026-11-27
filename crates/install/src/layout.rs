@@ -51,16 +51,10 @@ pub fn manifest_path(root: &Path) -> PathBuf {
 ///
 /// 读不到、解析不了、版本号不合法都是错误——没有“猜一个默认版本”的余地：
 /// 版本号错一位会让控制面把设备钉在“有更新”上，或者让启动器把降级当成升级。
+/// 版本号形状由清单解析统一把关（`Manifest::validate` 用的就是本模块的
+/// `valid_version`），这里不再重复判断：两处各写一份规则，迟早分叉。
 pub fn read_version(root: &Path) -> Result<String, Error> {
-    let path = manifest_path(root);
-    let manifest = manifest::read(&path)?;
-    if !valid_version(&manifest.version) {
-        return Err(Error::VersionInvalid {
-            path,
-            version: manifest.version,
-        });
-    }
-    Ok(manifest.version)
+    Ok(manifest::read(&manifest_path(root))?.version)
 }
 
 /// 从主程序的路径定位安装根：主程序在 `<root>/bin` 里，根是 `bin` 的上一级。
@@ -111,7 +105,11 @@ mod tests {
         std::fs::create_dir_all(root.join(BIN)).unwrap();
         std::fs::write(
             root.join(BIN).join(MANIFEST),
-            r#"{"version":"2026.11.26-13","slot":"client","platform":"windows/amd64","files":{},"signature":"00"}"#,
+            format!(
+                r#"{{"version":"2026.11.26-13","slot":"client","platform":"windows/amd64","files":{{"mesh-client.exe":"{}"}},"signature":"{}"}}"#,
+                "ab".repeat(32),
+                "cd".repeat(64)
+            ),
         )
         .unwrap();
         assert_eq!(read_version(&root).unwrap(), "2026.11.26-13");
@@ -131,14 +129,19 @@ mod tests {
             read_version(&root).unwrap_err(),
             Error::ManifestRead { .. }
         ));
+        // 版本号不合法由清单解析先拦下：形状规则只有 `valid_version` 一份。
         std::fs::write(
             root.join(BIN).join(MANIFEST),
-            r#"{"version":"bad/version","slot":"client","platform":"windows/amd64","files":{},"signature":"00"}"#,
+            format!(
+                r#"{{"version":"bad/version","slot":"client","platform":"windows/amd64","files":{{"a.exe":"{}"}},"signature":"{}"}}"#,
+                "ab".repeat(32),
+                "cd".repeat(64)
+            ),
         )
         .unwrap();
         assert!(matches!(
             read_version(&root).unwrap_err(),
-            Error::VersionInvalid { .. }
+            Error::ManifestRead { .. }
         ));
         let _ = std::fs::remove_dir_all(&root);
     }

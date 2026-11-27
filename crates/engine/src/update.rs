@@ -13,6 +13,7 @@ use crate::Cmd;
 use mesh_install::{layout, version};
 use mesh_remote as remote;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,6 +73,21 @@ pub(crate) struct UpdateState {
     pub attempts: u32,
     /// 下一次自动重试的时刻；退避由它算，不额外排定时器：心跳就是节拍。
     pub retry_at: Option<Instant>,
+    /// 启动器替换任务正在跑。
+    ///
+    /// 换启动器是进程级动作，暂存文件只有一个：两个任务同时进来，后一个的
+    /// 「先删再下」会把前一个正在写的文件截断，两边都算出对不上的摘要。
+    /// 同一时刻只放一个进去，后来的等下一轮心跳再说。
+    pub launcher_busy: Arc<AtomicBool>,
+}
+
+/// 启动器替换的占坑守卫：线程从任何一条路径退出都把坑放掉，包括提前 return。
+struct LauncherBusy(Arc<AtomicBool>);
+
+impl Drop for LauncherBusy {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// 64 位十六进制的完整 sha256。发布链用「摘要来自控制面、内容来自任意地址」这一对
@@ -524,7 +540,6 @@ impl Engine {
         {
             return;
         }
-        self.launcher_tried = Some(info.sha256.clone());
         let dir = self.config.root.join(UPDATE_DIR);
         if let Err(err) = std::fs::create_dir_all(&dir) {
             self.logf(
@@ -533,6 +548,12 @@ impl Engine {
             );
             return;
         }
+        // 占坑放在最后：上面几条都是「不干」，不该把坑占住。
+        if self.update.launcher_busy.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let busy_guard = LauncherBusy(Arc::clone(&self.update.launcher_busy));
+        self.launcher_tried = Some(info.sha256.clone());
         let api = Arc::clone(api);
         let root = self.config.root.clone();
         let log = Arc::clone(&self.log);
@@ -546,6 +567,7 @@ impl Engine {
         let spawned = thread::Builder::new()
             .name("mesh-launcher-update".to_string())
             .spawn(move || {
+                let _busy = busy_guard;
                 let temp = root.join(UPDATE_DIR).join("launcher.new");
                 let _ = std::fs::remove_file(&temp);
                 if let Err(err) = api.download(&url, &temp, MAX_UPDATE_BYTES, LAUNCHER_TIMEOUT) {

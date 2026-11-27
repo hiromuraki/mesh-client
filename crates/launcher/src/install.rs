@@ -4,6 +4,7 @@ use crate::log;
 use mesh_install::failures::Failures;
 use mesh_install::layout;
 use mesh_install::manifest::Manifest;
+use mesh_install::platform;
 use mesh_install::signing;
 use mesh_install::version;
 use mesh_text::id;
@@ -236,8 +237,12 @@ fn launch_and_check(root: &Path) -> Result<(), String> {
 }
 
 /// reload_current 拉起 bin/ 里现有的版本（不等启动确认）。
+///
+/// 恢复分支里的东西同样是「马上就要执行的代码」，所以和正常入口走同一道检查：
+/// 回滚材料本身就坏了就停下来等人修，而不是照旧拉起。
 #[cfg(windows)]
 fn reload_current(root: &Path) -> Result<(), String> {
+    verify_current(root)?;
     let exe = root.join("bin").join(launch::CLIENT_EXE);
     if !exe.is_file() {
         return Err(mesh_text::format(
@@ -319,7 +324,27 @@ pub fn verify_current_signed_by(root: &Path, public_hex: &str) -> Result<(), Str
     let manifest = mesh_install::manifest::read(&layout::manifest_path(root))
         .map_err(|err| err.to_string())?;
     check_manifest_signature(&manifest, public_hex)?;
+    check_manifest_identity(&manifest)?;
     verify(&root.join(layout::BIN), &manifest)
+}
+
+/// 清单是不是给这台机器准备的。
+///
+/// 签名证明内容出自发布方，不证明它是**这一份**：别的平台、别的槽位的清单同样能
+/// 验签通过。这两项由验签方对着自己的环境判断，清单自己说了不算。
+fn check_manifest_identity(manifest: &Manifest) -> Result<(), String> {
+    if manifest.slot != signing::SLOT_CLIENT || manifest.platform != platform::id() {
+        return Err(mesh_text::format(
+            id::LAUNCHER_ERROR_MANIFEST_IDENTITY,
+            &[
+                &manifest.slot.as_str(),
+                &manifest.platform.as_str(),
+                &signing::SLOT_CLIENT,
+                &platform::id(),
+            ],
+        ));
+    }
+    Ok(())
 }
 
 /// 清单必须由发布私钥签出。
@@ -337,18 +362,48 @@ fn check_manifest_signature(manifest: &Manifest, public_hex: &str) -> Result<(),
     Ok(())
 }
 
-/// verify 只认清单里列出的文件：多出来的忽略，少了或对不上就判包不可用。
+/// verify 要求 `bin/` 与清单是**同一个集合**：少了、多了、对不上都判包不可用。
+///
+/// 只核对清单列出的文件不够：签名授权的是一个文件集合，不是一份白名单。目录里
+/// 多出来的文件同样会被加载（Windows 的 DLL 搜索、Linux 的 `LD_LIBRARY_PATH` 相邻
+/// 目录），所以多一个也是「安装根被人动过」。`version.json` 是唯一例外——它自己
+/// 写不进自己的摘要，靠 `signature` 保护。
 fn verify(bin: &Path, manifest: &Manifest) -> Result<(), String> {
-    for (name, want) in &manifest.files {
-        if name.contains("..") || Path::new(name).is_absolute() {
-            return Err(mesh_text::format(id::LAUNCHER_ERROR_ILLEGAL_PATH, &[&name]));
+    // 主程序与内核必须出现在清单里：一份「格式合法、内容齐全」却不含这两者的
+    // 清单，装上去的结果就是起不来。
+    for required in [platform::client_exe(), platform::core_name()] {
+        if !manifest.files.contains_key(required) {
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_MISSING_FILE,
+                &[&required],
+            ));
         }
+    }
+    for (name, want) in &manifest.files {
         let path = bin.join(name);
         let got = sha256_file(&path)
             .map_err(|_| mesh_text::format(id::LAUNCHER_ERROR_MISSING_FILE, &[&name]))?;
         if !got.eq_ignore_ascii_case(want) {
             return Err(mesh_text::format(
                 id::LAUNCHER_ERROR_FILE_DIGEST_MISMATCH,
+                &[&name],
+            ));
+        }
+    }
+    let entries = fs::read_dir(bin)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_DIR, &[&bin.display(), &e]))?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name == layout::MANIFEST {
+            continue;
+        }
+        let regular = entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false);
+        if !regular || !manifest.files.contains_key(&name) {
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_UNEXPECTED_FILE,
                 &[&name],
             ));
         }
@@ -515,9 +570,10 @@ mod tests {
             .iter()
             .map(|(name, body)| (name.to_string(), sha256_bytes(body)))
             .collect();
+        let manifest_platform = platform::id();
         let message = signing::manifest_string(
             signing::SLOT_CLIENT,
-            "windows/amd64",
+            manifest_platform,
             version,
             &signing::files_digest(&files),
         );
@@ -528,7 +584,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         format!(
-            r#"{{"version":"{version}","slot":"client","platform":"windows/amd64","files":{{{pairs}}},"signature":"{signature}"}}"#
+            r#"{{"version":"{version}","slot":"client","platform":"{manifest_platform}","files":{{{pairs}}},"signature":"{signature}"}}"#
         )
     }
 
@@ -539,11 +595,17 @@ mod tests {
         let root = temp_root("verify-current");
         let bin = root.join(layout::BIN);
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("mesh-client.exe"), b"client").unwrap();
+        let entries: [(&str, &[u8]); 2] = [
+            (platform::client_exe(), b"client"),
+            (platform::core_name(), b"core"),
+        ];
+        for (name, body) in entries {
+            std::fs::write(bin.join(name), body).unwrap();
+        }
         let key = test_key();
         std::fs::write(
             layout::manifest_path(&root),
-            signed_manifest(&key, "2026.11.27-1", &[("mesh-client.exe", b"client")]),
+            signed_manifest(&key, "2026.11.27-1", &entries),
         )
         .unwrap();
         let public = public_hex(&key);
@@ -553,11 +615,58 @@ mod tests {
             "一份完整且签过名的 bin 应当通过"
         );
         // 换了二进制却没换清单：这正是「有人动过安装根」的形态。
-        std::fs::write(bin.join("mesh-client.exe"), b"evil").unwrap();
+        std::fs::write(bin.join(platform::client_exe()), b"evil").unwrap();
         assert!(
             verify_current_signed_by(&root, &public).is_err(),
             "换掉 bin 里的文件就必须拒绝启动"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 清单之外的文件同样要被拒：签名授权的是一个文件集合，不是一份白名单。
+    #[test]
+    fn a_file_outside_the_manifest_is_refused() {
+        let root = temp_root("verify-extra");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        let entries: [(&str, &[u8]); 2] = [
+            (platform::client_exe(), b"client"),
+            (platform::core_name(), b"core"),
+        ];
+        for (name, body) in entries {
+            std::fs::write(bin.join(name), body).unwrap();
+        }
+        let key = test_key();
+        std::fs::write(
+            layout::manifest_path(&root),
+            signed_manifest(&key, "2026.11.27-1", &entries),
+        )
+        .unwrap();
+        let public = public_hex(&key);
+        assert!(verify_current_signed_by(&root, &public).is_ok());
+
+        std::fs::write(bin.join("extra.dll"), b"planted").unwrap();
+        assert!(
+            verify_current_signed_by(&root, &public).is_err(),
+            "清单之外的文件必须被拒绝"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 清单合法但不含内核：装上去也起不来，所以验签阶段就判它不可用。
+    #[test]
+    fn a_manifest_without_the_core_is_refused() {
+        let root = temp_root("verify-no-core");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(platform::client_exe()), b"client").unwrap();
+        let key = test_key();
+        std::fs::write(
+            layout::manifest_path(&root),
+            signed_manifest(&key, "2026.11.27-1", &[(platform::client_exe(), b"client")]),
+        )
+        .unwrap();
+        assert!(verify_current_signed_by(&root, &public_hex(&key)).is_err());
         let _ = fs::remove_dir_all(&root);
     }
 

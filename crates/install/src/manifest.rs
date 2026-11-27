@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::{layout, signing, Error};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,10 +20,50 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    /// 解析清单文本。错误就是 serde 那一句话，前缀由调用方按场景加：
-    /// 启动器读的是包里的临时成员，客户端读的是 `bin/version.json`，两者措辞不同。
+    /// 解析清单文本。前缀由调用方按场景加：启动器读的是包里的临时成员，客户端
+    /// 读的是 `bin/version.json`，两者措辞不同。
     pub fn parse(text: &str) -> Result<Manifest, String> {
-        serde_json::from_str(text).map_err(|err| err.to_string())
+        let manifest: Manifest = serde_json::from_str(text).map_err(|err| err.to_string())?;
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    /// 清单必须落在发布契约的合法域里。
+    ///
+    /// 签名只回答「这些字节是不是发布私钥签的」，不回答「这些内容能不能装」。
+    /// 两件事分开：形状在解析时定死，免得签错的东西一路走到解包才炸；本机是否适用
+    /// （槽位、平台）留给验签方，因为那取决于运行环境而不是清单自己。
+    ///
+    /// 摘要的长度与大小写也必须定死：`FilesDigest` 按「名字 :: 摘要」拼行，
+    /// 长度或大小写不固定就等于同一组文件有几种合法写法，签名覆盖的范围随之模糊。
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(
+            self.slot.as_str(),
+            signing::SLOT_CLIENT | signing::SLOT_LAUNCHER
+        ) {
+            return Err(format!("槽位 {:?} 不在允许范围", self.slot));
+        }
+        if !layout::valid_version(&self.version) {
+            return Err(format!("版本号 {:?} 不合法", self.version));
+        }
+        if !platform_ok(&self.platform) {
+            return Err(format!("平台 {:?} 不是 GOOS/GOARCH 形状", self.platform));
+        }
+        if self.files.is_empty() {
+            return Err("清单没有列任何文件".to_string());
+        }
+        for (name, digest) in &self.files {
+            if !file_name_ok(name) {
+                return Err(format!("文件名 {name:?} 不合法"));
+            }
+            if !hex_ok(digest, 64) {
+                return Err(format!("{name} 的摘要不是 64 位小写十六进制：{digest:?}"));
+            }
+        }
+        if !hex_ok(&self.signature, 128) {
+            return Err(format!("签名不是 128 位小写十六进制：{:?}", self.signature));
+        }
+        Ok(())
     }
 
     /// 清单是否由发布私钥签出。
@@ -60,23 +100,125 @@ pub fn read(path: &Path) -> Result<Manifest, Error> {
     })
 }
 
+/// 平台是 `GOOS/GOARCH`：小写字母数字加一个斜杠。
+fn platform_ok(platform: &str) -> bool {
+    let Some((os, arch)) = platform.split_once('/') else {
+        return false;
+    };
+    let lower_alnum = |s: &str| {
+        s.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    };
+    !os.is_empty()
+        && !arch.is_empty()
+        && platform.len() <= 32
+        && lower_alnum(os)
+        && lower_alnum(arch)
+}
+
+/// 定长小写十六进制。
+fn hex_ok(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
+}
+
+/// 包内文件名：只能是 `bin/` 下的一个普通文件名。
+///
+/// `version.json` 不在 `files` 里——它自己写不进自己的摘要。
+fn file_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name != "."
+        && name != ".."
+        && name != layout::MANIFEST
+        && !name.contains(['/', '\\'])
+        && !name.chars().any(char::is_control)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tests::temp_dir;
 
-    fn complete() -> &'static str {
-        r#"{"version":"2026.11.26-13","slot":"client","platform":"windows/amd64","files":{"mesh-client.exe":"ab","version.json":"cd"},"signature":"00"}"#
+    const DIGEST: &str = "abababababababababababababababababababababababababababababababab";
+    const SIGNATURE: &str = concat!(
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    );
+
+    fn complete() -> String {
+        format!(
+            r#"{{"version":"2026.11.26-13","slot":"client","platform":"windows/amd64","files":{{"mesh-client.exe":"{DIGEST}"}},"signature":"{SIGNATURE}"}}"#
+        )
+    }
+
+    fn with_files(files: &str) -> String {
+        format!(
+            r#"{{"version":"2026.11.26-13","slot":"client","platform":"windows/amd64","files":{{{files}}},"signature":"{SIGNATURE}"}}"#
+        )
     }
 
     #[test]
     fn parses_a_complete_manifest() {
-        let manifest = Manifest::parse(complete()).unwrap();
+        let manifest = Manifest::parse(&complete()).unwrap();
         assert_eq!(manifest.version, "2026.11.26-13");
         assert_eq!(manifest.slot, "client");
         assert_eq!(manifest.platform, "windows/amd64");
-        assert_eq!(manifest.files.len(), 2);
-        assert_eq!(manifest.files["mesh-client.exe"], "ab");
+        assert_eq!(manifest.files.len(), 1);
+        assert_eq!(manifest.files["mesh-client.exe"], DIGEST);
+    }
+
+    /// 契约之外的东西一律在解析时拒绝：签错的东西不该走到解包才发现。
+    #[test]
+    fn a_manifest_outside_the_contract_is_an_error() {
+        for (case, text) in [
+            (
+                "unknown slot",
+                r#"{"version":"2026.11.26-13","slot":"server","platform":"windows/amd64","files":{"a.exe":"abababababababababababababababababababababababababababababababab"},"signature":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#.to_string()),
+            (
+                "empty file set",
+                with_files(""),
+            ),
+            (
+                "short digest",
+                with_files(r#""a.exe":"ab""#),
+            ),
+            (
+                "uppercase digest",
+                with_files(
+                    r#""a.exe":"ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB""#,
+                ),
+            ),
+            (
+                "non-hex digest",
+                with_files(
+                    r#""a.exe":"zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz""#,
+                ),
+            ),
+            (
+                "path separator in name",
+                with_files(r#""sub/a.exe":"abababababababababababababababababababababababababababababababab""#),
+            ),
+            (
+                "parent segment in name",
+                with_files(r#""..":"abababababababababababababababababababababababababababababababab""#),
+            ),
+            (
+                "manifest lists itself",
+                with_files(r#""version.json":"abababababababababababababababababababababababababababababababab""#),
+            ),
+            (
+                "bad platform",
+                r#"{"version":"2026.11.26-13","slot":"client","platform":"Windows","files":{"a.exe":"abababababababababababababababababababababababababababababababab"},"signature":"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd"}"#.to_string(),
+            ),
+        ] {
+            assert!(
+                Manifest::parse(&text).is_err(),
+                "{case} 应当被拒绝：{text}"
+            );
+        }
     }
 
     #[test]
