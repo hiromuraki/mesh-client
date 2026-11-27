@@ -46,8 +46,12 @@ static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 原子替换：写同目录临时文件 → 改名覆盖目标。
 ///
-/// 与 Go 版 `writeFileAtomic` 一样，先写临时文件再 rename：中途掉电只会留下一个
+/// 与 Go 版 `writeFileAtomic` 一样，先写临时文件再 rename：进程被杀只会留下一个
 /// 未命名的临时文件，目标位置永远是“旧的”或“新的”，不会是一半。
+///
+/// 保证的是**进程级**原子：内容只 `flush` 不 `fsync`，改名之后也不同步父目录。
+/// 掉电后状态文件与目录变更的先后可能反过来，所以安装事务的持久性承诺只到
+/// 「进程中断可恢复」（见 `docs/contract/updates.md`「持久性」）。
 /// `perm` 只在 Unix 上生效（Windows 的权限位来自 ACL，跟这个数没有关系）。
 pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()> {
     #[cfg(not(unix))]

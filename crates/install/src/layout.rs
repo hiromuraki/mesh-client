@@ -11,8 +11,11 @@ pub const BIN: &str = "bin";
 /// 上一版本，只在一次安装的窗口里存在。它存在**不**等于“上次安装没走完”：
 /// 那个判据由 `INSTALL_STATE` 表达。
 pub const BIN_OLD: &str = "bin.old";
-/// 一次安装的事务状态（`fresh` / `replaced` / `committed`）。没有这个文件就等于
-/// 没有在途的安装，`bin/` 是已确认能启动的那一份。
+/// 回滚时被丢下的新版本，只在一次回滚的窗口里存在。换回旧版本要先把它挪开，
+/// 不能就地删：改名和删除不是一次操作，中间断掉时旧版本必须还在。
+pub const BIN_STALE: &str = "bin.stale";
+/// 一次安装的事务状态（`fresh` / `replaced` / `installed` / `restoring` /
+/// `committed`）。没有这个文件就等于没有在途的安装，`bin/` 是已确认能启动的那一份。
 pub const INSTALL_STATE: &str = "install.state";
 /// 下载好的更新包。文件本身就是“请安装”的信号。
 pub const UPDATE_FILE: &str = "update.tar.zst";
@@ -20,6 +23,10 @@ pub const UPDATE_FILE: &str = "update.tar.zst";
 pub const FAILURES: &str = ".update-failures.json";
 /// 单实例锁：同一份 `config/` 不能被两个客户端同时用。
 pub const LOCK: &str = "instance.lock";
+/// 安装根的写权：`install.state`、`bin/`、`bin.old/`、待装包同时只能有一个写者。
+/// 与 `LOCK` 是两个问题——那一个问「客户端是不是只有一个」，这一个问「谁在改安装根」。
+/// 启动器在一次事务之内持有它；Linux 的常驻启动器持有到进程结束。
+pub const INSTALL_LOCK: &str = "install.lock";
 /// 版本清单，记在本 crate 里是为了和 `bin/` 相对位置绑在一起。
 pub const MANIFEST: &str = "version.json";
 /// 配置与身份。跨版本共享，`bin/` 整个换掉时它不动。

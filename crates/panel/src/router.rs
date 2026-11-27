@@ -5,7 +5,9 @@
 
 use crate::assets;
 use crate::guard;
-use mesh_engine::{build_nodes, Cmd, LocalNode, NodeRow, SettingsInput, Snapshot, StateCell};
+use mesh_engine::{
+    build_nodes, Cmd, LocalNode, NodeRow, Published, SettingsInput, Snapshot, StateCell,
+};
 use mesh_etrpc::{Peer, Route};
 use mesh_text::id;
 use serde::{Deserialize, Serialize};
@@ -174,12 +176,56 @@ impl ApiRoute {
     }
 }
 
-/// 仪表盘和它最近一次 core 查询结果。
+/// 本代 core 的实例标识：面板的查询缓存按它绑定，core 换代（重启、换网络）即失效。
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Instance {
+    /// 本代 core 的 rpc portal 地址，每代重选一个回环端口。
+    addr: SocketAddr,
+    /// 引擎分配的代次；同一个端口被下一代 core 复用时靠它区分。
+    gen: u64,
+}
+
+impl Instance {
+    /// 本代 core 的实例；`None` 表示 core 没在跑，没有可查的实例。
+    fn of(published: &Published) -> Option<Instance> {
+        published.rpc.map(|addr| Instance {
+            addr,
+            gen: published.core_gen,
+        })
+    }
+}
+
+/// 仪表盘最近一次成功的 core 查询，连同它属于哪个实例、什么时候查的。
 #[derive(Default)]
 struct Cache {
-    at: Option<Instant>,
-    peers: Vec<Peer>,
-    routes: Vec<Route>,
+    last: Option<(Instance, Instant, Vec<Peer>, Vec<Route>)>,
+}
+
+impl Cache {
+    /// 当前实例在有效期内的结果；实例不同或已经过期都不算命中。
+    fn get(&self, instance: Instance, now: Instant) -> Option<(Vec<Peer>, Vec<Route>)> {
+        let (cached, at, peers, routes) = self.last.as_ref()?;
+        if *cached != instance || now.duration_since(*at) >= CACHE_TTL {
+            return None;
+        }
+        Some((peers.clone(), routes.clone()))
+    }
+
+    /// 记一次查询结果。只接受仍属当前实例的（`current`）：查询期间 core 换了代，
+    /// 这份数据属于已经失效的实例，既不写回也不覆盖新缓存。
+    fn record(
+        &mut self,
+        queried: Instance,
+        current: Option<Instance>,
+        now: Instant,
+        peers: Vec<Peer>,
+        routes: Vec<Route>,
+    ) {
+        if current != Some(queried) {
+            return;
+        }
+        self.last = Some((queried, now, peers, routes));
+    }
 }
 
 pub(crate) struct Router {
@@ -189,6 +235,7 @@ pub(crate) struct Router {
     tx: Mutex<Sender<Cmd>>,
     logs: PathBuf,
     quit: Arc<dyn Fn() + Send + Sync>,
+    /// 仪表盘查询缓存：只对发起查询的那一代 core 有效。
     cache: Mutex<Cache>,
 }
 
@@ -248,54 +295,65 @@ impl Router {
         Response::json(&published.snapshot)
     }
 
-    /// 数据页内容：快照 + 节点表。core 没在跑（rpc 是 None）时节点表是空数组，
-    /// 与 Go 的 Dashboard 在 core 未运行时直接返回一致。
+    /// 数据页内容：快照 + 节点表。
+    ///
+    /// 节点表的形状要分清三种事实：core 没在跑 → `[]`（没有拓扑可问，与 Go 的
+    /// Dashboard 在 core 未运行时直接返回一致）；查询失败 → `null`（拓扑未知，
+    /// 不能当成空表）；查到了 → 行数组（真实为空时只剩本机那一行）。
     fn dashboard(&self) -> Response {
         let published = self.cell.get();
         let snapshot = &published.snapshot;
-        let mut nodes: Vec<NodeRow> = Vec::new();
-        if let Some(addr) = published.rpc {
-            let (peers, routes) = self.query_core(addr);
-            nodes = build_nodes(
-                &peers,
-                &routes,
-                LocalNode {
-                    ip: strip_cidr(&snapshot.local_ip).to_string(),
-                    hostname: snapshot.hostname.clone(),
-                    version: snapshot.core_version.clone(),
-                    nat: snapshot.nat_type_udp.clone(),
-                },
-            );
-        }
+        let nodes = match Instance::of(&published) {
+            Some(instance) => self.query_core(instance).map(|(peers, routes)| {
+                build_nodes(
+                    &peers,
+                    &routes,
+                    LocalNode {
+                        ip: strip_cidr(&snapshot.local_ip).to_string(),
+                        hostname: snapshot.hostname.clone(),
+                        version: snapshot.core_version.clone(),
+                        nat: snapshot.nat_type_udp.clone(),
+                    },
+                )
+            }),
+            None => Some(Vec::new()),
+        };
         Response::json(&Dashboard {
             snapshot,
-            nodes: &nodes,
+            nodes: nodes.as_deref(),
         })
     }
 
-    /// 查对等节点与路由表，结果缓存 2 秒（Go 的 queryCore）。两次查询各开一个
-    /// 连接、并行跑，总耗时取最慢的那个。
-    fn query_core(&self, addr: SocketAddr) -> (Vec<Peer>, Vec<Route>) {
+    /// 查对等节点与路由表，结果按 core 实例缓存 2 秒（Go 的 queryCore）。两次查询各开
+    /// 一个连接、并行跑，总耗时取最慢的那个。
+    ///
+    /// `None` 表示这一代 core 问不出来：查询失败与「拓扑确实是空的」是两件事。
+    fn query_core(&self, instance: Instance) -> Option<(Vec<Peer>, Vec<Route>)> {
         if let Ok(cache) = self.cache.lock() {
-            if let Some(at) = cache.at {
-                if at.elapsed() < CACHE_TTL {
-                    return (cache.peers.clone(), cache.routes.clone());
-                }
+            if let Some(hit) = cache.get(instance, Instant::now()) {
+                return Some(hit);
             }
         }
+        let addr = instance.addr;
         let (peers, routes) = std::thread::scope(|scope| {
             let peers = scope.spawn(move || mesh_etrpc::list_peer(addr, QUERY_TIMEOUT));
             let routes = scope.spawn(move || mesh_etrpc::list_route(addr, QUERY_TIMEOUT));
-            let peers = peers.join().ok().and_then(Result::ok).unwrap_or_default();
-            let routes = routes.join().ok().and_then(Result::ok).unwrap_or_default();
-            (peers, routes)
-        });
+            let peers = peers.join().ok().and_then(Result::ok);
+            let routes = routes.join().ok().and_then(Result::ok);
+            // 两半必须属于同一次拓扑：只拿到一半拼出来的节点表是错的。
+            Some((peers?, routes?))
+        })?;
         if let Ok(mut cache) = self.cache.lock() {
-            cache.at = Some(Instant::now());
-            cache.peers = peers.clone();
-            cache.routes = routes.clone();
+            // 查询期间 core 换了代：这份数据属于已经失效的实例，不写回。
+            cache.record(
+                instance,
+                Instance::of(&self.cell.get()),
+                Instant::now(),
+                peers.clone(),
+                routes.clone(),
+            );
         }
-        (peers, routes)
+        Some((peers, routes))
     }
 
     /// 日志页与最近事件：lines 缺省或为空用引擎的默认值；给了就必须是正整数
@@ -414,7 +472,8 @@ impl Router {
 #[derive(Serialize)]
 struct Dashboard<'a> {
     snapshot: &'a Snapshot,
-    nodes: &'a [NodeRow],
+    /// `null` 表示 core 在跑但查不到拓扑（未知）；`[]` 表示没有节点可显示。
+    nodes: Option<&'a [NodeRow]>,
 }
 
 #[derive(Deserialize, Default)]
@@ -450,5 +509,68 @@ fn strip_cidr(ip: &str) -> &str {
     match ip.find('/') {
         Some(index) => &ip[..index],
         None => ip,
+    }
+}
+
+/// 查询缓存的判据只在这里测：`Cache` 是 router 的私有类型，`tests.rs` 里的路由
+/// 测试拿不到它，而这一层是「首屏属于当前 core」的唯一决策点。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn instance(port: u16, gen: u64) -> Instance {
+        Instance {
+            addr: SocketAddr::from(([127, 0, 0, 1], port)),
+            gen,
+        }
+    }
+
+    #[test]
+    fn a_cached_topology_belongs_to_one_core_instance() {
+        let first = instance(11001, 1);
+        let now = Instant::now();
+        let mut cache = Cache::default();
+        cache.record(first, Some(first), now, Vec::new(), Vec::new());
+        assert!(cache.get(first, now).is_some());
+
+        // 换了一代 core：新实例先拿到的是「还不知道」，不是上一代的拓扑。
+        let second = instance(11002, 2);
+        assert!(cache.get(second, now).is_none());
+        // 同一个回环端口被下一代 core 复用：按代次区分。
+        assert!(cache.get(instance(11001, 2), now).is_none());
+
+        // 再换一代：两代之前的拓扑同样不能回流到当前首屏。
+        cache.record(second, Some(second), now, Vec::new(), Vec::new());
+        let third = instance(11003, 3);
+        assert!(cache.get(third, now).is_none(), "首屏只能属于当前实例");
+        assert!(cache.get(first, now).is_none());
+        assert!(cache.get(second, now).is_some());
+    }
+
+    #[test]
+    fn a_late_result_from_a_dead_instance_never_overwrites_the_cache() {
+        let old = instance(11001, 1);
+        let new = instance(11002, 2);
+        let now = Instant::now();
+        let mut cache = Cache::default();
+        cache.record(new, Some(new), now, Vec::new(), Vec::new());
+        // 旧实例的查询在新实例之后才完成：不写回，新缓存保持可用。
+        cache.record(old, Some(new), now, Vec::new(), Vec::new());
+        assert!(
+            cache.get(new, now).is_some(),
+            "新实例的缓存不能被旧结果覆盖"
+        );
+        assert!(cache.get(old, now).is_none());
+    }
+
+    #[test]
+    fn a_result_older_than_the_ttl_is_not_served() {
+        let one = instance(11001, 1);
+        let at = Instant::now();
+        let mut cache = Cache::default();
+        cache.record(one, Some(one), at, Vec::new(), Vec::new());
+        let almost = at + CACHE_TTL - Duration::from_millis(1);
+        assert!(cache.get(one, almost).is_some());
+        assert!(cache.get(one, at + CACHE_TTL).is_none());
     }
 }

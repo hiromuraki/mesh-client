@@ -28,6 +28,11 @@ impl Engine {
     }
 
     /// 处理设置页提交：有 token 则注册，否则保存配置并重启连接。
+    ///
+    /// 注册分两半：**服务端接受**（token 就此用掉）与**本地激活**。只有前一半
+    /// 能退回设置页重填 token；后一半的每一步失败都只记下来，身份已经在盘上，
+    /// 连接循环按同一份身份继续重试——再要一次 token 只会让用户拿着已经作废的
+    /// 令牌重来（F10）。
     pub(crate) fn save_settings(&mut self, input: SettingsInput) -> Result<(), String> {
         let server_url = normalize_server_url(&input.server_url)?;
         // 留空表示用本机主机名，不把当前主机名固化进配置。
@@ -42,10 +47,6 @@ impl Engine {
             hostname,
             created_at: 0,
         };
-        let previous_device_id = current
-            .as_ref()
-            .map(|current| current.device_id.clone())
-            .unwrap_or_default();
         if let Some(current) = current.as_ref() {
             config.device_id = current.device_id.clone();
             config.created_at = current.created_at;
@@ -65,30 +66,12 @@ impl Engine {
                 config.device_id = reply.device_id;
             }
             config.created_at = clock::unix_now();
-            // 注册成功即已消耗 token：身份必须立刻落盘。后面停 core / 写配置失败只
-            // 影响“生效”，不能让用户拿着一个已经作废的 token 重来。
+            // 注册成功即已消耗 token：身份必须立刻落盘。从这里往下都是本地激活，
+            // 失败只影响「这一代什么时候生效」，不能再要求一张新的令牌。
             self.store.save_client(&config).map_err(|err| {
                 mesh_text::format(mesh_text::id::ENGINE_TEXT_SAVE_REGISTER_FAILED, &[&err])
             })?;
-            // 设备身份变了（管理端新建了槽位、或这台机器改绑另一台设备）：上一台设备
-            // 的凭据还留在磁盘上，core 会先带着它启动，而控制面要等冷却才会签发新的。
-            // 丢掉旧的那份，下一轮心跳就按「没有凭据」重签。
-            if previous_device_id != config.device_id {
-                self.store.remove_credential().map_err(|err| {
-                    mesh_text::format(
-                        mesh_text::id::ENGINE_TEXT_REMOVE_OLD_CREDENTIAL_FAILED,
-                        &[&err],
-                    )
-                })?;
-            }
-            self.stop_core()?;
-            self.store.write_config(&reply.config_toml).map_err(|err| {
-                mesh_text::format(mesh_text::id::ENGINE_TEXT_WRITE_CONFIG_FAILED, &[&err])
-            })?;
-            self.refresh_identity();
-            self.client = Some(config.clone());
-            self.local_ip.clear();
-            self.set_status(Status::Connecting, String::new());
+            self.activate(&config, current.as_ref());
             self.logf(
                 "app",
                 &mesh_text::format(mesh_text::id::ENGINE_LOG_REGISTERED, &[&config.device_id]),
@@ -101,17 +84,71 @@ impl Engine {
                 mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED_TOKEN).to_string(),
             );
         }
-        self.stop_core()?;
         self.store
             .save_client(&config)
             .map_err(|err| err.to_string())?;
-        self.client = Some(config);
-        self.set_status(Status::Connecting, String::new());
+        self.activate(&config, current.as_ref());
         self.logf(
             "app",
             mesh_text::get(mesh_text::id::ENGINE_LOG_SETTINGS_SAVED),
         );
         Ok(())
+    }
+
+    /// 把这一代身份的本地部分交给连接循环，剩下的由它完成。
+    ///
+    /// 身份换代次（控制面地址或设备 id 变了）时先作废旧代次的凭据与配置：凭据属于
+    /// 某个控制面上的某台设备，配置属于那个控制面上的某个网络，留着只会让 core
+    /// 带着上一代的东西启动。删掉之后「已注册、待激活」是一个确定的状态：身份在
+    /// 盘上，配置等下一次心跳交下来——不依赖内存标记，退出再启动也一样。
+    ///
+    /// 配置本身**不在这里写**：写 `config.toml` 与换 core 是同一次转换，只由
+    /// `apply_locked` 一处完成。这里另写一份，core 会拿着旧文件继续跑（摘要没变
+    /// 就没人会再去重启它）。
+    fn activate(&mut self, config: &ClientConfig, previous: Option<&ClientConfig>) {
+        if generation_changed(previous, config) {
+            // 更新 offer 属于某个控制面的发布记录：换代次就作废，别拿上一代的
+            // 授权去给这一代装包。
+            self.clear_stale_update();
+            // 删旧凭据与旧配置都只记日志：身份已经落盘，连接循环会用「没有凭据」
+            // 重签、用对不上的摘要把配置要回来；为一次删除把注册卡死在这里，
+            // 反而把用户推回「令牌已经用掉」的死路。
+            if let Err(err) = self.store.remove_credential() {
+                self.logf(
+                    "app",
+                    &mesh_text::format(
+                        mesh_text::id::ENGINE_TEXT_REMOVE_OLD_CREDENTIAL_FAILED,
+                        &[&err],
+                    ),
+                );
+            }
+            if let Err(err) = self.store.remove_config() {
+                self.logf(
+                    "app",
+                    &mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err]),
+                );
+            }
+        }
+        // 设备名是 core 的启动参数，不会热更新：换了就得换一个进程，否则运行中的
+        // 那一代还在用旧名字。停不掉只记日志——下一轮连接循环会遇到同一个问题，
+        // 那时再停一次比在这里把注册结果判成失败有用。
+        let renamed = self
+            .client
+            .as_ref()
+            .map(|current| self.effective_hostname(current) != self.effective_hostname(config))
+            .unwrap_or(false);
+        if renamed && self.core.is_some() {
+            if let Err(err) = self.stop_core() {
+                self.logf(
+                    "app",
+                    &mesh_text::format(mesh_text::id::ENGINE_LOG_STOP_CORE_FAILED, &[&err]),
+                );
+            }
+        }
+        self.refresh_identity();
+        self.client = Some(config.clone());
+        self.local_ip.clear();
+        self.set_status(Status::Connecting, String::new());
     }
 
     /// 断开并清空本地身份与下发的配置，保留服务端地址、设备名等用户输入。
@@ -136,6 +173,22 @@ impl Engine {
             mesh_text::get(mesh_text::id::ENGINE_LOG_LOCAL_CONFIG_DELETED),
         );
         Ok(())
+    }
+}
+
+/// 换代次：控制面地址或设备 id 变了。
+///
+/// 凭据与配置都属于一个代次，换一处就必须把另一处也作废——只比设备 id 不够：
+/// id 是客户端生成的，同一台机器在两个控制面上可以是同一个 id，而那张凭据与
+/// 那个网络毫无关系。
+fn generation_changed(previous: Option<&ClientConfig>, next: &ClientConfig) -> bool {
+    match previous {
+        Some(previous) => {
+            previous.device_id != next.device_id || previous.server_url != next.server_url
+        }
+        // 首次注册没有上一代可作废：磁盘上若还有别的残留，那是人工留下的，
+        // 归「删除本地配置」处理，不在这里顺手删。
+        None => false,
     }
 }
 

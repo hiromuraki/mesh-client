@@ -57,6 +57,7 @@ install.error.manifest_read = Failed to read or parse {0}: {1}
 install.error.no_parent_dir = Path has no parent directory
 install.error.temp_name_collision = Temporary file names kept colliding
 install.error.unsupported_platform = Unsupported target platform: the platform id must match a GOOS/GOARCH slot in the release package
+launcher.error.install_root_busy = The install root is in use by another launcher
 remote.error.api = {0} (HTTP {1})
 remote.error.body_too_large = Response exceeds the {0}-byte limit
 remote.error.config_decode = Failed to decode the configuration: {0}

@@ -37,6 +37,43 @@ const CLOCK_SKEW_LIMIT_SECONDS: i64 = 300;
 /// 连续 401 的次数上限：单次可能只是时钟抖动或 nonce 撞车。
 const AUTH_FAIL_LIMIT: u32 = 3;
 
+/// 本机凭据的实际状态。
+///
+/// 「磁盘上有私钥」不等于「core 已经加载并确认它」：控制面把上报的 id 当作
+/// 「设备正在用这张」的证据，确认之后才撤销旧的。把两者混成一个回退判断，
+/// 一次写盘就等于宣称 core 已经跑在新凭据上，旧凭据会被提前撤销（F8）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CredentialState {
+    /// 正式节点：用 `config/secure.key`，不参与凭据签发。
+    Formal,
+    /// 本地没有凭据。
+    Missing,
+    /// 磁盘上有，但这一代 core 还没确认加载它（没起来、起不来或正在重启）。
+    Held(String),
+    /// core 已确认用这张凭据启动。
+    Loaded(String),
+}
+
+impl CredentialState {
+    /// 上报给控制面的 id。
+    ///
+    /// 只有 core 确认加载过的那张才算「设备在用」。持有但未确认时上报空串：
+    /// 控制面对空串既不确认也不签发，正好是这一刻该做的事——既不能因为一份刚
+    /// 写盘的私钥就去撤销 core 还在用的旧凭据，也不该在设备已经拿到凭据时再签一张。
+    /// 正式节点同样报空串：它用 `network_secret` 认证，报 `none` 只会让服务端每轮
+    /// 签一张用不上的。
+    ///
+    /// 空串因此同时覆盖「正式节点」与「持有但未确认」，服务端的行为相同；要让它
+    /// 们各自可辨（比如给未确认的凭据补签），需要协议里另有一个字段（见修复报告）。
+    fn reported_id(&self) -> String {
+        match self {
+            CredentialState::Formal | CredentialState::Held(_) => String::new(),
+            CredentialState::Missing => NO_CREDENTIAL_ID.to_string(),
+            CredentialState::Loaded(id) => id.clone(),
+        }
+    }
+}
+
 impl Engine {
     /// 读 `client.json`。
     pub(crate) fn load_client(&self) -> Loaded {
@@ -354,43 +391,51 @@ impl Engine {
         self.identity = next;
     }
 
-    /// 上报给控制面的凭据 id。
+    /// 本机凭据状态：磁盘事实与 core 事实各取一次，不缓存。
     ///
-    /// 正式节点报空串：它用 `network_secret` 认证，本来就不该持有凭据，报 `none` 只会
-    /// 让服务端每轮签一张用不上的。core 在跑时只报它加载的那一张：先报磁盘上新写的
-    /// 那张，控制面会认为设备已经换好了，立刻吊销 core 正在用的旧凭据（F1）。
-    pub(crate) fn credential_id(&self) -> String {
+    /// 两个事实不能互相顶替：磁盘上有私钥只说明「拿到了」，core 起来之后加载它
+    /// 才说明「用上了」。控制面把上报的 id 当作后者（确认切换、撤销旧凭据），
+    /// 所以这两种状态必须分开表达（F8）。
+    pub(crate) fn credential_state(&self) -> CredentialState {
         if self.hints.formal() {
-            return String::new();
+            return CredentialState::Formal;
         }
-        // `core_cred_id` 只在 core 启动成功后写入、停止时清空，它本身就是“core 正在用
-        // 哪一张”的唯一事实来源。
+        // core 实际加载的那张是唯一的「已确认」来源：它是启动时按配置取的，
+        // 收到 `Started` 之后才代表 core 真的带着它跑起来了。
         if let Some(core) = self.core.as_ref().filter(|core| core.started) {
             if !core.cred_id.is_empty() {
-                return core.cred_id.clone();
+                return CredentialState::Loaded(core.cred_id.clone());
             }
         }
-        match self.store.load_credential() {
-            Ok(Some(credential)) => credential.id,
-            _ => NO_CREDENTIAL_ID.to_string(),
+        match self.disk_credential_id() {
+            Some(id) => CredentialState::Held(id),
+            None => CredentialState::Missing,
         }
     }
 
-    /// 磁盘上的凭据是否已经不是 core 正在用的那张：换身份只能换进程。
-    pub(crate) fn credential_stale(&self) -> bool {
-        if self.hints.formal() {
-            return false;
-        }
-        let used = match self.core.as_ref().filter(|core| core.started) {
-            Some(core) => core.cred_id.clone(),
-            None => return false,
-        };
-        if used.is_empty() {
-            return false;
-        }
+    /// 磁盘上那张凭据的 id；没有或读不出来都是 None。
+    fn disk_credential_id(&self) -> Option<String> {
         match self.store.load_credential() {
-            Ok(Some(credential)) => credential.id != used,
-            _ => false,
+            Ok(Some(credential)) => Some(credential.id),
+            _ => None,
+        }
+    }
+
+    /// 上报给控制面的凭据 id（见 [`CredentialState::reported_id`]）。
+    pub(crate) fn credential_id(&self) -> String {
+        self.credential_state().reported_id()
+    }
+
+    /// 磁盘上的凭据是否已经不是 core 正在用的那张：换身份只能换进程。
+    ///
+    /// 持有但未确认（core 没起来）不算过期：那种情况本来就要启动 core，
+    /// 它会直接读磁盘上那张。
+    pub(crate) fn credential_stale(&self) -> bool {
+        match self.credential_state() {
+            CredentialState::Formal | CredentialState::Missing | CredentialState::Held(_) => false,
+            CredentialState::Loaded(id) => {
+                self.disk_credential_id().as_deref() != Some(id.as_str())
+            }
         }
     }
 

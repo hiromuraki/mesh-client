@@ -55,6 +55,7 @@ install.error.manifest_read = {0} 读取或解析失败：{1}
 install.error.no_parent_dir = 路径没有父目录
 install.error.temp_name_collision = 临时文件名一直撞车
 install.error.unsupported_platform = 未支持的目标平台：平台标识必须与发布包的 GOOS/GOARCH 槽位一致
+launcher.error.install_root_busy = 安装根正被另一个启动器使用
 remote.error.api = {0}（HTTP {1}）
 remote.error.body_too_large = 响应超过 {0} 字节上限
 remote.error.config_decode = 配置解码失败：{0}

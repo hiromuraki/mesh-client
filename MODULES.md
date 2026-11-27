@@ -1,18 +1,17 @@
 # 模块划分（cargo workspace）
 
-十个成员：八个库 crate、两个二进制。整个 workspace 就是 `client/`；启动器原来是一个独立仓库
-（`client-launcher`），已经并进 `crates/launcher`。
+十个成员：八个库 crate、两个二进制，整个 workspace 就是 `client/`。
 
 ## 1. 形状与依赖图
 
 ```
 client/
   Cargo.toml            # [workspace] + [workspace.dependencies]
-  .cargo/config.toml    # musl 目标用 musl-gcc（从原来的启动器仓库搬来）
+  .cargo/config.toml    # musl 目标用 musl-gcc
   frontend/             # pnpm + Vue 3 的面板前端，dist 在编译期嵌进 panel
   crates/
     text/               # mesh-text      语言清单、get/format、id 常量（唯一零依赖地板）
-    install/            # mesh-install   安装根形状、版本、失败计数、单实例锁、平台名
+    install/            # mesh-install   安装根形状、版本、失败计数、清单与签名、两个锁、平台名
     state/              # mesh-state     config/ 下的身份与配置（含 config.toml 提示字段）
     remote/             # mesh-remote    设备面 HTTP + 签名
     etrpc/              # mesh-etrpc     core rpc portal：帧 + 手写 protobuf + 三个查询
@@ -20,7 +19,7 @@ client/
     engine/             # mesh-engine    状态机（唯一可变状态的拥有者）
     panel/              # mesh-panel     本地面板 HTTP + 嵌入前端
     client/             # mesh-client    bin mesh-client(.exe)：进程形态、托盘、headless
-    launcher/           # mesh-launcher  bin mesh(.exe)：安装、回滚、监督（搬自 client-launcher）
+    launcher/           # mesh-launcher  bin mesh(.exe)：安装事务、回滚、常驻监督
 ```
 
 ```mermaid
@@ -81,24 +80,34 @@ pub mod id { pub const STATE_ERROR_IO: &str = "state.error.io"; /* …… */ }
 
 ### 3.1 `mesh-install`
 
-**职责**：安装根目录的磁盘事实。两个二进制都要用，且现在 Go 侧与 Rust 启动器各有一份实现（`version.go`/`version.rs`、`failures`、`version.json` 解析、路径常量），这里合并成一份。
+**职责**：安装根目录的磁盘事实。两个二进制都要用：布局与路径常量、版本号比较、失败计数、清单解析与签名、两个锁，各自只有这一份实现。
 
 **对外 API**：
 
 ```rust
 pub mod layout {
-    pub const BIN: &str = "bin";            // 其余：BIN_OLD、UPDATE_FILE、FAILURES、LOCK、MANIFEST
+    pub const BIN: &str = "bin";            // 其余：BIN_OLD、BIN_STALE、UPDATE_FILE、INSTALL_STATE、
+                                            //       FAILURES、LOCK、INSTALL_LOCK、LAUNCHER_VERSION、MANIFEST
     pub fn find_root(exe: &Path) -> PathBuf;              // 主程序在 <root>/bin 里，根是上一级
     pub fn read_version(root: &Path) -> Result<String, Error>;  // 唯一来源 bin/version.json
-    pub fn valid_version(v: &str) -> bool;                // 当文件名用的字符集 + 64 上限
+    pub fn write_launcher_version(root: &Path, v: &str) -> io::Result<()>;  // launcher.json
+    pub fn read_launcher_version(root: &Path) -> Option<String>;            // 缺失或坏掉都是 None
 }
-pub mod version { pub fn compare(a: &str, b: &str) -> Ordering; pub fn is_newer(c: &str, cur: &str) -> bool; }
+pub mod version { pub fn parse(text: &str) -> Option<Version>; pub fn valid(text: &str) -> bool;  // YYYY.MM.DD-N
+                 pub fn compare(a: &str, b: &str) -> Ordering; pub fn is_newer(candidate: &str, current: &str) -> bool; }
 pub mod failures { pub struct Failures; /* load/record/clear/count/exhausted，留下最新 5 个版本 */ }
-pub mod lock { pub struct Lock; pub fn acquire(path: &Path) -> Result<Lock, Error>; }  // Error::AlreadyRunning
+pub mod lock {
+    pub struct Lock;                                          // 进程退出即释放（LockFileEx / flock）
+    pub fn acquire(path: &Path) -> Result<Lock, Error>;       // 已被占用 → Error::AlreadyRunning
+    pub fn path(root: &Path) -> PathBuf;                      // instance.lock：这份 config 的客户端
+    pub fn owner_path(root: &Path) -> PathBuf;                // install.lock：安装根的写权
+}
 pub mod platform { pub fn client_exe() -> &'static str; pub fn launcher_name() -> &'static str;
                    pub fn core_name() -> &'static str; pub fn id() -> &'static str; } // "windows/amd64"
 pub mod manifest { pub struct Manifest { version, slot, platform, files, signature }
-                   pub fn read(path: &Path) -> Result<Manifest, Error>; }   // 字段缺一即解析失败
+                   pub fn read(path: &Path) -> Result<Manifest, Error>;   // 字段缺一即解析失败
+                   pub fn parse(text: &str) -> Result<Manifest, String>;
+                   pub fn is_plain_file_name(name: &str) -> bool; }       // 清单键与包内条目名同一判据
 pub mod signing {
     pub const RELEASE_PUBLIC_KEY: &str;
     pub fn signing_string(slot, platform, version, sha256) -> String;      // MESH3，签包
@@ -107,12 +116,13 @@ pub mod signing {
     pub fn verify_release(..) -> bool;   pub fn verify_release_with(public_hex, ..) -> bool;
     pub fn verify_manifest(..) -> bool;  pub fn verify_manifest_with(public_hex, ..) -> bool;
 }
-pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()>;
+pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()>;  // 写临时文件再 rename；
+// 只 flush 不 fsync，所以只承诺「进程中断可恢复」（见 ../docs/contract/updates.md「持久性」）
 ```
 
-**拥有的状态**：无内存状态。`Failures` 是 `.update-failures.json` 的读写视图；`Lock` 是 `instance.lock` 的 OS 锁句柄（进程退出即释放）。
+**拥有的状态**：无内存状态。`Failures` 是 `.update-failures.json` 的读写视图；`Lock` 是 OS 锁句柄（进程退出即释放），锁哪个文件由调用方给——客户端用 `Lock::path`（`instance.lock`），启动器与客户端提交安装包用 `Lock::owner_path`（`install.lock`）。
 
-**依赖**：`mesh-text`（文案）；`fs4` 覆盖两个平台的锁（Windows 的 `LockFileEx`、Unix 的 `flock`）；`ed25519-dalek` 与 `sha2`/`hex` 只给 `signing` 用。
+**依赖**：`mesh-text`（文案）；`fs4` 覆盖两个平台的锁（Windows 的 `LockFileEx`、Unix 的 `flock`）；`serde`/`serde_json` 给清单与 `launcher.json`；`ed25519-dalek` 与 `sha2`/`hex` 只给 `signing` 用。
 
 **签名为什么在这里**：启动器要验清单签名，而它不能依赖 `mesh-remote`——那条线会把 `ureq`、`serde`、`rand`、`httpdate` 全拖进一个只需要 verifier 的二进制。签名字符串的形状与 Go 侧 `signing` 包逐字节相同，有一对固定向量单测钉住两端。
 
@@ -260,7 +270,7 @@ pub enum Notice { ActionFailed(String) }  // 用户动作失败 → client 弹�
 
 // 发布给其它线程的只读视图。除快照外还带两样别的线程要用、但不该回问引擎的东西：
 // 心跳线程组请求要的三个参数，以及面板自己查 core 时需要的 rpc 地址。
-pub struct Published { snapshot: Snapshot, beat: BeatInput, rpc: Option<SocketAddr> }
+pub struct Published { snapshot: Snapshot, beat: BeatInput, rpc: Option<SocketAddr>, core_gen: u64 }
 pub struct BeatInput { config_hash: String, credential_id: String, app_version: String,
                         app_update_known: Option<String> }
 pub struct StateCell(RwLock<Arc<Published>>);   // 面板与托盘同步只读它
@@ -271,7 +281,7 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
 
 **拥有的状态**：全部。`status`、`last_error`、`cfg`、`core_running`/`core_pid`/`core_cred_id`、`local_ip`、`stun`、`core_version`、`identity`、`update{phase,version,notes,url,sha256,path,sum,err}`、`auth_fails`、`revive_attempt`/`core_started_at`、`autostart_on`、`launcher_sum`/`launcher_tried`/`auto_tried`。**没有一个被 `Mutex` 保护**，因为只有引擎线程读写；对外只发布只读副本（`Published`）。
 
-`beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定、`app_update_known` 取内存里那份 offer 的摘要（`None` 时整个字段省略）。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。
+`beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定、`app_update_known` 取内存里那份 offer 的摘要（`None` 时整个字段省略）。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。`core_gen` 是引擎给每代 core 分配、只增的代次（`0` 表示还没有 core 进过），与 `rpc` 一起标识「哪个 core 实例」：重启后即使复用同一个回环端口，代次也不同。
 
 **依赖**：`mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`。
 
@@ -287,11 +297,11 @@ pub fn start(cell: Arc<StateCell>, tx: Sender<Cmd>, logs: PathBuf) -> Result<Pan
 pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是关监听
 ```
 
-**拥有的状态**：监听 socket、仪表盘查询缓存（`Mutex<(Instant, Vec<Peer>, Vec<Route>)>`）。除此之外什么都没有——面板不缓存快照，每次从 `StateCell` 取一个 `Arc`。
+**拥有的状态**：监听 socket、仪表盘查询缓存（`Mutex<Cache>`，条目是 `(Instance, Instant, Vec<Peer>, Vec<Route>)`，`Instance` 是 `(rpc 地址, core 代次)`）。除此之外什么都没有——面板不缓存快照，每次从 `StateCell` 取一个 `Arc`。查询结果只在仍属当前实例时写回：查询期间 core 换了代，这份数据既不写回也不覆盖新实例的缓存。
 
 **依赖**：`mesh-engine`（DTO 与纯函数 `build_nodes`/`logs`/`events`）、`mesh-etrpc`（自己发起仪表盘查询）。
 
-**注**：JSON 的形状是前端契约的一部分，逐字段对照 `client/frontend/src/api/types.ts`。`publicIps`/`nodes` 必须是 `[]` 不是 `null`，`count` 为 1 时必须省略（Go 的 `omitempty`）。
+**注**：JSON 的形状是前端契约的一部分，逐字段对照 `client/frontend/src/api/types.ts`。`publicIps` 必须是 `[]` 不是 `null`；`nodes` 是 `[]`（core 未运行）或 `null`（core 在跑但查询失败）或行数组，三态都要出现在类型里。`count` 为 1 时必须省略（Go 的 `omitempty`）。
 
 ### 3.8 `mesh-client`（bin）
 
@@ -305,11 +315,108 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.9 `mesh-launcher`（bin `mesh`）
 
-**职责**：不变。安装（解包、校验清单、`bin.old` 回滚、失败计数）、Windows 上装完拉起新版本、Linux 上常驻监督。
+**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（起 `bin/` 里已确认的那一份），带 `--file`/`--url` 是 `Install`（装一份新包）。改动安装根的动作全部在 `Owner` 之内：安装、恢复、提交、回滚，以及拉起到确认启动。
 
-**改动**：只做三件事——搬进 workspace；`version.rs`/`failures.rs`/`manifest.rs` 换成 `mesh-install`；`install.rs` 里的路径常量换成 `mesh-install::layout`。`args.rs`/`launch.rs`/`supervisor.rs`/`log.rs` 原样保留。
+**对外 API**：
 
-**依赖**：`mesh-install`、`zstd`、`tar`、`sha2`、`serde_json`、`ureq`（Windows）、`windows-sys`。
+```rust
+// args：--root 可覆盖安装根；--file 与 --url 互斥；--sha256/--wait-for/--force 只能配安装
+pub enum Command { Launch, Install { source: Source, sha256: Option<String>,
+                                     wait_for: Option<u32>, force: bool } }
+
+// install.rs：安装根写权与一次事务
+pub(crate) fn own(root: &Path) -> Result<Owner, String>;            // install.lock，非阻塞
+impl Owner {
+    pub(crate) fn recover(&self) -> Result<(), String>;             // 拉起任何东西之前：退回没走完的安装
+    pub(crate) fn abort(&self) -> Result<(), String>;               // 同上，但 installed 也退
+    pub(crate) fn commit(&self) -> Result<(), String>;              // 先写 committed，再清 bin.old/ 与包
+    pub(crate) fn install(&self, pkg: &Path, force: bool) -> Result<(), String>;
+    pub(crate) fn verify_current(&self) -> Result<(), String>;
+    pub(crate) fn boot_and_settle(&self) -> Result<launch::Client, String>;
+}
+pub fn run(root: &Path, source: Source, want_sha: Option<String>,
+           wait_for: Option<u32>, force: bool) -> Result<(), String>;  // 手动安装入口
+
+// launch.rs：客户端子进程句柄
+pub struct Client;
+impl Client {
+    pub fn exited(&mut self) -> Result<Option<i32>, String>;
+    pub fn stop(&mut self) -> Result<(), String>;                   // 返回前确认它已退出
+    #[cfg(unix)] pub fn wait(&mut self) -> Result<i32, String>;
+}
+pub fn start(exe: &Path, root: &Path, boot_check: Option<&str>) -> Result<Client, String>;
+pub fn wait_exit(pid: u32, timeout: Duration) -> Result<(), String>;  // 只给 --wait-for
+
+#[cfg(windows)] pub(crate) fn launch_installed(root: &Path) -> Result<(), String>;
+pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>; }   // Linux 常驻
+```
+
+**一次安装的产物与判据**：
+
+| 产物 | 是什么 | 判据作用 |
+| --- | --- | --- |
+| `install.state` | 一次安装走到哪一步（五种取值见下） | **唯一判据**；文件不在 == 没有在途安装，`bin/` 就是已确认能启动的那一份 |
+| `bin.old/` | 安装前的 `bin/`，确认启动成功前是唯一的回滚材料 | 不是判据：只说明还有一份备份，**不**说明有在途事务 |
+| `bin.stale/` | 回滚时被丢下的新版本，换回旧版本的那一瞬存在 | 不是判据：收尾残骸，`undo` 与 `recover` 每次重试删除 |
+| `update.tar.zst` | 客户端交接的「请安装」信号（`.part` 是下载中） | 不是判据：只由消耗它的安装事务删掉 |
+
+`bin.old/` 当判据会同时被要求回答两件事——「上次安装没走完」与「旧版本还没删掉」。启动确认成功后删备份失败，就会让下一次启动把刚跑起来的新版本当成没装完退回去；状态写进文件之后，提交与清理才是两件可以各自失败的事。
+
+事务状态记在 `<root>/install.state`，对应 `install.rs` 里的 `Tx`：
+
+| 值 | 此刻 `bin/` 是什么 | 下一次 `recover` |
+| --- | --- | --- |
+| 文件不在 | 已确认能启动的那一份 | 不动；只清 `bin.old/`、`bin.stale/` 残留 |
+| `fresh` | 本次新建的，可能只解了一半；安装前没有 `bin/` | 删掉 `bin/`，回到「没装过」 |
+| `replaced` | 本次新建的，可能只解了一半；旧版本在 `bin.old/` | 删掉 `bin/`，把 `bin.old/` 改回来 |
+| `installed` | 完整的新版本，还没确认启动 | 保留：这一轮启动就是那次确认，失败再退 |
+| `restoring` | 正在换回旧版本；旧版本在 `bin.old/` 或已回到 `bin/` | 接着换回；每一步都可重复 |
+| `committed` | 已确认启动的新版本 | 不回滚：清掉 `bin.old/` 与状态文件 |
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Fresh: 安装前没有 bin/，先落状态
+    Idle --> Replaced: 先落状态，再把 bin/ 改名成 bin.old/
+    Fresh --> Installed: 解包、逐文件校验
+    Replaced --> Installed: 同上
+    Fresh --> Idle: 任一步失败，删 bin/
+    Replaced --> Idle: 失败但还没改名（bin.old/ 不在）
+    Replaced --> Restoring: 失败且已有 bin.old/（先记 restoring）
+    Installed --> Committed: 启动确认成功
+    Installed --> Restoring: 确认失败或超时（先停掉新版）
+    Restoring --> Idle: bin/→bin.stale/、bin.old/→bin/、删 bin.stale/
+    Committed --> Idle: 删 bin.old/ 与安装包，清状态
+```
+
+`restoring` 先于目录改动落盘，所以「`bin.old/` 不在了」只可能是换回已经做完，不会被当成首次安装没有备份而去删 `bin/`。
+
+`replaced` 而 `bin.old/` 不在，说明进程死在改名之前：`bin/` 还是原来那一份，`recover` 只清 `bin.stale/` 残骸。
+
+**四个入口、一个出口**：`boot_and_settle` 是 `installed` 唯一的出口——Windows 的安装后与普通启动（`run`、`launch_installed` → `boot_or_restore`）、确认被打断后的下一次启动（`recover` 之后状态仍是 `installed`）、Linux 常驻监督（`supervisor::run`）。Linux 的手动安装只把包装进 `bin/` 就返回，确认留给 systemd 拉起的常驻启动器。
+
+| 结局 | 处理 |
+| --- | --- |
+| 验证不过、进程创建失败 | 记一次失败，`abort`（没有在途安装时是空操作，`bin/` 保持原样） |
+| 确认超时或进程提前退出 | 先 `Client::stop` 并确认退出，再记一次失败、`abort` |
+| `stop` 失败（停不下来） | 不回滚，保留 `installed`，下一次启动接着确认 |
+| 确认成功 | 记 `committed`，删 `bin.old/` 与安装包 |
+
+`installed` 且客户端已经在跑时（上一个启动器在等确认时被打断），Windows 的普通启动直接记 `committed`：再起一个只会撞上单实例锁，回滚一个正在运行的版本更糟。
+
+**谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——读包里的版本，不比当前新、或清单读不出来都当场删掉，否则装它再删。Windows 上没有人按固定名去读：客户端把同一个路径作为 `--file` 交给启动器，由这次事务按 `downloaded` 判据处理——提交成功时 `commit` 删，安装失败时 `run` 删。客户端自己从不删固定路径上的这个文件。
+
+**拥有的状态**：`Owner`（安装根路径 + `install.lock` 的锁句柄；事务状态每次从 `install.state` 现读，不留内存副本）；`launch::Client`（客户端子进程句柄：Windows 是自己 `spawn` 的 `Child` 或 `runas` 交回的 `HANDLE`，Unix 是 `Child`）。除这些之外没有跨调用的内存状态：`Budget` 与命令参数都是值。
+
+**依赖**：`mesh-install`（布局、清单、签名、失败计数、锁、版本比较）、`mesh-text`（文案）、`zstd`、`tar`、`sha2`；Windows 另加 `ureq`（`tls`+`native-certs`，`--url` 下载）与 `windows-sys`（`ShellExecuteExW` 的 runas、`TerminateProcess`、`WaitForSingleObject`）；Unix 的 `--url` 调系统 `curl`。
+
+**注**：
+
+1. Windows 拉起客户端要过 UAC：`CreateProcess` 返回 `ERROR_ELEVATION_REQUIRED(740)` 时改用 `ShellExecuteExW` 的 `runas`，并必须保留 `hProcess`——没有句柄就无从确认新版退没退，确认超时后不能安全换 `bin/`。
+2. Windows 上安装事务失败后要自己把旧版本拉回来（`boot_or_restore` → `start_current`）：启动器装完就退，没有别人替它拉起。Linux 的常驻启动器回到循环开头重走一遍。
+3. `verify_current` 要求 `bin/` 与清单是同一个集合（`version.json` 除外）；装包、普通启动、手动安装后的拉起共用这一个判据。
+4. 预算收在 `Budget::package`：1024 条目、64 KiB 清单、256 MiB 解压后、120 s；`--url` 另加 200 MiB 包与 300 s 下载。条目数与声明字节在读清单时判完（此时 `bin/` 还没动），解包时同一组数字是兜底，触发即回滚。
+5. 每次启动先把自身版本写进 `launcher.json`（编进二进制的 `MESH_LAUNCHER_BUILD_VERSION`；不是合法版本号的开发构建不写，客户端按「没有记录」放行一次）。日志写 `<root>/log/launcher.log` 并同时进 stderr；`Launch` 在 Linux 上把客户端的退出码透传给 systemd。
 
 ## 4. Go ↔ Rust 对应与状态归属
 
@@ -324,7 +431,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 | `mesh-engine` | `internal/engine`（除 core 进程部分）、`internal/logbook`、`internal/autostart`、`internal/buildinfo` 的消费方 | 全部运行状态 |
 | `mesh-panel` | `internal/uits`、`web.go` | 监听 socket、仪表盘缓存 |
 | `mesh-client` | `main.go`、`internal/tray`、`notify/console/opendir` 平台文件 | `Shutdown`、托盘模型 |
-| `mesh-launcher` | `client-launcher/` | 安装流程的局部状态 |
+| `mesh-launcher` | `client-launcher/` | `Owner` 的 `install.lock` 句柄；`launch::Client` 的客户端子进程句柄 |
 
 ## 5. 并发模型
 
@@ -363,7 +470,7 @@ core 线程的主循环用 `recv_timeout(100ms)`：既能处理命令，又能�
 3. **心跳节奏**：心跳线程一轮结束才等下一 tick，两轮不会并行（对应 Go 的 `heartbeatLoop`）。
 4. **凭据上报**：`core_cred_id` 只在引擎线程写，写点是 `Cmd::Core(Started{..})` 与停止事件；心跳消息到达时读它。这是 F1（先报新凭据导致控制面吊销正在用的旧凭据）的修法，位置必须保持。
 5. **更新**：`phase`（`Idle`/`Downloading`/`Ready`/`Failed`）由引擎独占；下载线程只回报 `Download` 消息。Go 的 `busy` 标志因此可以去掉，「下载中不覆盖」的判断改看 `phase`。
-6. **跨进程**：`instance.lock`（`mesh-install::lock`）。
+6. **跨进程**：两个文件锁，见 5.7。线程之间没有别的锁。
 
 ### 5.4 共享内存只剩两处
 
@@ -398,11 +505,27 @@ core 线程的主循环用 `recv_timeout(100ms)`：既能处理命令，又能�
 
 Go 里 `quit`（停资源 + 通知主循环）与 `stop`（只停资源）是两件事，历史原因是更新路径曾想 `exec` 自己；实际 `applyUnix` 是 `stopResources()` 之后 `quitApp()`，两者总是成对出现。Rust 合成为一个幂等入口，托盘退出、`/api/quit`、SIGTERM、更新交接都调它。
 
+### 5.7 进程之间：两个锁
+
+两个锁回答不同的问题，互不替代：
+
+| 锁 | 回答的问题 | 谁持有 | 持有多久 |
+|---|---|---|---|
+| `instance.lock` | 这份 `config/` 是不是已经有一个客户端 | 客户端（`client::main` 取得后持有到进程结束） | 整个进程；启动器只在 `client_running` 里试拿一次就放开 |
+| `install.lock` | 安装根现在是不是有人在改 | 启动器（`Owner`），以及客户端的两次写：提交更新包、替换启动器 | 一次事务（含等旧客户端退出、等启动确认）/ 一次写动作；Windows 一条命令一个，Linux 每轮循环一个 |
+
+- `instance.lock` 只回答「有没有客户端在跑」。启动器拿它不是要占住，而是试一次：拿得到就是没人跑，立刻放开。崩溃由内核释放，不会留下要人工删的锁文件。
+- `install.lock` 在 `own()` 里非阻塞地取；拿不到就报「安装根正被占用」，不排队。
+- Linux 常驻启动器只在「`recover` → `apply_pending` → `boot_and_settle`」这一段持有它，`client.wait()` 等客户端期间放开——客户端提交更新包与替换启动器要用同一把锁，一直握着就永远提交不了。客户端拿不到只影响这一次提交：包留在 `.part`，下一轮心跳再试。
+- 冲突不靠锁预防，而是入口前提：
+  1. **Linux 上手工安装先停服务。** 客户端在跑时它占着 `instance.lock`，手工 `mesh --file` 会被 `client_running` 判据拒绝；`systemctl stop` 之后才能装。
+  2. **Windows 上客户端在跑时，`--file` 必须带 `--wait-for <pid>`。** 启动器等它退出（上限 60 s）；没有这一项就直接拒绝，不在运行中的客户端脚下换 `bin/`。
+
 ## 6. 错误分层
 
 | 层 | 错误类型 | 内容 |
 |---|---|---|
-| `mesh-install` | `Error { ManifestRead, VersionInvalid, Io, AlreadyRunning }` | `AlreadyRunning` 必须独立成变体：上层要据此走「唤起已有实例」而不是报错 |
+| `mesh-install` | `Error { ManifestRead, Io, AlreadyRunning }` | 清单读不出来（版本号非法也归在这里）、普通 IO、锁被占。`AlreadyRunning` 必须独立成变体：上层要据此走「唤起已有实例」或「下一轮再提交」而不是报错 |
 | `mesh-state` | `Error { Io, Parse, KeyLength }` | 文件读写与格式；`client.key` 长度异常直接失败，不重建 |
 | `mesh-remote` | `Error { Unauthorized{code,server_time}, Api{status,code,message}, Transport, Decode }` | `Unauthorized` 带 `code` 与 `Date` 偏差，因为引擎要分三支：`revoked` / 时钟偏差 / 其它 |
 | `mesh-etrpc` | `Error { Connect, Frame, Protocol{field}, Rpc(String), Timeout }` | `Rpc(String)` 已在 crate 内把 `error.Error` 的 oneof 翻成一句话 |
@@ -428,7 +551,7 @@ Go 里 `quit`（停资源 + 通知主循环）与 `stop`（只停资源）是两
 
 | 备选 | 为什么不 |
 |---|---|
-| 单个 crate + 模块（不分 workspace） | 没有编译期的方向约束，`engine` 会慢慢把面板、托盘都拖进来；启动器也没法复用 `install`。现在 `version` 比较与失败计数在 Go 和 Rust 启动器里各有一份，就是没有共享 crate 的证据 |
+| 单个 crate + 模块（不分 workspace） | 没有编译期的方向约束，`engine` 会慢慢把面板、托盘都拖进来；启动器也没法复用 `install`。没有共享 crate 时，`version` 比较与失败计数只能每个二进制各写一份 |
 | 按层切（domain / app / infra） | 每个概念只有一个实现，没有第二个实现也没有替换需求，纯增抽象层 |
 | `engine` 拆成 `heartbeat`/`config`/`core-sync` 三个 crate | 三者共享同一份可变状态，拆开后只能靠共享锁或消息转发，比同 crate 内模块更差，且「谁拥有 status」变得说不清 |
 | 面板独立进程 | 多一份生命周期、端口协商与失败模式；收益只有「面板崩了不影响网络」，而面板只是回环 HTTP 的 11 个 handler |
@@ -489,7 +612,7 @@ strip = true
 | crate | 依赖 |
 |---|---|
 | `text` | 无（零依赖地板） |
-| `install` | `mesh-text`、`fs4`（跨平台 `LockFileEx`/`flock`） |
+| `install` | `mesh-text`、`fs4`（跨平台 `LockFileEx`/`flock`）、`serde`、`serde_json`、`thiserror`、`ed25519-dalek`、`hex`、`sha2`（后三只给 `signing`） |
 | `state` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`toml`、`ed25519-dalek`、`rand`、`base64` |
 | `remote` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`sha2`、`hex`、`base64`、`ed25519-dalek`、`rand`、`ureq`（windows 加 `native-tls`，unix 加 `tls`） |
 | `etrpc` | `mesh-text`、`thiserror`（其余是 `std::net` + `std::io`） |
@@ -497,7 +620,7 @@ strip = true
 | `engine` | `mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`、`serde`、`serde_json`、`sha2`、`hex`、`thiserror`、`rand`；不需要 windows-sys（自启只写 UTF-16 文件 + 起 `schtasks.exe`，隐藏窗口用 `CommandExt::creation_flags`）；dev: `ed25519-dalek`（给测试 offer 签名） |
 | `panel` | `mesh-engine`、`mesh-etrpc`、`tiny_http`、`include_dir`、`serde_json` |
 | `client` | `mesh-install`、`mesh-engine`、`mesh-panel`；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_UI_WindowsAndMessaging`、`Win32_Graphics_Gdi`、`Win32_System_LibraryLoader`、`Win32_System_Console`）+ `windows`（`Win32_UI_Shell` 的 `IShellDispatch`、`Win32_System_Com`）；unix: `signal-hook`；build: `winresource` |
-| `launcher` | `mesh-install`、`zstd`、`tar`、`sha2`、`ureq`（windows: `native-tls`）；dev: `ed25519-dalek`（造签名正确的测试包）；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_System_Threading`）；unix: 无（下载走系统 `curl`）；build: `winresource` |
+| `launcher` | `mesh-install`、`mesh-text`、`zstd`、`tar`、`sha2`；windows: `ureq`（`tls`+`native-certs`，只开 `native-tls` 不会成为 `ureq` 的默认 provider）、`windows-sys`（`Win32_Foundation`、`Win32_System_Registry`、`Win32_System_Threading`、`Win32_UI_Shell`、`Win32_UI_WindowsAndMessaging`）、build: `winresource`；unix: 无（下载走系统 `curl`）；dev: `ed25519-dalek`（造签名正确的测试包） |
 
 `crates/panel/src/assets.rs`：`include_dir!("../../frontend/dist")`——路径相对 crate 根（`client/crates/panel` → 仓库根），直接吃 `frontend/` 的构建产物，不复制、不改名。前端未构建时先跑占位脚本（等价 `wails3 task stub:frontend`），再编译。
 

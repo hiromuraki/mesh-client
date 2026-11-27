@@ -54,6 +54,11 @@ impl Lock {
     pub fn path(root: &Path) -> std::path::PathBuf {
         root.join(layout::LOCK)
     }
+
+    /// 安装根写权的锁文件。启动器持有整个安装事务，客户端提交更新包时也走它。
+    pub fn owner_path(root: &Path) -> std::path::PathBuf {
+        root.join(layout::INSTALL_LOCK)
+    }
 }
 
 impl Drop for Lock {

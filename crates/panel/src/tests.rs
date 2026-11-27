@@ -302,19 +302,22 @@ fn dashboard_without_a_running_core_has_an_empty_node_list() {
 }
 
 #[test]
-fn dashboard_with_an_unreachable_core_still_lists_the_local_node() {
+fn dashboard_with_an_unreachable_core_reports_an_unknown_topology() {
+    // core 报的是「在跑」，但 rpc 连接不上：这是「拓扑未知」，不是「一台节点都没有」。
+    // 从前这里回一行本机，把查询失败伪装成空拓扑（F11）。
     let mut published = published();
-    // 一个必然连不上的回环地址：core 报的是「在跑」，但查询失败时仍要给出本机行。
     published.rpc = Some("127.0.0.1:1".parse().unwrap());
+    published.core_gen = 7;
     let (router, _rx) = router_with(published, PathBuf::from("unused.log"), Arc::new(|| {}));
     let response = router.handle(request("GET", "/api/dashboard"));
     assert_eq!(response.status, 200);
     let body = body_json(&response);
-    let nodes = body["nodes"].as_array().expect("nodes 是数组");
-    assert_eq!(nodes.len(), 1);
-    assert_eq!(nodes[0]["pathKind"], "me");
-    // 快照里的 localIp 带 /24，节点表里只留地址。
-    assert_eq!(nodes[0]["ip"], "10.126.126.100");
+    assert!(
+        body["nodes"].is_null(),
+        "查询失败时节点表是 null（未知），不是 []: {body}"
+    );
+    // 快照照旧可用：失败只影响节点表。
+    assert_eq!(body["snapshot"]["status"], "online");
 }
 
 #[test]

@@ -2,10 +2,15 @@
 //!
 //! 对应 Go 的 `engine/update.go`。三条不能改的行为：
 //!
-//! - 包先落到 `<root>/update.tar.zst.part`，校验通过才改名成 `update.tar.zst`：固定名字
-//!   本身就是「请安装」的信号，半截文件绝不能被当成可安装的包。
+//! - 包先落到 `<root>/update.tar.zst.part`，摘要对得上、并且这次下载仍然是当前
+//!   那份 offer 时才改名成 `update.tar.zst`：固定名字本身就是「请安装」的信号，
+//!   半截文件、被撤回的 offer、被换掉的旧任务都不许留下它。
 //! - **服务端没给摘要就拒绝安装**：摘要为空时放行等于给「中间人换包」留了一道缝。
 //! - 失败态保留到换版本或用户重试，否则下一轮心跳会把提示抹掉，界面改口说“已就绪”。
+//!
+//! 一份 offer 的身份是「版本 + 摘要」：同一版本号重新发布时内容会变，撤回、重发与
+//! 策略变更都必须显式迁移状态。下载任务另带自己的代次回来（见 [`DownloadTask`]），
+//! 旧任务完成时手上已经不是那一份，结果只能作废。
 
 use crate::run::Engine;
 use crate::sync::file_digest;
@@ -53,6 +58,22 @@ impl Phase {
     }
 }
 
+/// 一次下载任务的标识。
+///
+/// `gen` 是代次，不是 offer 身份：同一份 offer 重下、或者下载中换了 offer，都会
+/// 起一个不同的任务。完成消息带着它回来，引擎据此判断「这条结果还算数吗」——
+/// 只比版本号不够（同版本重发内容会变），只比摘要也不够（同一份 offer 可能重下过）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DownloadTask {
+    pub gen: u64,
+    pub version: String,
+    pub sha256: String,
+}
+
+/// 手上这份 offer 及其进度。
+///
+/// 版本与摘要永远成对描述同一份 offer：判重、自动安装资格、下载完成都按它们一起
+/// 判断。不另设「已知的摘要」这类副本——两份状态迟早分叉。
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UpdateState {
     pub phase: Phase,
@@ -69,24 +90,53 @@ pub(crate) struct UpdateState {
     pub busy: bool,
     /// 下载完成后是否立刻交接（用户点了安装 / 自动安装）。
     pub apply_after_download: bool,
+    /// 这份 offer 允不允许自动安装：服务端策略与本机否决合起来的结果。
+    ///
+    /// 与 offer 同生共死，而不是放在引擎上：换一份 offer 就是另一份授权；下载中
+    /// 管理端也可能改掉它（精简响应只带这个开关）。
+    pub auto: bool,
     /// 这份 offer 已经失败过几次下载。
     pub attempts: u32,
     /// 下一次自动重试的时刻；退避由它算，不额外排定时器：心跳就是节拍。
     pub retry_at: Option<Instant>,
+    /// 正在跑的下载任务。任何时刻最多一个：两个线程写同一个 `.part` 只会互相
+    /// 截断。任务结束时清空；被换掉的任务由它自己的完成消息认领。
+    pub task: Option<DownloadTask>,
+    /// 已经下载并校验好、但还没提交到固定路径的包。
+    ///
+    /// 提交要拿安装根写权（启动器装着东西的时候不能硬写），拿不到就留在这里：
+    /// 包是好的，别为了一个正在进行的安装重下一遍。下一轮心跳重试提交。
+    pub part: Option<PathBuf>,
+}
+
+impl UpdateState {
+    fn has_offer(&self) -> bool {
+        !self.version.is_empty()
+    }
+
+    /// 手上这份是不是 `version` + `sha256` 那一份。
+    fn is(&self, version: &str, sha256: &str) -> bool {
+        self.has_offer() && self.version == version && self.sha256.eq_ignore_ascii_case(sha256)
+    }
 }
 
 /// 启动器槽位的本地状态。
 ///
 /// 与 [`UpdateState`] 分开：那份状态会随客户端包 offer 整体重建为默认值，而启动器
-/// 的已知摘要、尝试记录、自报版本与在途任务要活到进程结束——否则一次普通的客户端
+/// 的已知摘要、尝试记录、版本与在途任务要活到进程结束——否则一次普通的客户端
 /// offer 变化就会把正在跑的替换任务放开给第二个任务，两份下载互相截断。
+///
+/// `sum` 与 `version` 描述的是**盘上**那份启动器：启动时读一次，替换成功之后用
+/// 已验签的结果更新。它们不描述正在运行的启动器——两者只在本进程没有替换过时
+/// 相同；替换成功后盘上已经是新的，而正在跑的那个还是旧的，直到它下次被拉起。
+/// 判降级只能用盘上那份的版本，否则会把设备换回一个更旧的启动器。
 #[derive(Default)]
 pub(crate) struct LauncherState {
     /// 安装根下这份启动器的完整摘要。
     pub sum: String,
     /// 本进程对哪一份 offer 已经有结论（换掉了，或拒绝换成）：同一份不再重试。
     pub tried: Option<String>,
-    /// 启动器自报的版本号（`launcher.json`）；读不到就是 None，那时不判降级。
+    /// 盘上这份启动器自报的版本号；读不到就是 None，那时不判降级。
     pub version: Option<String>,
     /// 替换任务正在跑。
     ///
@@ -94,6 +144,21 @@ pub(crate) struct LauncherState {
     /// 「先删再下」会把前一个正在写的文件截断，两边都算出对不上的摘要。
     /// 同一时刻只放一个进去，后来的等下一轮心跳再说。
     pub busy: Arc<AtomicBool>,
+}
+
+impl LauncherState {
+    /// 启动时读一次盘上的事实：安装根里那份启动器的摘要，与它自报的版本号。
+    ///
+    /// 只在这一个地方读：之后由替换结果更新（[`Engine::on_launcher_result`]）。
+    /// 记下的是「盘上那份」，不是正在跑的那一份——两者只在没有替换过时相同。
+    pub(crate) fn read(root: &Path) -> LauncherState {
+        LauncherState {
+            sum: crate::sync::file_digest(&root.join(mesh_install::platform::launcher_name()))
+                .unwrap_or_default(),
+            version: layout::read_launcher_version(root),
+            ..LauncherState::default()
+        }
+    }
 }
 
 /// 启动器替换的占坑守卫：线程从任何一条路径退出都把坑放掉，包括提前 return。
@@ -116,7 +181,7 @@ impl Engine {
     ///
     /// 来源就是 `update.sha256`——它是“内存里这份 offer 的摘要”，与进度（`phase`）无关：
     /// Ready / Downloading / Failed 都仍然是同一份 offer，都该照报；`Idle`（没有 offer，
-    /// 或被 `clear_stale_update` 清掉）自然就是 `None`。
+    /// 或被撤回清掉）自然就是 `None`。
     ///
     /// 特意不另设一个 `known_sha` 字段：两个字段迟早出现“清了 offer 忘了清 known”的
     /// 分叉，而这里 known 与 offer 是同一件事，只有一个来源才不可能不一致。
@@ -129,29 +194,30 @@ impl Engine {
     }
 
     /// 记下服务端报告的新版本。安装动作交给启动器。
-    pub(crate) fn offer_update(
-        &mut self,
-        api: &Arc<remote::Client>,
-        info: Option<&remote::UpdateInfo>,
-    ) {
+    ///
+    /// 一份 offer 的处理只有两个出口：同一份就只更新自动安装资格（下载中不打断
+    /// 任务），另一份就整体换掉（撤回、同版本重发、换版本都走这一步）。
+    pub(crate) fn offer_update(&mut self, info: Option<&remote::UpdateInfo>) {
         let Some(info) = info else {
             return;
         };
-        // 包级开关每次都更新——包括精简响应：管理员可能刚改过设备级覆盖，而
-        // `appUpdate.autoUpdate` 已经是覆盖后的值，客户端照单全收，不再自己判一次。
-        self.auto_update = info.auto_update && !self.config.auto_update_disabled;
+        let auto = info.auto_update && !self.config.auto_update_disabled;
         // 精简响应：服务端确认“你手上就是这份发布包”。
         //
         // 只认开关，别的什么都不动：不校验 url/版本号（精简形状里本来就没有 url），
         // 不写日志（这正是要省掉的那份每 30 秒重复），不碰 update 的 phase/version/
         // notes/sha256/path（否则会把“已知”错当成“新下发”，把已就绪的包重置成待下载）。
         if info.unchanged {
+            if self.update.has_offer() {
+                // 管理端可能刚改过设备级覆盖：这份 offer 的授权跟着变。
+                self.update.auto = auto;
+            }
             // 下载失败过的 offer 仍要按退避重试。客户端上报的「我有哪一份」与
             // 进度无关（Failed 也照报），服务端据此一直回精简形状，重试分支
             // 一次都进不去——最常见的失败（文件服务抖一下）就永远等不到第二次
             // 机会，界面停在错误上直到有人手动点重试。
             if self.update.phase == Phase::Failed {
-                self.retry_failed_download(api);
+                self.retry_failed_download();
             }
             return;
         }
@@ -225,19 +291,32 @@ impl Engine {
             );
             return;
         }
-        // 正在下载/交接：这份状态由下载线程独占，心跳不要碰。
-        if self.update.busy || self.update.phase == Phase::Downloading {
+        // 交接中：安装器已经拉起、进程马上退出，这一轮不再改任何状态。
+        if self.update.busy {
             return;
         }
-        // 同一个版本号重新发布时内容会变，所以“是不是同一份 offer”看摘要，不看版本号。
-        let same_offer = self.update.version == info.version
-            && self.update.sha256.eq_ignore_ascii_case(&info.sha256);
-        let settled = matches!(self.update.phase, Phase::Ready | Phase::Failed);
-        if settled && same_offer {
-            // 下载失败过的包在退避到期后自动重下一次：发布文件服务短暂不可达时，
-            // 不该让提示永远停在错误上，也不该要求用户自己去点重试。
-            self.retry_failed_download(api);
+        if self.update.is(&info.version, &info.sha256) {
+            // 同一份：策略可能刚变，进度与在跑的下载由现有状态机管。
+            self.update.auto = auto;
+            if self.update.phase == Phase::Failed {
+                self.retry_failed_download();
+            }
             return;
+        }
+        self.start_offer(info, auto);
+    }
+
+    /// 换上一份新的 offer。撤回、同版本重发与换版本走的是同一条状态迁移。
+    ///
+    /// 在跑的下载任务留在原地：线程没法取消，而且 `.part` 只有一个，再起一个只会
+    /// 互相截断。它的完成消息回来时身份已经对不上，由 [`Engine::on_download`]
+    /// 判为过期，接手新 offer 的下载。
+    fn start_offer(&mut self, info: &remote::UpdateInfo, auto: bool) {
+        let task = self.update.task.take();
+        // 上一份 offer 已经下好但还没提交的包：内容不再被授权，删掉它自己的
+        // 临时文件（固定路径上的包仍然不归客户端清）。
+        if let Some(part) = self.update.part.take() {
+            let _ = std::fs::remove_file(part);
         }
         self.update = UpdateState {
             phase: Phase::Ready,
@@ -245,6 +324,8 @@ impl Engine {
             notes: info.notes.clone(),
             url: info.url.clone(),
             sha256: info.sha256.clone(),
+            auto,
+            task,
             ..UpdateState::default()
         };
         // Windows 先把包抓到本地：安装发生在客户端退出之后，那时 mesh 已经断了。
@@ -254,12 +335,7 @@ impl Engine {
                 "app",
                 &mesh_text::format(mesh_text::id::ENGINE_LOG_DOWNLOAD_STARTED, &[&info.version]),
             );
-            self.spawn_download(
-                Arc::clone(api),
-                info.version.clone(),
-                info.url.clone(),
-                info.sha256.clone(),
-            );
+            self.begin_download();
             return;
         }
         self.logf(
@@ -271,18 +347,24 @@ impl Engine {
         );
     }
 
-    /// 无人值守模式：直接安装刚记录下来的更新。只试一次。
+    /// 无人值守模式：直接安装刚记录下来的更新。每份 offer 只试一次。
     pub(crate) fn auto_apply(&mut self) {
-        if !self.auto_update {
+        if self.update.phase != Phase::Ready || self.update.busy || !self.update.has_offer() {
             return;
         }
-        if self.update.phase != Phase::Ready || self.update.busy || self.update.version.is_empty() {
+        if !self.update.auto {
             return;
         }
-        if self.auto_tried.as_deref() == Some(self.update.version.as_str()) {
+        // 包已下好但还没提交（安装根被别人占着）：等提交成功之后由
+        // accept_download 再调一次，这里不做任何动作，免得重下一遍。
+        if self.update.part.is_some() {
             return;
         }
-        self.auto_tried = Some(self.update.version.clone());
+        // 按摘要去重而不是按版本号：同版本重发是另一份 offer，该给它一次机会。
+        if self.auto_tried.as_deref() == Some(self.update.sha256.as_str()) {
+            return;
+        }
+        self.auto_tried = Some(self.update.sha256.clone());
         self.logf(
             "app",
             &mesh_text::format(
@@ -324,88 +406,94 @@ impl Engine {
                 )
             }
         }
-        if cfg!(windows) {
-            // 包已经预取到本地；没有本地包说明下载失败过或被人删掉了。
-            // 这时重新下一份、下完直接交接——面板上的「重试」走的就是这条路径。
-            let path = self.update.path.clone();
-            if !path.as_deref().map(Path::is_file).unwrap_or(false) {
-                let Some(api) = self.api.clone() else {
-                    return Err(
-                        mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_SERVER_FOR_DOWNLOAD)
-                            .to_string(),
-                    );
-                };
-                // 用户主动重试：次数重新给满。
-                self.update.attempts = 0;
-                self.update.retry_at = None;
-                self.update.phase = Phase::Downloading;
-                self.update.error.clear();
-                self.update.apply_after_download = true;
-                let version = self.update.version.clone();
-                self.logf(
-                    "app",
-                    &mesh_text::format(
-                        mesh_text::id::ENGINE_LOG_REDOWNLOAD_FOR_INSTALL,
-                        &[&version],
-                    ),
-                );
-                self.spawn_download(
-                    api,
-                    version,
-                    self.update.url.clone(),
-                    self.update.sha256.clone(),
-                );
-                return Ok(());
-            }
+        // 上一轮下好、但没拿到安装根写权的那份包：先试提交，别重下已经校验过的字节。
+        if self.update.part.is_some() {
+            self.resume_commit();
+        }
+        // 包已经在本地（预取，或被推迟的提交刚刚完成）：两个平台都是直接交接。
+        if self
+            .update
+            .path
+            .as_deref()
+            .map(Path::is_file)
+            .unwrap_or(false)
+        {
             self.update.busy = true;
             self.update.apply_after_download = false;
             return self.handoff();
         }
-        let Some(api) = self.api.clone() else {
+        if self.api.is_none() {
             return Err(
                 mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_SERVER_FOR_DOWNLOAD).to_string(),
             );
-        };
-        self.update.busy = true;
+        }
+        // 没有本地包说明下载失败过、被人删掉，或者安装根一直被别人占着。
+        // 重新下一份、下完直接交接——面板上的「重试」走的就是这条路径。
+        self.update.attempts = 0;
+        self.update.retry_at = None;
         self.update.phase = Phase::Downloading;
         self.update.error.clear();
         self.update.apply_after_download = true;
-        self.spawn_download(
-            api,
-            self.update.version.clone(),
-            self.update.url.clone(),
-            self.update.sha256.clone(),
-        );
+        if cfg!(windows) {
+            let version = self.update.version.clone();
+            self.logf(
+                "app",
+                &mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_REDOWNLOAD_FOR_INSTALL,
+                    &[&version],
+                ),
+            );
+        }
+        self.begin_download();
         Ok(())
     }
 
-    /// 下载线程把包落到 `<root>/update.tar.zst` 后回报。
-    pub(crate) fn on_download(&mut self, version: String, result: Result<PathBuf, String>) {
-        if self.update.version != version {
-            // 下载期间服务端又下发了别的版本，这次的结果作废。
+    /// 下载线程把包写到 `.part` 后回报。
+    ///
+    /// 只有「这条结果仍然属于手上这份 offer、并且就是这个任务」时才接受：撤回、
+    /// 同版本重发与换任务都会让旧结果失效，旧结果甚至不许留下固定路径上的包。
+    pub(crate) fn on_download(&mut self, task: DownloadTask, result: Result<PathBuf, String>) {
+        if self.update.task.as_ref() != Some(&task) {
+            // 不是手上这个任务（重复回报或早已作废）：只清它自己的临时文件，
+            // 也绝不碰正在跑的那个任务。固定路径上的包不动——那是交接信号，
+            // 只有消耗它的安装事务能清（F3）。
+            if let Ok(part) = &result {
+                let _ = std::fs::remove_file(part);
+            }
+            return;
+        }
+        self.update.task = None;
+        if !self.update.is(&task.version, &task.sha256) {
+            // 任务跑完时 offer 已经换了或撤回：这份内容不再被授权。
+            if let Ok(part) = &result {
+                let _ = std::fs::remove_file(part);
+            }
+            if self.update.phase == Phase::Downloading {
+                // 新 offer 还在等下载：旧任务已经让路，接着下。
+                self.begin_download();
+            }
             return;
         }
         match result {
-            Ok(path) => {
-                self.update.sum = file_digest(&path).unwrap_or_default();
-                self.update.path = Some(path);
-                self.update.phase = Phase::Ready;
-                self.update.busy = false;
-                self.update.error.clear();
-                let version = self.update.version.clone();
-                self.logf(
-                    "app",
-                    &mesh_text::format(
-                        mesh_text::id::ENGINE_LOG_DOWNLOADED_MANUAL_INSTALL,
-                        &[&version],
-                    ),
-                );
-                if self.update.apply_after_download {
-                    self.update.apply_after_download = false;
-                    let _ = self.handoff();
-                } else {
-                    self.auto_apply();
-                }
+            Ok(part) => {
+                // 提交要在安装根写权之内：启动器可能正在装上一份，两边会踩到
+                // 同一个文件名。拿不到就留在这里，下一轮心跳再提交。
+                let Some(owner) = self.own_install_root_for_package(&part) else {
+                    return;
+                };
+                // 被接受才改成固定名字：`update.tar.zst` 一出现就是「请安装」。
+                let path = match commit_package(&part, &self.config.root) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        drop(owner);
+                        let _ = std::fs::remove_file(&part);
+                        self.fail_update(&err);
+                        self.logf("app", &err);
+                        return;
+                    }
+                };
+                drop(owner);
+                self.accept_download(path);
             }
             Err(err) => {
                 let version = self.update.version.clone();
@@ -426,7 +514,7 @@ impl Engine {
     }
 
     /// 下载失败且退避到期时重下一次。次数用完就停，错误提示留在界面上等人处理。
-    fn retry_failed_download(&mut self, api: &Arc<remote::Client>) {
+    fn retry_failed_download(&mut self) {
         if self.update.phase != Phase::Failed || self.update.busy || self.update.url.is_empty() {
             return;
         }
@@ -442,20 +530,15 @@ impl Engine {
             return;
         }
         let version = self.update.version.clone();
+        let attempt = self.update.attempts + 1;
         self.update.phase = Phase::Downloading;
         self.update.error.clear();
         self.update.retry_at = None;
-        let attempt = self.update.attempts + 1;
         self.logf(
             "app",
             &mesh_text::format(mesh_text::id::ENGINE_LOG_REDOWNLOAD, &[&version, &attempt]),
         );
-        self.spawn_download(
-            Arc::clone(api),
-            version,
-            self.update.url.clone(),
-            self.update.sha256.clone(),
-        );
+        self.begin_download();
     }
 
     /// 把安装交给启动器，然后退出。
@@ -510,15 +593,24 @@ impl Engine {
         self.shutdown.run_and_exit(0);
     }
 
-    /// 清掉“服务端已经不再提供”的更新提示。下载中或正在交接时不动。
+    /// 控制面不再提供这份 offer（撤回）：把 offer 显式清掉。
+    ///
+    /// 下载中也照清：线程取消不了，但它的完成消息会带着旧身份回来被判为过期，
+    /// 不会把内容留下、更不会去安装。固定路径上的包不动——只有消耗它的安装事务
+    /// 能清（F3）。在跑的任务留在原地等它自己结束，避免两个线程写同一个 `.part`。
     pub(crate) fn clear_stale_update(&mut self) {
-        if self.update.busy
-            || self.update.phase == Phase::Downloading
-            || self.update.phase == Phase::Idle
-        {
+        if self.update.busy || self.update.phase == Phase::Idle {
             return;
         }
-        self.update = UpdateState::default();
+        let task = self.update.task.take();
+        if let Some(part) = self.update.part.take() {
+            let _ = std::fs::remove_file(part);
+        }
+        self.update = UpdateState {
+            task,
+            part: None,
+            ..UpdateState::default()
+        };
     }
 
     /// 按控制面公布的摘要替换安装根里的启动器（下载与替换放后台）。
@@ -558,6 +650,9 @@ impl Engine {
         // 摘要只证明「是不是同一份」，不证明「是不是更新的」：一份当年真签过的旧
         // 三元组能让设备退回还没有清单校验的旧启动器。盘上这份自己报的版本号是
         // 唯一的本地依据，它比下发的更新才换；没有记录时不判，放行这一次。
+        //
+        // 比的是**盘上**那份：替换成功后引擎已经把 version 更新成新的那一版，
+        // 所以一次进程里有多次发布时不会把设备来回换。
         if let Some(current) = self.launcher.version.as_deref() {
             if !version::is_newer(&info.version, current) {
                 self.logf(
@@ -589,6 +684,7 @@ impl Engine {
         let api = Arc::clone(api);
         let root = self.config.root.clone();
         let log = Arc::clone(&self.log);
+        let tx = self.self_tx.clone();
         let version = info.version.clone();
         let url = info.url.clone();
         let want = info.sha256.clone();
@@ -644,12 +740,40 @@ impl Engine {
                         return;
                     }
                 }
+                // 换启动器也是写安装根：启动器正装着东西时不能动它的文件。
+                let owner = match own_install_root(&root) {
+                    Ok(owner) => owner,
+                    Err(err) => {
+                        log.add(
+                            "app",
+                            &mesh_text::format(
+                                mesh_text::id::ENGINE_LOG_LAUNCHER_UPDATE_FAILED,
+                                &[&err],
+                            ),
+                        );
+                        let _ = std::fs::remove_file(&temp);
+                        // 这次不算结论：下一轮心跳再试（盘上那份没动）。
+                        let _ = tx.send(Cmd::Launcher {
+                            version,
+                            sha256: want,
+                            replaced: false,
+                            retry: true,
+                        });
+                        return;
+                    }
+                };
                 let dst = root.join(mesh_install::platform::launcher_name());
-                match std::fs::rename(&temp, &dst) {
-                    Ok(()) => log.add(
-                        "app",
-                        &mesh_text::format(mesh_text::id::ENGINE_LOG_LAUNCHER_UPDATED, &[&version]),
-                    ),
+                let replaced = match std::fs::rename(&temp, &dst) {
+                    Ok(()) => {
+                        log.add(
+                            "app",
+                            &mesh_text::format(
+                                mesh_text::id::ENGINE_LOG_LAUNCHER_UPDATED,
+                                &[&version],
+                            ),
+                        );
+                        true
+                    }
                     Err(err) => {
                         log.add(
                             "app",
@@ -659,8 +783,17 @@ impl Engine {
                             ),
                         );
                         let _ = std::fs::remove_file(&temp);
+                        false
                     }
-                }
+                };
+                drop(owner);
+                // 结果交回引擎线程：盘上那份换成什么，只有状态机知道该记成什么。
+                let _ = tx.send(Cmd::Launcher {
+                    version,
+                    sha256: want,
+                    replaced,
+                    retry: false,
+                });
             });
         if spawned.is_err() {
             self.logf(
@@ -670,7 +803,38 @@ impl Engine {
         }
     }
 
+    /// 启动器替换的结果：成功就把「盘上那份」的事实改成新的。
+    ///
+    /// `retry` 表示这次只是没拿到安装根写权：它不是结论，`tried` 要放回去，
+    /// 下一轮心跳拿同一份 offer 再试一次。
+    ///
+    /// 不写 `launcher.json`——那份记录只由启动器自己写（它是唯一确定「我就是那个
+    /// 文件」的进程）。因此「正在运行的启动器」与「盘上启动器」只在本进程没换过
+    /// 启动器时相同：换过之后盘上已经是新的，而要到下一次拉起才是新的在跑。
+    pub(crate) fn on_launcher_result(
+        &mut self,
+        version: String,
+        sha256: String,
+        replaced: bool,
+        retry: bool,
+    ) {
+        if retry {
+            // 安装根被启动器占着：这不是结论，下一轮心跳拿同一份 offer 再来。
+            self.launcher.tried = None;
+            return;
+        }
+        if !replaced {
+            // 换失败：盘上那份没变，事实也不变；tried 已经记过，同一份不再重试。
+            return;
+        }
+        self.launcher.sum = sha256;
+        self.launcher.version = Some(version);
+    }
+
     /// 清掉 `update/` 里上一轮留下的临时文件。
+    ///
+    /// 只清这个目录：`update.tar.zst` 在安装根下，它是「请安装」的信号，不是临时
+    /// 文件，任何时候都不该由客户端顺手删掉（F3）。
     pub(crate) fn clean_update_dir(&mut self) {
         let dir = self.config.root.join(UPDATE_DIR);
         let entries = match std::fs::read_dir(&dir) {
@@ -680,7 +844,13 @@ impl Engine {
         for entry in entries.flatten() {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
-            match std::fs::remove_dir_all(&path) {
+            // 这一层既放过半截下载（文件）也放过临时目录，两种都要清得掉。
+            let outcome = if path.is_dir() {
+                std::fs::remove_dir_all(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+            match outcome {
                 Ok(()) => self.logf(
                     "app",
                     &mesh_text::format(mesh_text::id::ENGINE_LOG_CLEAN_TEMP_FILE, &[&name]),
@@ -704,26 +874,117 @@ impl Engine {
         self.update.busy = false;
     }
 
-    fn spawn_download(
-        &mut self,
-        api: Arc<remote::Client>,
-        version: String,
-        url: String,
-        want: String,
-    ) {
+    /// 为当前 offer 起一次下载。单飞由 `update.task` 保证：有任务在跑就等它回来，
+    /// 它的完成消息会接手这一次（见 `on_download`）。
+    fn begin_download(&mut self) {
+        if self.update.task.is_some() || self.update.phase != Phase::Downloading {
+            return;
+        }
+        // 重新下一个包：上一份「等下写权」的记录作废（同一个 .part 会被这次下载覆盖）。
+        self.update.part = None;
+        let Some(api) = self.api.clone() else {
+            let message =
+                mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_SERVER_FOR_DOWNLOAD).to_string();
+            self.fail_update(&message);
+            return;
+        };
+        self.next_download = self.next_download.wrapping_add(1);
+        let task = DownloadTask {
+            gen: self.next_download,
+            version: self.update.version.clone(),
+            sha256: self.update.sha256.clone(),
+        };
         let root = self.config.root.clone();
+        let url = self.update.url.clone();
+        let want = task.sha256.clone();
         let tx = self.self_tx.clone();
+        let sent = task.clone();
         let spawned = thread::Builder::new()
             .name("mesh-download".to_string())
             .spawn(move || {
-                let result = download_update(&api, &root, &url, &want);
-                let _ = tx.send(Cmd::Download { version, result });
+                let result = download_package(&api, &root, &url, &want);
+                let _ = tx.send(Cmd::Download { task: sent, result });
             });
         if spawned.is_err() {
             let message =
                 mesh_text::get(mesh_text::id::ENGINE_TEXT_DOWNLOAD_THREAD_FAILED).to_string();
             self.fail_update(&message);
             self.logf("app", &message);
+            return;
+        }
+        self.update.task = Some(task);
+    }
+}
+
+impl Engine {
+    /// 提交包的安装根写权。拿不到就把包留在 `update.part` 里等下一轮。
+    ///
+    /// 返回 `None` 表示这一轮不提交也不报错：包是好的，安装根正被启动器用着
+    /// （它装着东西的时候我们去改同一批文件只会互相打脸）。到点由
+    /// [`Engine::resume_commit`] 接着提交，不重下。
+    fn own_install_root_for_package(&mut self, part: &Path) -> Option<mesh_install::lock::Lock> {
+        match own_install_root(&self.config.root) {
+            Ok(owner) => Some(owner),
+            Err(err) => {
+                self.logf("app", &err);
+                self.update.part = Some(part.to_path_buf());
+                self.update.phase = Phase::Ready;
+                self.update.busy = false;
+                self.update.error.clear();
+                None
+            }
+        }
+    }
+
+    /// 上一轮拿不到安装根写权时留下的包：再试一次提交。
+    ///
+    /// 节拍用心跳：交接触发只有用户点安装与自动安装两种，两者本来就挂在心跳上。
+    pub(crate) fn resume_commit(&mut self) {
+        let Some(part) = self.update.part.take() else {
+            return;
+        };
+        if !part.is_file() {
+            // 包被人删了：这一份作废，下一轮心跳重新下发时再下。
+            return;
+        }
+        let Some(owner) = self.own_install_root_for_package(&part) else {
+            return;
+        };
+        let path = match commit_package(&part, &self.config.root) {
+            Ok(path) => path,
+            Err(err) => {
+                drop(owner);
+                let _ = std::fs::remove_file(&part);
+                self.fail_update(&err);
+                self.logf("app", &err);
+                return;
+            }
+        };
+        drop(owner);
+        self.accept_download(path);
+    }
+
+    /// 提交完成之后：记下本地包，按当前请求交接或等自动安装。
+    fn accept_download(&mut self, path: PathBuf) {
+        // 摘要已经在下载线程里核对过：这里不必再把整个包读一遍。
+        self.update.sum = self.update.sha256.clone();
+        self.update.path = Some(path);
+        self.update.phase = Phase::Ready;
+        self.update.busy = false;
+        self.update.error.clear();
+        let version = self.update.version.clone();
+        self.logf(
+            "app",
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_DOWNLOADED_MANUAL_INSTALL,
+                &[&version],
+            ),
+        );
+        if self.update.apply_after_download {
+            self.update.apply_after_download = false;
+            let _ = self.handoff();
+        } else {
+            self.auto_apply();
         }
     }
 }
@@ -736,14 +997,17 @@ fn retry_delay(attempts: u32) -> Duration {
     Duration::from_secs((30u64 << shift).min(600))
 }
 
-/// 下载并校验更新包：落 `.part` → 算摘要 → 改名成固定的 `update.tar.zst`。
-pub(crate) fn download_update(
+/// 下载并校验更新包，落成 `<root>/update.tar.zst.part`。
+///
+/// 返回的是临时文件，**不是**固定路径：改名由引擎在确认这条结果还算数之后做
+/// （[`commit_package`]）。半截文件、被撤回的 offer、被换掉的旧任务都不会在
+/// 安装根下留下一个「请安装」的信号。
+pub(crate) fn download_package(
     api: &remote::Client,
     root: &Path,
     url: &str,
     want: &str,
 ) -> Result<PathBuf, String> {
-    let dst = root.join(layout::UPDATE_FILE);
     let part = root.join(format!("{}.part", layout::UPDATE_FILE));
     let _ = std::fs::remove_file(&part);
     if let Err(err) = api.download(url, &part, MAX_UPDATE_BYTES, DOWNLOAD_TIMEOUT) {
@@ -766,12 +1030,33 @@ pub(crate) fn download_update(
             &[&sum],
         ));
     }
-    if let Err(err) = std::fs::rename(&part, &dst) {
-        let _ = std::fs::remove_file(&part);
-        return Err(mesh_text::format(
-            mesh_text::id::ENGINE_TEXT_PERSIST_FAILED,
-            &[&err],
-        ));
-    }
+    Ok(part)
+}
+
+/// 安装根的写权：`install.lock`，启动器 `Owner` 用的同一把。
+///
+/// 客户端有两次「写安装根」——把下载好的包提交到固定路径、替换根下的启动器。
+/// 启动器正在装东西时这两步会踩到它正在换的文件，所以都要在这把锁之内完成。
+/// 拿不到就失败（`AlreadyRunning`），由调用方留待下一轮：不排队、不硬写。
+fn own_install_root(root: &Path) -> Result<mesh_install::lock::Lock, String> {
+    mesh_install::lock::acquire(&mesh_install::lock::Lock::owner_path(root)).map_err(|err| {
+        // 锁被占着要说得具体：用户看到的是「安装根正被另一个启动器使用」，
+        // 而不是一句泛泛的失败。其它错误原样带出去。
+        match err {
+            mesh_install::Error::AlreadyRunning => {
+                mesh_text::get(mesh_text::id::LAUNCHER_ERROR_INSTALL_ROOT_BUSY).to_string()
+            }
+            err => err.to_string(),
+        }
+    })
+}
+
+/// 把校验过的临时文件改成固定名：从这一刻起它才是「请安装」的信号。
+///
+/// 调用方必须持有安装根写权（`own_install_root`）。
+pub(crate) fn commit_package(part: &Path, root: &Path) -> Result<PathBuf, String> {
+    let dst = root.join(layout::UPDATE_FILE);
+    std::fs::rename(part, &dst)
+        .map_err(|err| mesh_text::format(mesh_text::id::ENGINE_TEXT_PERSIST_FAILED, &[&err]))?;
     Ok(dst)
 }

@@ -69,13 +69,18 @@ pub struct BeatInput {
 /// 引擎发布给其它线程的只读视图。
 ///
 /// 除快照外还带两样别的线程要用、但不该回问引擎的东西：心跳线程要的三个参数，以及
-/// 面板自己查 core 时需要的 rpc 地址（`None` 表示本代 core 没在跑，面板直接返回空
-/// 节点表，与 Go 的 `Dashboard` 在 core 未运行时一致）。
+/// 面板自己查 core 时需要的 rpc 地址与代次（`rpc` 为 `None` 表示本代 core 没在跑，
+/// 面板直接返回空节点表，与 Go 的 `Dashboard` 在 core 未运行时一致）。
 #[derive(Debug, Clone, Default)]
 pub struct Published {
     pub snapshot: Snapshot,
     pub beat: BeatInput,
     pub rpc: Option<SocketAddr>,
+    /// 本代 core 的代次（引擎分配，每起一代加一）；0 表示还没有 core 进过。
+    ///
+    /// 与 `rpc` 一起构成「哪个 core 实例」：重启后即使复用同一个回环端口，代次也不同，
+    /// 面板的查询缓存按这一对值绑定，core 换代即失效。
+    pub core_gen: u64,
 }
 
 /// 跨线程共享的全部可变状态：一个 `RwLock<Arc<Published>>`。
@@ -189,6 +194,8 @@ impl Engine {
                 app_update_known: self.known_app_update(),
             },
             rpc: self.core_rpc_addr(),
+            // 与 rpc 分开取：core 还没就绪时 rpc 是 None，而代次已经是新的那一代。
+            core_gen: self.core.as_ref().map(|core| core.gen).unwrap_or(0),
         };
         self.cell.publish(published);
     }
@@ -211,6 +218,9 @@ pub struct NodeRow {
     pub path_kind: String,
     /// 从本机到该节点途经的中间节点，不含目标自身；直连是空数组。
     pub path: Vec<Hop>,
+    /// `path` 是否只走到了半路：路由表成环或下一跳不在表里时推不出整条链路，
+    /// 此时 `path` 是已经走到的那一段，不能当成完整路径展示。
+    pub path_incomplete: bool,
     pub hops: i32,
     /// 本行用到的隧道协议，已去重排序；本机那一行是整张网的聚合。
     pub tunnels: Vec<String>,
@@ -241,7 +251,9 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
     // 还要在网络里挂一阵（最长一小时），而地址是写死的，于是两个 peer_id 撞同一个 IPv4。
     // 这一列叫「节点」，一台机器一行，所以先按地址归并再往下拼。
     let live = one_route_per_address(routes, &peer_by_id);
-    let mut resolver = PathResolver::new(&live);
+    // 路径推导拿完整路由表：归并只发生在展示阶段，而下一跳引用的是 `peer_id`，
+    // 被归并掉的那个 ID 仍可能是别的节点的下一跳。
+    let mut resolver = PathResolver::new(&live, routes);
 
     let mut rows: Vec<NodeRow> = Vec::with_capacity(live.len() + 1);
     if !local.ip.is_empty() {
@@ -266,6 +278,7 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
             hostname: route.hostname.clone(),
             path_kind: "direct".to_string(),
             path: Vec::new(),
+            path_incomplete: false,
             tunnels: Vec::new(),
             nat_type: route.nat_type.clone(),
             latency_ms: millis(route.path_latency),
@@ -283,7 +296,9 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
         }
         if route.cost > 1 {
             row.path_kind = "relay".to_string();
-            row.path = resolver.to(&ip);
+            let (path, incomplete) = resolver.to(&ip);
+            row.path = path;
+            row.path_incomplete = incomplete;
         }
         rows.push(row);
     }
@@ -335,66 +350,98 @@ fn closer(candidate: &Route, current: &Route, peer_by_id: &HashMap<u32, &Peer>) 
         _ => (candidate.cost, candidate.path_latency) < (current.cost, current.path_latency),
     }
 }
+
+/// 一条路径的推导结果。
+enum Path {
+    /// 已经走到目标（到目标的下一跳就是它自己），`hops` 是整条链路。
+    Complete(Vec<Hop>),
+    /// 路由表成环或下一跳不在表里，`hops` 只是已经走到的那一段。
+    Incomplete(Vec<Hop>),
+}
+
+impl Path {
+    /// 把 `hop` 接到链路前面：先经过它，再走已经推出的那一段。完整性跟着链路走。
+    fn prepend(mut self, hop: Hop) -> Path {
+        match &mut self {
+            Path::Complete(hops) | Path::Incomplete(hops) => hops.insert(0, hop),
+        }
+        self
+    }
+}
+
 /// 把路由表还原成完整路径。路由表每一项只给出「到目标的下一跳」，而下一跳是
 /// `peer_id`，需要先按 `peer_id` 找到它自己那一行的 IP，再逐级回推；结果按 IP 记忆。
 struct PathResolver<'a> {
+    /// 展示行用的那一份（一台机器一条）：跳链要与展示出来的那些行一致。
     routes: HashMap<String, &'a Route>,
+    /// `peer_id` → IP，用**完整**路由表建：被地址归并掉的 `peer_id` 仍可能是别人的
+    /// 下一跳，缺了它这条链路就推不下去。
     ip_by_peer: HashMap<u32, String>,
+    /// 已经完整推出来的路径；不完整的那些不记，它们取决于从哪里进入环路。
     memo: HashMap<String, Vec<Hop>>,
 }
 
 impl<'a> PathResolver<'a> {
-    fn new(routes: &'a [&'a Route]) -> PathResolver<'a> {
-        let mut by_ip = HashMap::with_capacity(routes.len());
-        let mut ip_by_peer = HashMap::with_capacity(routes.len());
-        for route in routes {
-            let route = *route;
-            let ip = strip_cidr(&route.ipv4).to_string();
-            ip_by_peer.insert(route.peer_id, ip.clone());
-            by_ip.insert(ip, route);
+    fn new(live: &[&'a Route], all: &'a [Route]) -> PathResolver<'a> {
+        let mut by_ip = HashMap::with_capacity(live.len());
+        for route in live {
+            by_ip.insert(strip_cidr(&route.ipv4).to_string(), *route);
         }
         PathResolver {
             routes: by_ip,
-            ip_by_peer,
+            ip_by_peer: all
+                .iter()
+                .map(|route| (route.peer_id, strip_cidr(&route.ipv4).to_string()))
+                .collect(),
             memo: HashMap::new(),
         }
     }
 
-    fn to(&mut self, ip: &str) -> Vec<Hop> {
-        let mut active = HashSet::new();
-        self.walk(ip, &mut active)
+    /// 路径，以及「只走到了半路」这个事实。
+    fn to(&mut self, ip: &str) -> (Vec<Hop>, bool) {
+        match self.walk(ip, &mut HashSet::new()) {
+            Path::Complete(hops) => (hops, false),
+            Path::Incomplete(hops) => (hops, true),
+        }
     }
 
-    fn walk(&mut self, ip: &str, active: &mut HashSet<String>) -> Vec<Hop> {
+    fn walk(&mut self, ip: &str, active: &mut HashSet<String>) -> Path {
         if let Some(hops) = self.memo.get(ip) {
-            return hops.clone();
+            // 完整路径与从哪条链路走进来无关，记下来能省掉重复回推。
+            return Path::Complete(hops.clone());
         }
-        let next_hop = match self.routes.get(ip) {
-            Some(route) => route.next_hop,
-            None => return Vec::new(),
+        // 当前链上已经走过的节点；成环的判据在 `advance` 里比这一份。
+        active.insert(ip.to_string());
+        let path = self.advance(ip, active);
+        active.remove(ip);
+        if let Path::Complete(hops) = &path {
+            self.memo.insert(ip.to_string(), hops.clone());
+        }
+        path
+    }
+
+    /// 沿 `ip` 的下一跳往前走一步。下一跳就是自己时，这条路由直连目标。
+    fn advance(&mut self, ip: &str, active: &mut HashSet<String>) -> Path {
+        let Some(route) = self.routes.get(ip) else {
+            return Path::Incomplete(Vec::new());
         };
-        let next = match self.ip_by_peer.get(&next_hop) {
-            Some(next) => next.clone(),
-            None => return Vec::new(),
+        let Some(next) = self.ip_by_peer.get(&route.next_hop).cloned() else {
+            // 下一跳不在任何一条路由里：路径只能到这里。
+            return Path::Incomplete(Vec::new());
         };
         if next == ip {
-            self.memo.insert(ip.to_string(), Vec::new());
-            return Vec::new();
+            return Path::Complete(Vec::new());
         }
-        // 路由表异常时可能成环，沿当前递归栈截断就够了。
-        if !active.insert(ip.to_string()) {
-            return Vec::new();
+        if active.contains(&next) {
+            // 下一跳已经在当前链上：再走下去只会重复，停在这里。
+            return Path::Incomplete(Vec::new());
         }
-        let mut hops = self.walk(&next, active);
-        active.remove(ip);
         let hostname = self
             .routes
             .get(&next)
             .map(|route| route.hostname.clone())
             .unwrap_or_default();
-        hops.push(Hop { ip: next, hostname });
-        self.memo.insert(ip.to_string(), hops.clone());
-        hops
+        self.walk(&next, active).prepend(Hop { ip: next, hostname })
     }
 }
 
@@ -518,6 +565,7 @@ mod tests {
         assert_eq!(relay.path[0].ip, "10.126.126.2");
         assert_eq!(relay.path[0].hostname, "tencent-seed");
         assert_eq!(relay.latency_ms, Some(18.0));
+        assert!(!relay.path_incomplete, "两跳的链推得出来，就是完整的");
     }
 
     #[test]
@@ -576,6 +624,55 @@ mod tests {
         assert_eq!(node.tunnels, vec!["udp".to_string()]);
         assert_eq!(node.path.len(), 1);
         assert_eq!(node.path[0].ip, "10.126.126.2");
+    }
+
+    #[test]
+    fn a_merged_peer_id_still_resolves_as_a_next_hop() {
+        // 10.126.126.1 有两代 peer_id：7 有活隧道（展示行留它），8 是上一代的残留。
+        // 10.126.126.5 的下一跳写的是 8——被地址归并掉的那个 ID，路径仍要推得出来：
+        // 归并只发生在展示阶段，推导用的是完整的 peer_id 路由图。
+        let peers = vec![peer(7, &[("udp", 6)])];
+        let routes = vec![
+            route(7, "10.126.126.1/24", "ali-seed", 1, 7, 6),
+            route(8, "10.126.126.1/24", "ali-seed", 2, 2, 525),
+            route(2, "10.126.126.2/24", "tencent-seed", 1, 2, 5),
+            route(5, "10.126.126.5/24", "DESKTOP", 2, 8, 18),
+        ];
+        let rows = build_nodes(&peers, &routes, LocalNode::default());
+        assert_eq!(rows.len(), 3, "一台机器一行: {rows:?}");
+        let relay = rows.iter().find(|row| row.ip == "10.126.126.5").unwrap();
+        assert_eq!(relay.path_kind, "relay");
+        assert!(!relay.path_incomplete, "被归并的下一跳仍在图里: {relay:?}");
+        assert_eq!(relay.path.len(), 1);
+        assert_eq!(relay.path[0].ip, "10.126.126.1");
+        assert_eq!(relay.path[0].hostname, "ali-seed");
+    }
+
+    #[test]
+    fn a_cycle_is_reported_as_an_incomplete_path() {
+        // 4 的下一跳是 6，6 的下一跳是 4：路由表成环，推不出整条链路。
+        let routes = vec![
+            route(4, "10.126.126.4/24", "alpha", 3, 6, 50),
+            route(6, "10.126.126.6/24", "beta", 3, 4, 50),
+        ];
+        let rows = build_nodes(&[], &routes, LocalNode::default());
+        let node = rows.iter().find(|row| row.ip == "10.126.126.4").unwrap();
+        assert!(node.path_incomplete, "成环不是完整路径: {node:?}");
+        // 只走到环又回到自己的地方为止：这一段仍然给出来，但标明只有这一段。
+        assert_eq!(node.path.len(), 1);
+        assert_eq!(node.path[0].ip, "10.126.126.6");
+        assert_eq!(node.path[0].hostname, "beta");
+    }
+
+    #[test]
+    fn a_dangling_next_hop_is_reported_as_an_incomplete_path() {
+        // 下一跳 99 不在路由表里：只知道要绕行，绕到哪一段推不出来。
+        let routes = vec![route(5, "10.126.126.5/24", "DESKTOP", 2, 99, 18)];
+        let rows = build_nodes(&[], &routes, LocalNode::default());
+        let node = &rows[0];
+        assert_eq!(node.path_kind, "relay");
+        assert!(node.path_incomplete, "缺失下一跳不是「直接可达」: {node:?}");
+        assert!(node.path.is_empty());
     }
 
     #[test]

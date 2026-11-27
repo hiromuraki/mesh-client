@@ -6,7 +6,9 @@ import type { LogLine, NodeRow, SettingsInput, Snapshot, Status, View } from "./
 // 全局只有这一份状态：三个页面共用同一个快照，轮询也只有一处。
 const view = ref<View>("data");
 const snapshot = shallowRef<Snapshot | null>(null);
-const nodes = shallowRef<NodeRow[]>([]);
+// 节点表有两种"没有行"：core 没运行（空数组）与查询失败（null，拓扑未知）。
+// 折成同一个 [] 会让"查不出来"被渲染成"一台都没有"，所以原样保留 null。
+const nodes = shallowRef<NodeRow[] | null>(null);
 const logs = shallowRef<LogLine[]>([]);
 // 两种错误分开：轮询失败每次刷新都会重写，一次性操作（比如点"立即更新"）
 // 的结果不应该被下一次成功轮询抹掉。
@@ -44,7 +46,7 @@ export async function refresh(): Promise<void> {
       // 最近事件由后端筛好（客户端事件 + 内核告警），只回十几行，别拉整页日志。
       const [dashboard, events] = await Promise.all([bridge.dashboard(), bridge.events(12)]);
       snapshot.value = dashboard.snapshot ?? null;
-      nodes.value = dashboard.nodes ?? [];
+      nodes.value = dashboard.nodes;
       logs.value = events ?? [];
     } else if (view.value === "logs") {
       const [next, lines] = await Promise.all([bridge.snapshot(), bridge.logs()]);

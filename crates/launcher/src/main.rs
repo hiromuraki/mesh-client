@@ -99,21 +99,12 @@ fn root_dir() -> Result<PathBuf, String> {
 
 /// launch_installed 在 Windows 上拉起客户端就放手：客户端是独立进程，
 /// 启动器确认它起来之后退出。
+///
+/// 整个启动都在 `install` 里收口：有在途安装时，这一轮启动就是那次安装的确认，
+/// 与安装入口同一个出口；没有时才是「拉起已确认的那一份」。
 #[cfg(windows)]
 fn launch_installed(root: &Path) -> Result<i32, String> {
-    // 上次安装没走完会留下 bin.old，先回到那一套再启动。
-    install::recover(root)?;
-    // 拉起客户端就等于执行 `bin/` 里的代码，先确认它和清单对得上。
-    install::verify_current(root)?;
-    let exe = root.join("bin").join(launch::CLIENT_EXE);
-    if !exe.is_file() {
-        return Err(mesh_text::format(
-            mesh_text::id::LAUNCHER_ERROR_CLIENT_MISSING,
-            &[&exe.display()],
-        ));
-    }
-    log::line(mesh_text::get(mesh_text::id::LAUNCHER_TEXT_START_CLIENT));
-    launch::start(&exe, root, None)?;
+    install::launch_installed(root)?;
     Ok(0)
 }
 

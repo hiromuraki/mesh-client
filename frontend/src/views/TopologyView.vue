@@ -1,7 +1,14 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useClient } from "../client";
-import { joinOrDash, latencyText, pathText } from "../format";
+import {
+  joinOrDash,
+  latencyText,
+  pathText,
+  routeText,
+  TOPOLOGY_UNKNOWN_HINT,
+  TOPOLOGY_UNKNOWN_TEXT,
+} from "../format";
 import type { NodeRow } from "../api/types";
 
 const { nodes, snapshot } = useClient();
@@ -19,8 +26,12 @@ const picked = ref(new Set<string>());
 const focused = ref("");
 let seeded = false;
 
+// 节点表为 null 表示拓扑未知（core 在跑但查询失败）：它与「core 未运行、
+// 一台节点都没有」是两件事，界面要出提示而不是空图。
+const known = computed(() => nodes.value !== null);
+
 // 本机由中间的固定框表示，不参与勾选与环形排布。
-const candidates = computed(() => nodes.value.filter((node) => node.pathKind !== "me"));
+const candidates = computed(() => (nodes.value ?? []).filter((node) => node.pathKind !== "me"));
 
 const pickedList = computed(() => candidates.value.filter((node) => picked.value.has(node.ip)));
 
@@ -66,13 +77,24 @@ interface Edge {
   x2: number;
   y2: number;
   relay: boolean;
+  /** 路径只画到已知的那一段：这段之后链就断了，不能当成整条。 */
+  broken: boolean;
   label: string;
   lx: number;
   ly: number;
 }
 
-function edge(key: string, x1: number, y1: number, x2: number, y2: number, relay: boolean, label: string): Edge {
-  return { key, x1, y1, x2, y2, relay, label, lx: (x1 + x2) / 2, ly: (y1 + y2) / 2 };
+function edge(
+  key: string,
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  relay: boolean,
+  broken: boolean,
+  label: string,
+): Edge {
+  return { key, x1, y1, x2, y2, relay, broken, label, lx: (x1 + x2) / 2, ly: (y1 + y2) / 2 };
 }
 
 // 按 IP 排序再排布：心跳换一次顺序不能让整张图重排。
@@ -173,7 +195,17 @@ const tree = computed(() => {
   return { placed, parent };
 });
 
+// 中继除了"经过谁"还要看行本身：路径只走到半路时 path 可能一段都没有，
+// 这一行仍然是 relay。
+function isRelay(node: GNode): boolean {
+  return node.hop || node.row?.pathKind === "relay" || (node.row?.path?.length ?? 0) > 0;
+}
+
 // 每条边只画一次：从父节点到子节点。父节点不在图里时退回本机直连。
+//
+// 路径只走到半路（pathIncomplete）时，已经走到的那一段是真的，照常画出来；但
+// 通向目标的那一小段画成虚线并标注，说明链到此为止——否则图上会把半截链当成
+// 整条路径。中间跳是为画链路补出来的占位节点，不看它们的 pathIncomplete。
 const edges = computed<Edge[]>(() => {
   const { placed, parent } = tree.value;
   const pos = new Map(placed.map((item) => [item.node.ip, item]));
@@ -181,14 +213,26 @@ const edges = computed<Edge[]>(() => {
   for (const item of placed) {
     const ownerIp = parent.get(item.node.ip) ?? "";
     const owner = ownerIp ? pos.get(ownerIp) : undefined;
-    const relay = item.node.hop || (item.node.row?.path?.length ?? 0) > 0;
+    const relay = isRelay(item.node);
+    const broken = item.node.row?.pathIncomplete === true;
     if (owner) {
-      out.push(edge(item.node.ip, owner.x, owner.y, item.x, item.y, relay, ""));
+      out.push(edge(item.node.ip, owner.x, owner.y, item.x, item.y, relay, broken, broken ? "路径不完整" : ""));
       continue;
     }
     // 中间跳一定会被补进图里，只有数据自相矛盾时才会退回这条带标签的直连。
     const hop = item.node.row?.path?.at(-1) ?? null;
-    out.push(edge("root-" + item.node.ip, CX, CY, item.x, item.y, relay, hop ? "经 " + (hop.hostname || hop.ip) : ""));
+    out.push(
+      edge(
+        "root-" + item.node.ip,
+        CX,
+        CY,
+        item.x,
+        item.y,
+        relay,
+        broken,
+        broken ? "路径不完整" : hop ? "经 " + (hop.hostname || hop.ip) : "",
+      ),
+    );
   }
   return out;
 });
@@ -212,14 +256,9 @@ const canvas = computed(() => {
   return { x: (minX + maxX - w) / 2, y: (minY + maxY - h) / 2, w, h };
 });
 
-const focusedNode = computed(() => nodes.value.find((node) => node.ip === focused.value) ?? null);
+const focusedNode = computed(() => (nodes.value ?? []).find((node) => node.ip === focused.value) ?? null);
 
-const focusedRoute = computed(() => {
-  const node = focusedNode.value;
-  if (!node) return "—";
-  if (!node.path?.length) return "直接可达";
-  return node.path.map((hop) => hop.hostname || hop.ip).join(" → ");
-});
+const focusedRoute = computed(() => (focusedNode.value ? routeText(focusedNode.value) : "—"));
 
 const directCount = computed(() => pickedList.value.filter((node) => node.pathKind === "direct").length);
 const relayCount = computed(() => pickedList.value.filter((node) => node.pathKind === "relay").length);
@@ -229,7 +268,7 @@ const relayCount = computed(() => pickedList.value.filter((node) => node.pathKin
   <div class="topo">
     <aside class="picker">
       <div class="picker-head">
-        <span>节点 {{ candidates.length }} 个</span>
+        <span>节点 {{ known ? candidates.length : "—" }} 个</span>
         <button type="button" @click="toggleAll">{{ allPicked ? "全不选" : "全选" }}</button>
       </div>
       <div class="list">
@@ -252,12 +291,17 @@ const relayCount = computed(() => pickedList.value.filter((node) => node.pathKin
             </span>
           </span>
         </label>
-        <div v-if="!candidates.length" class="empty">暂无节点数据。</div>
+        <div v-if="!candidates.length" class="empty">{{ known ? "暂无节点数据。" : TOPOLOGY_UNKNOWN_TEXT }}</div>
       </div>
     </aside>
 
     <section class="canvas">
-      <div v-if="!pickedList.length" class="empty-state">
+      <div v-if="!known" class="empty-state">
+        <strong>{{ TOPOLOGY_UNKNOWN_TEXT }}</strong>
+        <p>{{ TOPOLOGY_UNKNOWN_HINT }}</p>
+      </div>
+
+      <div v-else-if="!pickedList.length" class="empty-state">
         <strong>还没有选中节点</strong>
         <p>在左侧勾选节点，这里会画出它们到本机的路径。</p>
         <button v-if="candidates.length" type="button" @click="toggleAll">全选 {{ candidates.length }} 个节点</button>
@@ -271,7 +315,7 @@ const relayCount = computed(() => pickedList.value.filter((node) => node.pathKin
           :y1="line.y1"
           :x2="line.x2"
           :y2="line.y2"
-          :class="{ relay: line.relay }"
+          :class="{ relay: line.relay, broken: line.broken }"
           class="edge"
         />
 
@@ -302,9 +346,10 @@ const relayCount = computed(() => pickedList.value.filter((node) => node.pathKin
         </g>
       </svg>
 
-      <footer class="legend">
+      <footer v-if="known" class="legend">
         <span class="key direct">直连</span>
         <span class="key relay">中继</span>
+        <span class="key broken">路径不完整</span>
         <span class="sep">·</span>
         <span>已选 {{ pickedList.length }} / {{ candidates.length }} · 直连 {{ directCount }} · 中继 {{ relayCount }}</span>
       </footer>
@@ -356,6 +401,8 @@ svg{flex:1 1 0;min-height:0;width:100%;display:block;padding:8px 12px 0}
 
 .edge{stroke:#d7dde5;stroke-width:1.4}
 .edge.relay{stroke:var(--orange);stroke-dasharray:5 4;opacity:.75}
+/* 链只走到这里：点线比中继的虚线更"断"，并配一条「路径不完整」的边标签。 */
+.edge.broken{stroke:var(--faint);stroke-dasharray:2 3;opacity:.9}
 
 .edge-label rect{fill:#fff;stroke:var(--line-soft)}
 .edge-label text{font-size:10.5px;fill:var(--muted)}
@@ -383,11 +430,12 @@ svg{flex:1 1 0;min-height:0;width:100%;display:block;padding:8px 12px 0}
 .empty-state button{margin-top:10px;padding:4px 12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);font:inherit;font-size:12px;cursor:pointer}
 .empty-state button:hover{background:var(--wash)}
 
-.legend{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:7px 18px 11px;font-size:11px;color:var(--muted)}
+.legend{flex:0 0 auto;display:flex;align-items:center;flex-wrap:wrap;gap:8px;padding:7px 18px 11px;font-size:11px;color:var(--muted)}
 .legend .key{display:inline-flex;align-items:center;gap:5px}
 .legend .key::before{content:"";width:18px;height:0;border-top-width:2px;border-top-style:solid}
 .legend .key.direct::before{border-top-color:#cbd5e1}
 .legend .key.relay::before{border-top-color:var(--orange);border-top-style:dashed}
+.legend .key.broken::before{border-top-color:var(--faint);border-top-style:dotted}
 .legend .sep{opacity:.5}
 
 .detail{position:absolute;right:16px;bottom:44px;width:212px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--card)}

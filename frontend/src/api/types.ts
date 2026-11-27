@@ -1,4 +1,4 @@
-// 与 Go 侧 engine/binding 的 JSON 结构一一对应（见 internal/engine/views.go）。
+// 与 Rust 侧 engine 发出的 JSON 一一对应（见 crates/engine/src/views.rs）。
 
 export type View = "data" | "logs" | "settings";
 
@@ -59,6 +59,11 @@ export interface NodeRow {
   pathKind: string;
   /** 从本机到该节点途经的中间节点，按顺序排列，不含目标自身；直连为空。 */
   path: Hop[];
+  /**
+   * `path` 是否只走到了半路：路由表成环或下一跳不在表里时推不出整条链路，
+   * 此时 `path` 是已经走到的那一段，不能当成完整路径展示。
+   */
+  pathIncomplete: boolean;
   hops: number;
   /** 本行用到的隧道协议，已去重排序；本机那一行是整张网的聚合。 */
   tunnels: string[];

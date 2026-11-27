@@ -71,9 +71,20 @@ pub enum Cmd {
     },
     Core(mesh_core::Event),
     Stun(mesh_etrpc::StunInfo),
+    /// 一份下载任务的完成消息。带着任务代次：撤回、同版本重发与换任务之后，
+    /// 旧任务的结果不许消费新状态（F5）。
     Download {
-        version: String,
+        task: update::DownloadTask,
         result: Result<PathBuf, String>,
+    },
+    /// 启动器替换的结果：盘上那份换了没有（F6）。
+    ///
+    /// `retry` 表示这次只是安装根被启动器占着（F4）：不算结论，下一轮再来。
+    Launcher {
+        version: String,
+        sha256: String,
+        replaced: bool,
+        retry: bool,
     },
     Settings(SettingsInput, Reply<Result<Snapshot, String>>),
     Reset(Reply<Result<Snapshot, String>>),
@@ -161,8 +172,11 @@ pub(crate) struct Engine {
     pub(crate) revive: Option<Revive>,
     pub(crate) auth_fails: u32,
     pub(crate) update: update::UpdateState,
-    pub(crate) auto_update: bool,
+    /// 自动安装去重用的摘要（与服务端 offer 同一判据：版本号重发内容会变）。
     pub(crate) auto_tried: Option<String>,
+    /// 下载任务的代次，只增不减：换 offer 会重置 `update`，代次不能跟着重置，
+    /// 否则旧任务的完成消息会认领新任务。
+    pub(crate) next_download: u64,
     /// 启动器槽位的本地状态。与 `update` 分开：那份会随客户端包 offer 重建。
     pub(crate) launcher: update::LauncherState,
     /// 开机自启任务是否存在。查询要起一个 `schtasks` 进程，所以缓存起来，由
@@ -258,12 +272,11 @@ pub fn spawn(
     });
 
     // 启动器的两件事实只读一次：安装根下那份的摘要，与它自报的版本号。
-    let launcher = update::LauncherState {
-        sum: sync::file_digest(&config.root.join(mesh_install::platform::launcher_name()))
-            .unwrap_or_default(),
-        version: mesh_install::layout::read_launcher_version(&config.root),
-        ..update::LauncherState::default()
-    };
+    //
+    // 这里读到的 `launcher.json` 描述的是「上一次被拉起的那个启动器」，本进程
+    // 不重置也不重读：替换成功之后盘上那份已经是新的，事实由替换结果更新
+    // （见 `Engine::on_launcher_result`），只有下一次启动才是新的在跑。
+    let launcher = update::LauncherState::read(&config.root);
     let engine = Engine {
         store,
         cell,
@@ -286,8 +299,8 @@ pub fn spawn(
         revive: None,
         auth_fails: 0,
         update: update::UpdateState::default(),
-        auto_update: false,
         auto_tried: None,
+        next_download: 0,
         launcher,
         autostart_on: false,
         identity: IdentityMeta::default(),
@@ -534,8 +547,17 @@ impl Engine {
                 self.stun = stun;
                 false
             }
-            Cmd::Download { version, result } => {
-                self.on_download(version, result);
+            Cmd::Download { task, result } => {
+                self.on_download(task, result);
+                false
+            }
+            Cmd::Launcher {
+                version,
+                sha256,
+                replaced,
+                retry,
+            } => {
+                self.on_launcher_result(version, sha256, replaced, retry);
                 false
             }
             Cmd::Settings(input, reply) => {
@@ -639,9 +661,12 @@ impl Engine {
         }
         let res = heartbeat.unwrap_or_default();
         if res.app_update.is_some() {
-            self.offer_update(&api, res.app_update.as_ref());
+            self.offer_update(res.app_update.as_ref());
+            // 上一轮没拿到安装根写权的那份包：心跳就是重试提交的节拍。
+            self.resume_commit();
             self.auto_apply();
         } else {
+            // 服务端不再提供这份 offer（撤回）：显式迁移，不让旧任务的结果续命。
             self.clear_stale_update();
         }
         // 启动器单独一路：控制面每次都带，客户端自己比摘要；下载放后台跑。

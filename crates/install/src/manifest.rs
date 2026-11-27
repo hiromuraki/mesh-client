@@ -150,11 +150,18 @@ fn hex_ok(value: &str, len: usize) -> bool {
 ///
 /// `version.json` 不在 `files` 里——它自己写不进自己的摘要。
 fn file_name_ok(name: &str) -> bool {
+    is_plain_file_name(name) && name != layout::MANIFEST
+}
+
+/// 单层普通文件名：非空、≤128 字节、不含路径分隔符与控制字符、不是 `.`/`..`。
+///
+/// 解包那一侧用同一条判据：清单的合法域只允许这个形状，解包再按另一套规则收，
+/// 就等于给路径穿越留第二种解释。
+pub fn is_plain_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 128
         && name != "."
         && name != ".."
-        && name != layout::MANIFEST
         && !name.contains(['/', '\\'])
         && !name.chars().any(char::is_control)
 }

@@ -1,7 +1,20 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { applyUpdate, reconnect, select, setActionError, useClient } from "../client";
-import { clockTime, dateTime, errorMessage, joinOrDash, latencyText, pathText, releaseVersion, statusText } from "../format";
+import {
+  clockTime,
+  dateTime,
+  errorMessage,
+  joinOrDash,
+  latencyText,
+  pathText,
+  releaseVersion,
+  routeText,
+  statusText,
+  TOPOLOGY_UNKNOWN_HINT,
+  TOPOLOGY_UNKNOWN_NOTE,
+  TOPOLOGY_UNKNOWN_TEXT,
+} from "../format";
 import type { NodeRow } from "../api/types";
 import TopologyView from "./TopologyView.vue";
 
@@ -10,9 +23,15 @@ const { snapshot, nodes, logs, status, restarting } = useClient();
 // 节点区域的两种呈现：列表与拓扑图。二者用同一份 nodes 数据，只是画法不同。
 const nodeTab = ref<"list" | "topology">("list");
 
+// 节点表有三种事实：core 未运行（空数组）、查询失败（null，拓扑未知）、有行。
+// 未知时表格与拓扑图都不渲染，指标也写「—」——不能把「查不出来」说成 0 台。
+const known = computed(() => nodes.value !== null);
+const nodeCount = computed(() => (nodes.value === null ? null : nodes.value.length));
+
 // 本机在节点表里单独占一行，指标和列表只统计其余节点。
-const remote = computed(() => nodes.value.filter((node) => node.pathKind !== "me"));
-const localRow = computed(() => nodes.value.find((node) => node.pathKind === "me") ?? null);
+// 这两个派生值只在 known 为真时被渲染，未知时的空数组合并不进画面。
+const remote = computed(() => (nodes.value ?? []).filter((node) => node.pathKind !== "me"));
+const localRow = computed(() => (nodes.value ?? []).find((node) => node.pathKind === "me") ?? null);
 const directCount = computed(() => remote.value.filter((node) => node.pathKind === "direct").length);
 const relayCount = computed(() => remote.value.filter((node) => node.pathKind === "relay").length);
 
@@ -99,12 +118,6 @@ function sourceShort(source: string): string {
 
 // 后端已经筛成「客户端事件 + 内核告警」，这里直接用。
 const recent = computed(() => logs.value);
-
-// 路径列只写中间跳；直连没有中间跳，直接说明。
-function routeText(node: NodeRow): string {
-  if (!node.path?.length) return "直接可达";
-  return node.path.map((hop) => hop.hostname || hop.ip).join(" → ");
-}
 
 const copied = ref("");
 let copyTimer = 0;
@@ -217,39 +230,44 @@ async function runApplyUpdate(): Promise<void> {
         <section class="metrics">
           <div>
             <span class="k">在线节点</span>
-            <span class="v">{{ remote.length }}</span>
-            <span class="n">另含本机 1 台</span>
+            <span class="v">{{ known ? remote.length : "—" }}</span>
+            <span class="n">{{ known ? "另含本机 1 台" : TOPOLOGY_UNKNOWN_NOTE }}</span>
           </div>
           <div>
             <span class="k">直连</span>
-            <span class="v">{{ directCount }}</span>
-            <span class="n">全部 1 跳</span>
+            <span class="v">{{ known ? directCount : "—" }}</span>
+            <span class="n">{{ known ? "全部 1 跳" : TOPOLOGY_UNKNOWN_NOTE }}</span>
           </div>
           <div>
             <span class="k">中继</span>
-            <span class="v" :class="{ warn: relayCount > 0 }">{{ relayCount }}</span>
-            <span class="n">{{ relayCount ? "存在绕行路径" : "全部直连" }}</span>
+            <span class="v" :class="{ warn: known && relayCount > 0 }">{{ known ? relayCount : "—" }}</span>
+            <span class="n">{{ !known ? TOPOLOGY_UNKNOWN_NOTE : relayCount ? "存在绕行路径" : "全部直连" }}</span>
           </div>
           <div>
             <span class="k">平均延迟</span>
             <span class="v">{{ latency ? latency.avg : "—" }}<small v-if="latency">ms</small></span>
-            <span class="n">{{ latency ? latency.min + " – " + latency.max + " ms" : "暂无数据" }}</span>
+            <span class="n">{{ latency ? latency.min + " – " + latency.max + " ms" : known ? "暂无数据" : TOPOLOGY_UNKNOWN_NOTE }}</span>
           </div>
         </section>
 
         <section class="nodes">
           <header class="nodes-head">
             <h2>节点</h2>
-            <span class="count">{{ nodes.length }}</span>
+            <span class="count">{{ nodeCount ?? "—" }}</span>
             <div class="subtabs">
               <button type="button" :class="{ active: nodeTab === 'list' }" @click="nodeTab = 'list'">列表</button>
               <button type="button" :class="{ active: nodeTab === 'topology' }" @click="nodeTab = 'topology'">拓扑</button>
             </div>
             <span class="spacer" />
-            <span class="legend"><i class="sw direct" />直连 {{ directCount }}<i class="sw relay" />中继 {{ relayCount }}</span>
+            <span class="legend"><i class="sw direct" />直连 {{ known ? directCount : "—" }}<i class="sw relay" />中继 {{ known ? relayCount : "—" }}</span>
           </header>
 
           <div v-if="nodeTab === 'topology'" class="topo-wrap"><TopologyView /></div>
+
+          <div v-else-if="!known" class="unknown">
+            <strong>{{ TOPOLOGY_UNKNOWN_TEXT }}</strong>
+            <span>{{ TOPOLOGY_UNKNOWN_HINT }}</span>
+          </div>
 
           <table v-else>
             <thead>
@@ -320,7 +338,7 @@ async function runApplyUpdate(): Promise<void> {
               </tr>
             </tbody>
           </table>
-          <div v-if="nodeTab === 'list' && !remote.length" class="empty">暂无节点数据。</div>
+          <div v-if="nodeTab === 'list' && known && !remote.length" class="empty">暂无节点数据。</div>
         </section>
       </div>
 
@@ -523,6 +541,10 @@ tbody tr.self:hover{background:transparent}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
 
 .empty{padding:14px 2px;font-size:12px;color:var(--faint)}
+
+/* 拓扑未知：只说清楚"查不到"，不摆空表，也不占整页当错误横幅。 */
+.unknown{display:flex;flex-direction:column;gap:3px;padding:14px 2px;font-size:12px;color:var(--muted)}
+.unknown strong{font-size:12.5px;font-weight:500;color:var(--ink)}
 
 button{padding:5px 12px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink);font:inherit;font-size:12px;cursor:pointer}
 button.primary{border-color:var(--blue);background:var(--blue);color:#fff}
