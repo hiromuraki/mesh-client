@@ -201,8 +201,10 @@ fn save_cred(harness: &Harness, id: &str) {
         .store
         .save_credential(&Credential {
             id: id.to_string(),
-            secret: format!("secret-{id}"),
+            // 磁盘上的私钥是 base64（内容不重要，但必须能编解码往返）。
+            secret: "Y3JlZC0x".to_string(),
             expires_at: 0,
+            protect: String::new(),
         })
         .unwrap();
 }
@@ -353,7 +355,7 @@ fn a_new_config_is_written_and_the_core_started() {
             match spec.identity {
                 mesh_core::Identity::Credential { id, secret } => {
                     assert_eq!(id, "cred-1");
-                    assert_eq!(secret, "secret-cred-1");
+                    assert_eq!(secret, "Y3JlZC0x");
                 }
                 _ => panic!("凭据节点应当用 ET_CREDENTIAL"),
             }

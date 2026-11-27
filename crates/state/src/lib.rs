@@ -9,6 +9,22 @@
 
 pub mod hints;
 
+#[cfg(windows)]
+mod win;
+
+/// 收紧 `config/` 的 DACL：只留当前用户、SYSTEM、Administrators。
+///
+/// Unix 上不需要：那里的权限就是 0600，`atomic_replace` 已经按它建文件。
+#[cfg(windows)]
+fn harden_dir(dir: &Path) -> io::Result<()> {
+    win::harden_dir(dir)
+}
+
+#[cfg(not(windows))]
+fn harden_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 use ed25519_dalek::SigningKey;
 use mesh_install::atomic_replace;
 use mesh_install::layout;
@@ -86,6 +102,10 @@ pub struct ClientConfig {
 pub struct Credential {
     pub id: String,
     pub secret: String,
+    /// 私钥的保护方式。Windows 上写 `dpapi`，表示 `secret` 是 DPAPI 密文的 base64；
+    /// Unix 上不写（靠 0600）。跨平台搬 config 目录时靠它报错，而不是解出一把错密钥。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub protect: String,
     /// 控制面给的过期时刻（unix 秒）。只在签发的那一次心跳响应里出现，
     /// 记下来只为面板显示；0 表示没有记录（早期版本写下的文件）。
     #[serde(skip_serializing_if = "is_zero")]
@@ -116,6 +136,9 @@ impl Store {
         }
         let dir = root.join(layout::CONFIG);
         fs::create_dir_all(&dir).map_err(|err| Error::io(&dir, err))?;
+        // 目录一建好就收权限，赶在写任何密钥之前：继承来的 ACL 可能对本地所有账户
+        // 开放，晚一步就等于先把私钥暴露过一次。
+        harden_dir(&dir).map_err(|err| Error::io(&dir, err))?;
         Ok(Store {
             root: root.to_path_buf(),
             keys: Mutex::new(Keys::default()),
@@ -263,11 +286,13 @@ impl Store {
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(Error::io(&path, err)),
         };
-        let credential: Credential =
+        let mut credential: Credential =
             serde_json::from_str(&text).map_err(|err| Error::parse(&path, err.to_string()))?;
         if credential.secret.is_empty() {
             return Ok(None);
         }
+        credential.secret = open_secret(&path, &credential.secret, &credential.protect)?;
+        credential.protect.clear();
         Ok(Some(credential))
     }
 
@@ -277,7 +302,14 @@ impl Store {
         if credential.secret.is_empty() {
             return Err(Error::parse(&path, "凭据私钥为空"));
         }
-        let mut text = serde_json::to_string_pretty(credential)
+        let (secret, protect) = seal_secret(&path, &credential.secret)?;
+        let stored = Credential {
+            id: credential.id.clone(),
+            secret,
+            expires_at: credential.expires_at,
+            protect,
+        };
+        let mut text = serde_json::to_string_pretty(&stored)
             .map_err(|err| Error::parse(&path, err.to_string()))?;
         text.push('\n');
         atomic_replace(&path, text.as_bytes(), 0o600).map_err(|err| Error::io(&path, err))
@@ -328,6 +360,50 @@ impl Store {
         // 那种情况下继续用这把锁里的缓存与“重新读一遍磁盘”没有区别。
         self.keys.lock().unwrap_or_else(|err| err.into_inner())
     }
+}
+
+/// 凭据私钥落盘前的编码。返回 (写进 secret 的值, protect 标记)。
+///
+/// 入参出参都是 base64 的 32 字节私钥（线上格式），这里只负责「落盘形态」。
+#[cfg(windows)]
+fn seal_secret(path: &Path, secret: &str) -> Result<(String, String), Error> {
+    let raw = BASE64
+        .decode(secret)
+        .map_err(|err| Error::parse(path, format!("凭据私钥不是 base64: {err}")))?;
+    let blob = win::protect(&raw).map_err(|err| Error::io(path, err))?;
+    Ok((BASE64.encode(blob), "dpapi".to_string()))
+}
+
+#[cfg(not(windows))]
+fn seal_secret(_path: &Path, secret: &str) -> Result<(String, String), Error> {
+    Ok((secret.to_string(), String::new()))
+}
+
+/// seal_secret 的逆操作：把磁盘上的形态解回 base64 私钥。
+#[cfg(windows)]
+fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<String, Error> {
+    if protect != "dpapi" {
+        return Err(Error::parse(
+            path,
+            "凭据是明文写的：删掉这个文件，等控制面重签一张",
+        ));
+    }
+    let blob = BASE64
+        .decode(stored)
+        .map_err(|err| Error::parse(path, format!("凭据密文不是 base64: {err}")))?;
+    let raw = win::unprotect(&blob).map_err(|err| Error::io(path, err))?;
+    Ok(BASE64.encode(raw))
+}
+
+#[cfg(not(windows))]
+fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<String, Error> {
+    if !protect.is_empty() {
+        return Err(Error::parse(
+            path,
+            "凭据是用 Windows DPAPI 加密的，本机解不开：删掉这个文件，等控制面重签一张",
+        ));
+    }
+    Ok(stored.to_string())
 }
 
 /// 注册用的 base64 公钥。
@@ -447,12 +523,14 @@ mod tests {
                 id: "id".into(),
                 secret: String::new(),
                 expires_at: 0,
+                protect: String::new(),
             })
             .is_err());
         let credential = Credential {
             id: "9b2f".into(),
             secret: "c2VjcmV0".into(),
             expires_at: 1_798_000_000,
+            protect: String::new(),
         };
         store.save_credential(&credential).unwrap();
         assert_eq!(store.load_credential().unwrap(), Some(credential));
@@ -472,5 +550,72 @@ mod tests {
             Some("hostname = \"laptop\"\n")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+    /// 收紧之后，身份目录只留当前用户、SYSTEM、Administrators 三条 ACE，
+    /// 而且不再继承安装根所在卷的默认 ACL。
+    #[cfg(windows)]
+    #[test]
+    fn hardening_keeps_only_three_principals() {
+        let dir = temp_root("acl");
+        let config = dir.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        // 先放一个文件：它继承的是临时目录的 ACL，收紧目录后必须一并被改写。
+        let key = config.join("client.key");
+        std::fs::write(&key, b"seed").unwrap();
+        win::harden_dir(&config).unwrap();
+        let output = std::process::Command::new("icacls")
+            .arg(&config)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(text.contains("SYSTEM"), "{text}");
+        assert!(text.contains("Administrators"), "{text}");
+        assert!(
+            !text.contains("BUILTIN\\Users"),
+            "继承来的 Users 权限还在: {text}"
+        );
+        assert!(
+            !text.contains("Authenticated Users"),
+            "继承来的 Authenticated Users 权限还在: {text}"
+        );
+        // 目录里已有的密钥文件也要跟着收紧，否则收紧目录只是收了个空壳。
+        let file_acl = std::process::Command::new("icacls")
+            .arg(&key)
+            .output()
+            .unwrap();
+        let file_text = String::from_utf8_lossy(&file_acl.stdout);
+        assert!(
+            !file_text.contains("Authenticated Users"),
+            "密钥文件仍带着继承权限: {file_text}"
+        );
+        assert!(file_text.contains("SYSTEM"), "{file_text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 凭据落盘是 DPAPI 密文：文件里看不到私钥，读回来还是原来那把。
+    #[cfg(windows)]
+    #[test]
+    fn a_credential_is_encrypted_at_rest() {
+        let dir = temp_root("dpapi");
+        let store = Store::open(&dir).unwrap();
+        let secret = BASE64.encode([7u8; 32]);
+        let credential = Credential {
+            id: "cred-1".to_string(),
+            secret: secret.clone(),
+            expires_at: 42,
+            protect: String::new(),
+        };
+        store.save_credential(&credential).unwrap();
+
+        let text = std::fs::read_to_string(store.credential_path()).unwrap();
+        assert!(text.contains("\"dpapi\""), "{text}");
+        assert!(!text.contains(&secret), "私钥明文落盘了: {text}");
+
+        let loaded = store.load_credential().unwrap().unwrap();
+        assert_eq!(loaded.secret, secret);
+        assert!(loaded.protect.is_empty(), "内存里不该留下保护标记");
+        assert_eq!(loaded.id, "cred-1");
+        assert_eq!(loaded.expires_at, 42);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

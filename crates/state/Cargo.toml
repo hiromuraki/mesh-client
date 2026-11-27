@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# DACL 与 DPAPI：两件只能靠系统 API 做的事（见 src/win.rs）。
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_System_Threading",
+] }
+
 [dependencies]
 # mesh-install 提供 atomic_replace：本地文件要么是旧的、要么是新的，不能写一半。
 mesh-install = { workspace = true }

@@ -615,6 +615,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "toml 0.8.23",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

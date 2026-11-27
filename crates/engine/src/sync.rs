@@ -372,6 +372,7 @@ impl Engine {
             id: heartbeat.credential_id.clone(),
             secret: heartbeat.credential.clone(),
             expires_at: heartbeat.credential_expiry,
+            protect: String::new(),
         };
         if let Err(err) = self.store.save_credential(&credential) {
             let msg = format!("保存凭据失败: {err}");
