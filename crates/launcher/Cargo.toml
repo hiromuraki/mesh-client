@@ -17,6 +17,10 @@ zstd = { workspace = true }
 tar = { workspace = true }
 sha2 = { workspace = true }
 
+[dev-dependencies]
+# 只有测试用得到签发方：造一份签名正确的清单，证明「验签能过」这条路径真的能过。
+ed25519-dalek = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",

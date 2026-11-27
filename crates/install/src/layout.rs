@@ -111,7 +111,7 @@ mod tests {
         std::fs::create_dir_all(root.join(BIN)).unwrap();
         std::fs::write(
             root.join(BIN).join(MANIFEST),
-            r#"{"version":"2026.11.26-13","files":{}}"#,
+            r#"{"version":"2026.11.26-13","slot":"client","platform":"windows/amd64","files":{},"signature":"00"}"#,
         )
         .unwrap();
         assert_eq!(read_version(&root).unwrap(), "2026.11.26-13");
@@ -133,7 +133,7 @@ mod tests {
         ));
         std::fs::write(
             root.join(BIN).join(MANIFEST),
-            r#"{"version":"bad/version","files":{}}"#,
+            r#"{"version":"bad/version","slot":"client","platform":"windows/amd64","files":{},"signature":"00"}"#,
         )
         .unwrap();
         assert!(matches!(

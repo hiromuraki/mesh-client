@@ -13,3 +13,8 @@ fs4 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# 清单签名。启动器也要验，所以验签代码在这里而不是 mesh-remote：那条线会把
+# ureq、serde、rand、httpdate 全拖进一个只需要 verifier 的二进制。
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }

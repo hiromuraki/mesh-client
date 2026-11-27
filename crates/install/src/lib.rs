@@ -12,6 +12,7 @@ pub mod layout;
 pub mod lock;
 pub mod manifest;
 pub mod platform;
+pub mod signing;
 pub mod version;
 
 use std::fs::{File, OpenOptions};

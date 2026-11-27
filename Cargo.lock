@@ -561,10 +561,13 @@ dependencies = [
 name = "mesh-install"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "fs4",
+ "hex",
  "mesh-text",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
 ]
 
@@ -572,6 +575,7 @@ dependencies = [
 name = "mesh-launcher"
 version = "0.1.0"
 dependencies = [
+ "ed25519-dalek",
  "mesh-install",
  "mesh-text",
  "sha2",

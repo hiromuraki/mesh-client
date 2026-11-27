@@ -4,6 +4,7 @@ use crate::log;
 use mesh_install::failures::Failures;
 use mesh_install::layout;
 use mesh_install::manifest::Manifest;
+use mesh_install::signing;
 use mesh_install::version;
 use mesh_text::id;
 use sha2::{Digest, Sha256};
@@ -135,6 +136,9 @@ pub(crate) fn install_from_file(
     let old_version = installed_version(&bin);
 
     let manifest = read_manifest(pkg)?;
+    // 验签放在动 bin/ 之前：坏包不该换掉唯一的回滚材料，也不该走到「装完才发现
+    // 起不来」那一步。降级检查与失败计数都在后面，因为它们只读、给出的错误更具体。
+    check_manifest_signature(&manifest, signing::RELEASE_PUBLIC_KEY)?;
     log::line(&mesh_text::format(
         id::LAUNCHER_TEXT_INSTALLING,
         &[&manifest.version, &manifest.files.len()],
@@ -303,14 +307,34 @@ fn unpack(pkg: &Path, dest: &Path) -> Result<(), String> {
 
 /// verify_current 在拉起客户端之前校验 `bin/` 与它自带的清单一致。
 ///
-/// 清单是包内带的，所以它证明不了「这份 bin 出自发布方」——那由客户端验签负责。
-/// 它能证明的是「这份 bin 是一次完整安装的结果」：有人换了二进制却没换清单、
-/// 解包只写了一半、磁盘坏了一块，都会在这里被拦住。11 MiB 的包实测约 30 ms，
-/// 与「加载一个 DLL」同一个量级。
+/// 两道闸，顺序有意义：先验清单的签名（谁能改 `bin/` 里的文件，却改不出发布私钥
+/// 的签名），再逐文件比对摘要（解包只写了一半、磁盘坏了一块、有人换了二进制却
+/// 没换清单，都在这里被拦住）。11 MiB 的包实测约 30 ms，与「加载一个 DLL」同一个量级。
 pub fn verify_current(root: &Path) -> Result<(), String> {
+    verify_current_signed_by(root, signing::RELEASE_PUBLIC_KEY)
+}
+
+/// 用给定公钥验当前 `bin/`。轮换公钥与测试走这一条。
+pub fn verify_current_signed_by(root: &Path, public_hex: &str) -> Result<(), String> {
     let manifest = mesh_install::manifest::read(&layout::manifest_path(root))
         .map_err(|err| err.to_string())?;
+    check_manifest_signature(&manifest, public_hex)?;
     verify(&root.join(layout::BIN), &manifest)
+}
+
+/// 清单必须由发布私钥签出。
+///
+/// 文件摘要只证明「这份 bin 与清单一致」：清单自己也是可以写在 `bin/` 里的一个
+/// 文件，被换掉时那条判断就没有意义了。空签名单独报一条，因为它的成因不同
+/// （手工造的包，而不是被改过的包）。
+fn check_manifest_signature(manifest: &Manifest, public_hex: &str) -> Result<(), String> {
+    if manifest.signature.is_empty() {
+        return Err(mesh_text::get(id::LAUNCHER_ERROR_MANIFEST_UNSIGNED).to_string());
+    }
+    if !manifest.verify_with(public_hex) {
+        return Err(mesh_text::get(id::LAUNCHER_ERROR_MANIFEST_SIGNATURE_INVALID).to_string());
+    }
+    Ok(())
 }
 
 /// verify 只认清单里列出的文件：多出来的忽略，少了或对不上就判包不可用。
@@ -420,6 +444,7 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     fn temp_root(tag: &str) -> PathBuf {
@@ -465,6 +490,48 @@ mod tests {
         )
     }
 
+    fn test_key() -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[5u8; 32])
+    }
+
+    fn public_hex(key: &ed25519_dalek::SigningKey) -> String {
+        hex(&key.verifying_key().to_bytes())
+    }
+
+    fn sha256_bytes(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        hex(&hasher.finalize())
+    }
+
+    /// 造一份签名正确的清单：摘要按文件内容算，签的是清单摘要。
+    fn signed_manifest(
+        key: &ed25519_dalek::SigningKey,
+        version: &str,
+        entries: &[(&str, &[u8])],
+    ) -> String {
+        use ed25519_dalek::Signer;
+        let files: BTreeMap<String, String> = entries
+            .iter()
+            .map(|(name, body)| (name.to_string(), sha256_bytes(body)))
+            .collect();
+        let message = signing::manifest_string(
+            signing::SLOT_CLIENT,
+            "windows/amd64",
+            version,
+            &signing::files_digest(&files),
+        );
+        let signature = hex(&key.sign(message.as_bytes()).to_bytes());
+        let pairs = files
+            .iter()
+            .map(|(name, sha)| format!("{name:?}:{sha:?}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            r#"{{"version":"{version}","slot":"client","platform":"windows/amd64","files":{{{pairs}}},"signature":"{signature}"}}"#
+        )
+    }
+
     /// 安装失败不能删用户给的文件：--file 收的是用户自己的包，客户端交接时那个
     /// 路径（<root>/update.tar.zst）才是下载下来的、可以删的那一份。
     #[test]
@@ -473,21 +540,73 @@ mod tests {
         let bin = root.join(layout::BIN);
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::write(bin.join("mesh-client.exe"), b"client").unwrap();
-        let sum = sha256_file(&bin.join("mesh-client.exe")).unwrap();
+        let key = test_key();
         std::fs::write(
             layout::manifest_path(&root),
-            format!(r#"{{"version":"2026.11.27-1","files":{{"mesh-client.exe":"{sum}"}}}}"#),
+            signed_manifest(&key, "2026.11.27-1", &[("mesh-client.exe", b"client")]),
         )
         .unwrap();
+        let public = public_hex(&key);
 
-        assert!(verify_current(&root).is_ok(), "一份完整的 bin 应当通过");
+        assert!(
+            verify_current_signed_by(&root, &public).is_ok(),
+            "一份完整且签过名的 bin 应当通过"
+        );
         // 换了二进制却没换清单：这正是「有人动过安装根」的形态。
         std::fs::write(bin.join("mesh-client.exe"), b"evil").unwrap();
         assert!(
-            verify_current(&root).is_err(),
+            verify_current_signed_by(&root, &public).is_err(),
             "换掉 bin 里的文件就必须拒绝启动"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 清单与 bin/ 完全一致，但签名不是这个公钥签的：文件摘要那一关会全过，
+    /// 只有验签能拦住——这正是加签名的理由。
+    #[test]
+    fn a_manifest_signed_by_another_key_is_refused() {
+        let root = temp_root("verify-other-key");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("mesh-client.exe"), b"client").unwrap();
+        let key = test_key();
+        std::fs::write(
+            layout::manifest_path(&root),
+            signed_manifest(&key, "2026.11.27-1", &[("mesh-client.exe", b"client")]),
+        )
+        .unwrap();
+
+        let stranger = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
+        assert!(
+            verify_current_signed_by(&root, &public_hex(&stranger)).is_err(),
+            "别的密钥签出来的清单不能过"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 没有签名的包在动 bin/ 之前就被拒：否则会先换掉唯一的回滚材料，再发现装不了。
+    #[test]
+    fn a_package_without_a_signature_is_refused_before_touching_bin() {
+        let root = temp_root("unsigned-pkg");
+        let src = temp_root("unsigned-pkg-src");
+        std::fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        std::fs::write(root.join(layout::BIN).join("KEEP"), b"keep").unwrap();
+        let pkg = package(
+            &src,
+            r#"{"version":"2099.01.01-1","slot":"client","platform":"windows/amd64","files":{},"signature":""}"#,
+            &[],
+        );
+
+        assert!(
+            install_from_file(&root, &pkg, true).is_err(),
+            "空签名必须拒绝"
+        );
+        assert!(
+            root.join(layout::BIN).join("KEEP").is_file(),
+            "验签失败不该动 bin/"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
     }
 
     #[test]

@@ -97,12 +97,24 @@ pub mod failures { pub struct Failures; /* load/record/clear/count/exhausted，�
 pub mod lock { pub struct Lock; pub fn acquire(path: &Path) -> Result<Lock, Error>; }  // Error::AlreadyRunning
 pub mod platform { pub fn client_exe() -> &'static str; pub fn launcher_name() -> &'static str;
                    pub fn core_name() -> &'static str; pub fn id() -> &'static str; } // "windows/amd64"
+pub mod manifest { pub struct Manifest { version, slot, platform, files, signature }
+                   pub fn read(path: &Path) -> Result<Manifest, Error>; }   // 字段缺一即解析失败
+pub mod signing {
+    pub const RELEASE_PUBLIC_KEY: &str;
+    pub fn signing_string(slot, platform, version, sha256) -> String;      // MESH3，签包
+    pub fn manifest_string(slot, platform, version, files_digest) -> String; // MESH4，签清单
+    pub fn files_digest(files: &BTreeMap<String, String>) -> String;
+    pub fn verify_release(..) -> bool;   pub fn verify_release_with(public_hex, ..) -> bool;
+    pub fn verify_manifest(..) -> bool;  pub fn verify_manifest_with(public_hex, ..) -> bool;
+}
 pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()>;
 ```
 
 **拥有的状态**：无内存状态。`Failures` 是 `.update-failures.json` 的读写视图；`Lock` 是 `instance.lock` 的 OS 锁句柄（进程退出即释放）。
 
-**依赖**：`mesh-text`（文案）；`fs4` 覆盖两个平台的锁（Windows 的 `LockFileEx`、Unix 的 `flock`）。
+**依赖**：`mesh-text`（文案）；`fs4` 覆盖两个平台的锁（Windows 的 `LockFileEx`、Unix 的 `flock`）；`ed25519-dalek` 与 `sha2`/`hex` 只给 `signing` 用。
+
+**签名为什么在这里**：启动器要验清单签名，而它不能依赖 `mesh-remote`——那条线会把 `ureq`、`serde`、`rand`、`httpdate` 全拖进一个只需要 verifier 的二进制。签名字符串的形状与 Go 侧 `signing` 包逐字节相同，有一对固定向量单测钉住两端。
 
 **注**：`read_version` 与 `Failures` 必须同时被客户端与启动器使用——「不比当前新不装」和「同版本失败两次就停手」在两侧都要判，重复实现迟早会分叉。
 
@@ -168,7 +180,7 @@ pub struct Heartbeat { config_hash, config_b64, app_update, launcher, credential
 
 **拥有的状态**：无。签名原文（`MESH2\n<method>\n<path>\n...`）在 `signing_string` 里现拼，字段顺序写死并有单测。
 
-**发布签名**：`signing` 子模块拼 `MESH3\n<slot>\n<platform>\n<version>\n<sha256>` 并验签，公钥是编进二进制的常量（`RELEASE_PUBLIC_KEY`）——控制面被拿下后改不了它，这是更新链的信任锚。`verify_release_with` 收公钥、`verify_release` 用常量；引擎传自己那份（生产是常量，测试是临时密钥对，否则「有效签名被接受」这条路径跑不到）。有一条固定向量单测盯着 Go 侧 `tools/signpkg` 签出来的字节。
+**发布签名**：`signing` 子模块只是 `pub use mesh_install::signing::*` 的转出口，实现在 `mesh-install`（启动器也要验）。引擎经 `remote::signing::*` 调，与搬家前同名。
 
 **依赖**：`mesh-install`（`platform::id()`）。
 
@@ -485,7 +497,7 @@ strip = true
 | `engine` | `mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`、`serde`、`serde_json`、`sha2`、`hex`、`thiserror`、`rand`；不需要 windows-sys（自启只写 UTF-16 文件 + 起 `schtasks.exe`，隐藏窗口用 `CommandExt::creation_flags`）；dev: `ed25519-dalek`（给测试 offer 签名） |
 | `panel` | `mesh-engine`、`mesh-etrpc`、`tiny_http`、`include_dir`、`serde_json` |
 | `client` | `mesh-install`、`mesh-engine`、`mesh-panel`；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_UI_WindowsAndMessaging`、`Win32_Graphics_Gdi`、`Win32_System_LibraryLoader`、`Win32_System_Console`）+ `windows`（`Win32_UI_Shell` 的 `IShellDispatch`、`Win32_System_Com`）；unix: `signal-hook`；build: `winresource` |
-| `launcher` | `mesh-install`、`zstd`、`tar`、`sha2`、`serde_json`、`ureq`（windows: `native-tls`）；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_System_Threading`）；unix: 无（下载走系统 `curl`）；build: `winresource` |
+| `launcher` | `mesh-install`、`zstd`、`tar`、`sha2`、`ureq`（windows: `native-tls`）；dev: `ed25519-dalek`（造签名正确的测试包）；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_System_Threading`）；unix: 无（下载走系统 `curl`）；build: `winresource` |
 
 `crates/panel/src/assets.rs`：`include_dir!("../../frontend/dist")`——路径相对 crate 根（`client/crates/panel` → 仓库根），直接吃 `frontend/` 的构建产物，不复制、不改名。前端未构建时先跑占位脚本（等价 `wails3 task stub:frontend`），再编译。
 
