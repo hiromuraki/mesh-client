@@ -34,9 +34,9 @@ pub(crate) fn write_frame<W: Write>(
     payload: &[u8],
 ) -> Result<(), Error> {
     if payload.len() > MAX_PAYLOAD_SIZE {
-        return Err(Error::Frame(format!(
-            "rpc 载荷过大: {} 字节",
-            payload.len()
+        return Err(Error::Frame(mesh_text::format(
+            mesh_text::id::ETRPC_ERROR_PAYLOAD_TOO_LARGE,
+            &[&payload.len()],
         )));
     }
     let mut frame = vec![0u8; FRAME_HEAD_SIZE + payload.len()];
@@ -61,7 +61,10 @@ pub(crate) fn read_frame<R: Read>(reader: &mut R) -> Result<(u8, Vec<u8>), Error
     reader.read_exact(&mut head).map_err(io_error)?;
     let total = u32::from_le_bytes(head) as usize;
     if !(PEER_HEADER_SIZE..=PEER_HEADER_SIZE + MAX_PAYLOAD_SIZE).contains(&total) {
-        return Err(Error::Frame(format!("rpc 帧长度异常: {total}")));
+        return Err(Error::Frame(mesh_text::format(
+            mesh_text::id::ETRPC_ERROR_FRAME_LENGTH,
+            &[&total],
+        )));
     }
     let mut rest = vec![0u8; total];
     reader.read_exact(&mut rest).map_err(io_error)?;

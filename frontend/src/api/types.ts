@@ -56,16 +56,20 @@ export interface Hop {
 export interface NodeRow {
   ip: string;
   hostname: string;
+  /** `me` / `direct` / `relay`，界面按它取标签与颜色。 */
   pathKind: string;
-  pathLabel: string;
   /** 从本机到该节点途经的中间节点，按顺序排列，不含目标自身；直连为空。 */
   path: Hop[];
-  proto: string;
-  natType: string;
-  latency: string;
-  coreVersion: string;
   hops: number;
-  proxyCidrs: string;
+  /** 本行用到的隧道协议，已去重排序；本机那一行是整张网的聚合。 */
+  tunnels: string[];
+  /** `ListRoute` 给的原值，可能是空串。 */
+  natType: string;
+  /** 到该节点的延迟（毫秒）；null 表示未知。 */
+  latencyMs: number | null;
+  /** core 上报的完整版本串；截取发行号由前端做。 */
+  version: string;
+  proxyCidrs: string[];
 }
 
 export interface Dashboard {

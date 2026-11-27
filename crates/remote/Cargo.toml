@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mesh-text = { workspace = true }
 mesh-install = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

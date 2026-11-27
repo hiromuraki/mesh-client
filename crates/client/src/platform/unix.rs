@@ -30,7 +30,7 @@ pub(crate) fn notify_error(_text: &str) {}
 
 /// 只有 Windows 版有托盘菜单（Go 的 opendir_other.go 同）。
 pub(crate) fn open_browser(_url: &str) -> Result<(), String> {
-    Err("只有 Windows 版有托盘菜单".to_string())
+    Err(mesh_text::get(mesh_text::id::CLIENT_TEXT_NO_TRAY).to_string())
 }
 
 pub(crate) fn hostname() -> String {
@@ -47,7 +47,7 @@ pub(crate) fn spawn_signal_thread(tx: Sender<()>) -> Result<(), String> {
         signal_hook::consts::SIGINT,
         signal_hook::consts::SIGTERM,
     ])
-    .map_err(|err| format!("注册信号处理失败: {err}"))?;
+    .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_REGISTER_SIGNALS, &[&err]))?;
     std::thread::Builder::new()
         .name("mesh-signal".to_string())
         .spawn(move || {
@@ -55,7 +55,9 @@ pub(crate) fn spawn_signal_thread(tx: Sender<()>) -> Result<(), String> {
                 let _ = tx.send(());
             }
         })
-        .map_err(|err| format!("启动信号线程失败: {err}"))?;
+        .map_err(|err| {
+            mesh_text::format(mesh_text::id::CLIENT_ERROR_START_SIGNAL_THREAD, &[&err])
+        })?;
     Ok(())
 }
 

@@ -112,7 +112,7 @@ fn open_with_explorer(target: &str) -> Result<(), String> {
         .arg(target)
         .spawn()
         .map(|_| ())
-        .map_err(|err| format!("启动 explorer.exe 失败: {err}"))
+        .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_START_EXPLORER, &[&err]))
 }
 
 pub(crate) fn hostname() -> String {
@@ -135,11 +135,14 @@ pub(crate) fn spawn_notice_thread(rx: Receiver<Notice>) {
 /// 注册控制台事件：Ctrl+C / 关闭控制台时唤醒 headless 主循环，走正常收尾。
 pub(crate) fn spawn_signal_thread(tx: Sender<()>) -> Result<(), String> {
     let slot = CTRL_TX.get_or_init(|| Mutex::new(None));
-    *slot.lock().map_err(|_| "信号通道不可用".to_string())? = Some(tx);
+    *slot
+        .lock()
+        .map_err(|_| mesh_text::get(mesh_text::id::CLIENT_ERROR_SIGNAL_CHANNEL).to_string())? =
+        Some(tx);
     if unsafe { SetConsoleCtrlHandler(Some(ctrl_handler), 1) } == 0 {
-        return Err(format!(
-            "注册控制台事件处理失败: {}",
-            std::io::Error::last_os_error()
+        return Err(mesh_text::format(
+            mesh_text::id::CLIENT_ERROR_REGISTER_CONSOLE_HANDLER,
+            &[&std::io::Error::last_os_error()],
         ));
     }
     Ok(())

@@ -119,9 +119,10 @@ impl Engine {
         }
         // 版本号会被拼进安装目录里的路径，先按 layout 的规则挡掉非法值。
         if !layout::valid_version(&info.version) {
+            let shown = format!("{:?}", info.version);
             self.logf(
                 "app",
-                &format!("忽略服务端下发的非法版本号 {:?}", info.version),
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_IGNORE_INVALID_VERSION, &[&shown]),
             );
             return;
         }
@@ -131,9 +132,9 @@ impl Engine {
         {
             self.logf(
                 "app",
-                &format!(
-                    "忽略不比当前新的版本 {}（当前 {}）",
-                    info.version, self.config.self_version
+                &mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_IGNORE_NOT_NEWER,
+                    &[&info.version, &self.config.self_version],
                 ),
             );
             return;
@@ -142,16 +143,20 @@ impl Engine {
         if failures >= FAILURE_LIMIT {
             self.logf(
                 "app",
-                &format!(
-                    "跳过 {}：已连续失败 {failures} 次，需要人工处理",
-                    info.version
+                &mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_SKIP_FAILED_VERSION,
+                    &[&info.version, &failures],
                 ),
             );
             return;
         }
         // 契约里包的地址一律是绝对地址；不是就记一句，不去猜。
         if !(info.url.starts_with("http://") || info.url.starts_with("https://")) {
-            self.logf("app", &format!("更新地址不是绝对地址: {:?}", info.url));
+            let shown = format!("{:?}", info.url);
+            self.logf(
+                "app",
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_UPDATE_URL_NOT_ABSOLUTE, &[&shown]),
+            );
             return;
         }
         // 摘要必填：没有摘要就证明不了下载到的包就是发布的那一份，这种 offer 不接。
@@ -159,7 +164,7 @@ impl Engine {
         if !is_full_digest(&info.sha256) {
             self.logf(
                 "app",
-                &format!("忽略 {}：服务端没有给出可用的包摘要", info.version),
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_IGNORE_NO_DIGEST, &[&info.version]),
             );
             return;
         }
@@ -190,7 +195,7 @@ impl Engine {
             self.update.phase = Phase::Downloading;
             self.logf(
                 "app",
-                &format!("服务端报告新版本 {}，开始下载", info.version),
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_DOWNLOAD_STARTED, &[&info.version]),
             );
             self.spawn_download(
                 Arc::clone(api),
@@ -202,7 +207,10 @@ impl Engine {
         }
         self.logf(
             "app",
-            &format!("服务端报告新版本 {}，可在托盘或面板里安装", info.version),
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_UPDATE_READY_MANUAL,
+                &[&info.version],
+            ),
         );
     }
 
@@ -220,29 +228,44 @@ impl Engine {
         self.auto_tried = Some(self.update.version.clone());
         self.logf(
             "app",
-            &format!("无人值守：自动安装 {}", self.update.version),
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_AUTO_APPLY,
+                &[&self.update.version],
+            ),
         );
         if let Err(err) = self.apply_update() {
-            self.logf("app", &format!("自动安装失败: {err}"));
+            self.logf(
+                "app",
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_AUTO_APPLY_FAILED, &[&err]),
+            );
         }
     }
 
     /// 用户点了“安装”（或自动安装）：Windows 交接，Unix 先下载再交接。
     pub(crate) fn apply_update(&mut self) -> Result<(), String> {
         if self.update.busy {
-            return Err("更新已在进行中".to_string());
+            return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_UPDATE_IN_PROGRESS).to_string());
         }
         // 客户端自己查得出来的失败不要拖到进程退出之后。
         if !layout::valid_version(&self.update.version) {
-            let msg = format!("服务端下发的版本号不合法: {:?}", self.update.version);
+            let shown = format!("{:?}", self.update.version);
+            let msg = mesh_text::format(mesh_text::id::ENGINE_TEXT_VERSION_INVALID, &[&shown]);
             self.fail_update(&msg);
             return Err(msg);
         }
         match self.update.phase {
-            Phase::Downloading => return Err("更新还在下载".to_string()),
+            Phase::Downloading => {
+                return Err(
+                    mesh_text::get(mesh_text::id::ENGINE_TEXT_UPDATE_DOWNLOADING).to_string(),
+                )
+            }
             // 失败态允许用户直接重试：同样一份包、同一个版本，不必等下一轮心跳。
             Phase::Ready | Phase::Failed => {}
-            Phase::Idle => return Err("没有可安装的更新".to_string()),
+            Phase::Idle => {
+                return Err(
+                    mesh_text::get(mesh_text::id::ENGINE_TEXT_NOTHING_TO_INSTALL).to_string(),
+                )
+            }
         }
         if cfg!(windows) {
             // 包已经预取到本地；没有本地包说明下载失败过或被人删掉了。
@@ -250,7 +273,10 @@ impl Engine {
             let path = self.update.path.clone();
             if !path.as_deref().map(Path::is_file).unwrap_or(false) {
                 let Some(api) = self.api.clone() else {
-                    return Err("尚未连接服务端，无法下载更新".to_string());
+                    return Err(
+                        mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_SERVER_FOR_DOWNLOAD)
+                            .to_string(),
+                    );
                 };
                 // 用户主动重试：次数重新给满。
                 self.update.attempts = 0;
@@ -259,7 +285,13 @@ impl Engine {
                 self.update.error.clear();
                 self.update.apply_after_download = true;
                 let version = self.update.version.clone();
-                self.logf("app", &format!("重新下载 {version} 以便安装"));
+                self.logf(
+                    "app",
+                    &mesh_text::format(
+                        mesh_text::id::ENGINE_LOG_REDOWNLOAD_FOR_INSTALL,
+                        &[&version],
+                    ),
+                );
                 self.spawn_download(
                     api,
                     version,
@@ -273,7 +305,9 @@ impl Engine {
             return self.handoff();
         }
         let Some(api) = self.api.clone() else {
-            return Err("尚未连接服务端，无法下载更新".to_string());
+            return Err(
+                mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_SERVER_FOR_DOWNLOAD).to_string(),
+            );
         };
         self.update.busy = true;
         self.update.phase = Phase::Downloading;
@@ -302,7 +336,13 @@ impl Engine {
                 self.update.busy = false;
                 self.update.error.clear();
                 let version = self.update.version.clone();
-                self.logf("app", &format!("{version} 已下载，可在托盘或面板里安装"));
+                self.logf(
+                    "app",
+                    &mesh_text::format(
+                        mesh_text::id::ENGINE_LOG_DOWNLOADED_MANUAL_INSTALL,
+                        &[&version],
+                    ),
+                );
                 if self.update.apply_after_download {
                     self.update.apply_after_download = false;
                     let _ = self.handoff();
@@ -319,9 +359,9 @@ impl Engine {
                 self.update.retry_at = Some(Instant::now() + retry_delay(self.update.attempts));
                 self.logf(
                     "app",
-                    &format!(
-                        "下载 {version} 失败（第 {} 次）: {err}",
-                        self.update.attempts
+                    &mesh_text::format(
+                        mesh_text::id::ENGINE_LOG_DOWNLOAD_FAILED,
+                        &[&version, &self.update.attempts, &err],
                     ),
                 );
             }
@@ -348,9 +388,10 @@ impl Engine {
         self.update.phase = Phase::Downloading;
         self.update.error.clear();
         self.update.retry_at = None;
+        let attempt = self.update.attempts + 1;
         self.logf(
             "app",
-            &format!("重新下载 {version}（第 {} 次）", self.update.attempts + 1),
+            &mesh_text::format(mesh_text::id::ENGINE_LOG_REDOWNLOAD, &[&version, &attempt]),
         );
         self.spawn_download(
             Arc::clone(api),
@@ -369,12 +410,15 @@ impl Engine {
                 .root
                 .join(mesh_install::platform::launcher_name());
             if !launcher.is_file() {
-                let msg = format!("找不到启动器 {}", launcher.display());
+                let msg = mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_LAUNCHER_MISSING,
+                    &[&launcher.display()],
+                );
                 self.fail_update(&msg);
                 return Err(msg);
             }
             let Some(path) = self.update.path.clone() else {
-                let msg = "更新包不在本地".to_string();
+                let msg = mesh_text::get(mesh_text::id::ENGINE_TEXT_PACKAGE_NOT_LOCAL).to_string();
                 self.fail_update(&msg);
                 return Err(msg);
             };
@@ -389,16 +433,23 @@ impl Engine {
             }
             command.current_dir(&self.config.root);
             if let Err(err) = command.spawn() {
-                let msg = format!("启动安装器失败: {err}");
+                let msg =
+                    mesh_text::format(mesh_text::id::ENGINE_TEXT_LAUNCHER_START_FAILED, &[&err]);
                 self.fail_update(&msg);
                 return Err(msg);
             }
-            self.logf("app", &format!("开始安装 {version}，客户端即将退出"));
+            self.logf(
+                "app",
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_INSTALL_STARTED, &[&version]),
+            );
             // 必须先把启动器拉起来再退出，否则新版本装不上（F7）。
             self.shutdown.run_and_exit(0);
         }
         // Linux：客户端只负责把包放到安装根，解包与启动交给常驻启动器；正常退出即可。
-        self.logf("app", &format!("已下载 {version}，交给启动器安装"));
+        self.logf(
+            "app",
+            &mesh_text::format(mesh_text::id::ENGINE_LOG_HANDOFF_LAUNCHER, &[&version]),
+        );
         self.shutdown.run_and_exit(0);
     }
 
@@ -434,7 +485,10 @@ impl Engine {
         self.launcher_tried = Some(info.sha256.clone());
         let dir = self.config.root.join(UPDATE_DIR);
         if let Err(err) = std::fs::create_dir_all(&dir) {
-            self.logf("app", &format!("更新启动器失败: {err}"));
+            self.logf(
+                "app",
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_LAUNCHER_UPDATE_FAILED, &[&err]),
+            );
             return;
         }
         let api = Arc::clone(api);
@@ -443,23 +497,38 @@ impl Engine {
         let version = info.version.clone();
         let url = info.url.clone();
         let want = info.sha256.clone();
-        self.logf("app", &format!("下载启动器 {version}"));
+        self.logf(
+            "app",
+            &mesh_text::format(mesh_text::id::ENGINE_LOG_LAUNCHER_DOWNLOAD, &[&version]),
+        );
         let spawned = thread::Builder::new()
             .name("mesh-launcher-update".to_string())
             .spawn(move || {
                 let temp = root.join(UPDATE_DIR).join("launcher.new");
                 let _ = std::fs::remove_file(&temp);
                 if let Err(err) = api.download(&url, &temp, MAX_UPDATE_BYTES, LAUNCHER_TIMEOUT) {
-                    log.add("app", &format!("下载启动器失败: {err}"));
+                    log.add(
+                        "app",
+                        &mesh_text::format(
+                            mesh_text::id::ENGINE_LOG_LAUNCHER_DOWNLOAD_FAILED,
+                            &[&err],
+                        ),
+                    );
                     return;
                 }
                 let Some(sum) = file_digest(&temp) else {
-                    log.add("app", "校验启动器失败");
+                    log.add(
+                        "app",
+                        mesh_text::get(mesh_text::id::ENGINE_LOG_LAUNCHER_VERIFY_FAILED),
+                    );
                     let _ = std::fs::remove_file(&temp);
                     return;
                 };
                 if !sum.eq_ignore_ascii_case(&want) {
-                    log.add("app", "启动器摘要不符，已放弃");
+                    log.add(
+                        "app",
+                        mesh_text::get(mesh_text::id::ENGINE_LOG_LAUNCHER_DIGEST_MISMATCH),
+                    );
                     let _ = std::fs::remove_file(&temp);
                     return;
                 }
@@ -469,21 +538,39 @@ impl Engine {
                     if let Err(err) =
                         std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o755))
                     {
-                        log.add("app", &format!("设置启动器权限失败: {err}"));
+                        log.add(
+                            "app",
+                            &mesh_text::format(
+                                mesh_text::id::ENGINE_LOG_LAUNCHER_CHMOD_FAILED,
+                                &[&err],
+                            ),
+                        );
                         return;
                     }
                 }
                 let dst = root.join(mesh_install::platform::launcher_name());
                 match std::fs::rename(&temp, &dst) {
-                    Ok(()) => log.add("app", &format!("启动器已更新到 {version}")),
+                    Ok(()) => log.add(
+                        "app",
+                        &mesh_text::format(mesh_text::id::ENGINE_LOG_LAUNCHER_UPDATED, &[&version]),
+                    ),
                     Err(err) => {
-                        log.add("app", &format!("替换启动器失败: {err}"));
+                        log.add(
+                            "app",
+                            &mesh_text::format(
+                                mesh_text::id::ENGINE_LOG_LAUNCHER_REPLACE_FAILED,
+                                &[&err],
+                            ),
+                        );
                         let _ = std::fs::remove_file(&temp);
                     }
                 }
             });
         if spawned.is_err() {
-            self.logf("app", "启动启动器更新线程失败");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_LAUNCHER_THREAD_FAILED),
+            );
         }
     }
 
@@ -498,8 +585,14 @@ impl Engine {
             let path = entry.path();
             let name = entry.file_name().to_string_lossy().into_owned();
             match std::fs::remove_dir_all(&path) {
-                Ok(()) => self.logf("app", &format!("清理更新临时文件 {name}")),
-                Err(err) => self.logf("app", &format!("清理更新临时文件失败: {err}")),
+                Ok(()) => self.logf(
+                    "app",
+                    &mesh_text::format(mesh_text::id::ENGINE_LOG_CLEAN_TEMP_FILE, &[&name]),
+                ),
+                Err(err) => self.logf(
+                    "app",
+                    &mesh_text::format(mesh_text::id::ENGINE_LOG_CLEAN_TEMP_FILE_FAILED, &[&err]),
+                ),
             }
         }
     }
@@ -531,7 +624,8 @@ impl Engine {
                 let _ = tx.send(Cmd::Download { version, result });
             });
         if spawned.is_err() {
-            let message = "启动下载线程失败".to_string();
+            let message =
+                mesh_text::get(mesh_text::id::ENGINE_TEXT_DOWNLOAD_THREAD_FAILED).to_string();
             self.fail_update(&message);
             self.logf("app", &message);
         }
@@ -562,20 +656,26 @@ pub(crate) fn download_update(
     }
     let Some(sum) = file_digest(&part) else {
         let _ = std::fs::remove_file(&part);
-        return Err("读取下载结果失败".to_string());
+        return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_READ_DOWNLOAD_FAILED).to_string());
     };
     // 服务端没给摘要就不装：摘要为空时放行等于给「中间人换包」留了唯一一道缝。
     if want.is_empty() {
         let _ = std::fs::remove_file(&part);
-        return Err("服务端没有给出包摘要，拒绝安装".to_string());
+        return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_DIGEST_REFUSE).to_string());
     }
     if !sum.eq_ignore_ascii_case(want) {
         let _ = std::fs::remove_file(&part);
-        return Err(format!("包摘要不符：得到 {sum}"));
+        return Err(mesh_text::format(
+            mesh_text::id::ENGINE_TEXT_DIGEST_MISMATCH,
+            &[&sum],
+        ));
     }
     if let Err(err) = std::fs::rename(&part, &dst) {
         let _ = std::fs::remove_file(&part);
-        return Err(format!("落盘失败: {err}"));
+        return Err(mesh_text::format(
+            mesh_text::id::ENGINE_TEXT_PERSIST_FAILED,
+            &[&err],
+        ));
     }
     Ok(dst)
 }

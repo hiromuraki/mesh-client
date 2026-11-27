@@ -1,8 +1,8 @@
 diff --git a/easytier-contrib/easytier-mini/Cargo.toml b/easytier-contrib/easytier-mini/Cargo.toml
-index 73e517b..db3c0f4 100644
+index 73e517b..b5e9d32 100644
 --- a/easytier-contrib/easytier-mini/Cargo.toml
 +++ b/easytier-contrib/easytier-mini/Cargo.toml
-@@ -9,13 +9,14 @@ build = "build.rs"
+@@ -9,14 +9,14 @@ build = "build.rs"
  
  [dependencies]
  anyhow.workspace = true
@@ -17,15 +17,18 @@ index 73e517b..db3c0f4 100644
 -    "smoltcp",
 +    "tcp-hole-punch",
      "tun",
-     "web-client",
+-    "web-client",
  ] }
+ tokio = { workspace = true, features = ["macros", "rt", "signal"] }
 diff --git a/easytier-contrib/easytier-mini/src/main.rs b/easytier-contrib/easytier-mini/src/main.rs
-index add3120..5fa38eb 100644
+index add3120..2936ade 100644
 --- a/easytier-contrib/easytier-mini/src/main.rs
 +++ b/easytier-contrib/easytier-mini/src/main.rs
-@@ -3,8 +3,11 @@ use std::{ffi::OsString, path::PathBuf, sync::Arc};
+@@ -1,12 +1,13 @@
+ use std::{ffi::OsString, path::PathBuf, sync::Arc};
+ 
  use anyhow::Context as _;
- use easytier::common::MachineIdOptions;
+-use easytier::common::MachineIdOptions;
  use easytier::{
 -    common::config::{ConfigFileControl, load_toml_config_from_path},
 +    common::config::{
@@ -34,10 +37,16 @@ index add3120..5fa38eb 100644
      instance::factory::native_compact_instance_manager_with_runtime,
 +    proto::common::SecureModeConfig,
      rpc_service::ReadOnlyApiRpcServer,
-     web_client::{WebClientHooks, parse_config_server_endpoint, run_web_client},
+-    web_client::{WebClientHooks, parse_config_server_endpoint, run_web_client},
  };
-@@ -21,10 +24,15 @@ struct RunOptions {
-     machine_id: Option<String>,
+ 
+ enum Command {
+@@ -17,14 +18,16 @@ enum Command {
+ #[derive(Debug, Default, PartialEq, Eq)]
+ struct RunOptions {
+     config: Option<PathBuf>,
+-    config_server: Option<String>,
+-    machine_id: Option<String>,
      hostname: Option<String>,
      secure_mode: bool,
 +    credential: Option<String>,
@@ -45,15 +54,15 @@ index add3120..5fa38eb 100644
 +    rpc_portal: Option<String>,
  }
  
- const USAGE: &str = "usage: easytier-mini [--config <FILE>] [--config-server <URL>] \
+-const USAGE: &str = "usage: easytier-mini [--config <FILE>] [--config-server <URL>] \
 -                     [--machine-id <ID>] [--hostname <NAME>] [--secure-mode]";
-+                     [--machine-id <ID>] [--hostname <NAME>] [--secure-mode] \
-+                     [--rpc-portal <ADDR>]";
++const USAGE: &str = "usage: easytier-mini --config <FILE> [--hostname <NAME>] \
++                     [--secure-mode] [--rpc-portal <ADDR>]";
 +const DEFAULT_RPC_PORTAL: &str = "127.0.0.1:15888";
  
  fn required_value(
      args: &mut impl Iterator<Item = OsString>,
-@@ -34,8 +42,18 @@ fn required_value(
+@@ -34,8 +37,18 @@ fn required_value(
          .with_context(|| format!("{option} requires a value"))
  }
  
@@ -73,7 +82,33 @@ index add3120..5fa38eb 100644
      while let Some(arg) = args.next() {
          if arg == "-h" || arg == "--help" {
              println!(
-@@ -86,6 +104,17 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
+@@ -55,25 +68,6 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
+             options.config = Some(PathBuf::from(required_value(&mut args, "--config")?));
+             continue;
+         }
+-        if arg == "-w" || arg == "--config-server" {
+-            if options.config_server.is_some() {
+-                anyhow::bail!("--config-server may only be specified once");
+-            }
+-            options.config_server = Some(
+-                required_value(&mut args, "--config-server")?
+-                    .into_string()
+-                    .map_err(|_| anyhow::anyhow!("--config-server must be valid UTF-8"))?,
+-            );
+-            continue;
+-        }
+-        if arg == "--machine-id" {
+-            options.machine_id = Some(
+-                required_value(&mut args, "--machine-id")?
+-                    .into_string()
+-                    .map_err(|_| anyhow::anyhow!("--machine-id must be valid UTF-8"))?,
+-            );
+-            continue;
+-        }
+         if arg == "--hostname" {
+             options.hostname = Some(
+                 required_value(&mut args, "--hostname")?
+@@ -86,34 +80,113 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
              options.secure_mode = true;
              continue;
          }
@@ -90,11 +125,20 @@ index add3120..5fa38eb 100644
 +        }
          anyhow::bail!("unknown argument {arg:?}; {USAGE}");
      }
-     if options.config.is_none() && options.config_server.is_none() {
-@@ -108,6 +137,96 @@ fn validate_config_server(config_server: &str) -> anyhow::Result<()> {
-     require_tcp_or_udp(endpoint.connect_url().scheme(), "config server")
+-    if options.config.is_none() && options.config_server.is_none() {
+-        anyhow::bail!("either --config or --config-server is required; {USAGE}");
++    if options.config.is_none() {
++        anyhow::bail!("--config is required; {USAGE}");
+     }
+     Ok(Command::Run(options))
  }
  
+-fn require_tcp_or_udp(scheme: &str, source: &str) -> anyhow::Result<()> {
+-    match scheme {
+-        "tcp" | "udp" => Ok(()),
+-        scheme => anyhow::bail!(
+-            "{source} uses unsupported tunnel scheme {scheme:?}; easytier-mini supports only tcp:// and udp://"
+-        ),
 +// 身份由 --secure-mode / ET_CREDENTIAL 决定，但 core 在**装载配置的那一刻**就按
 +// 「TOML 里 secure_mode 是否开着」定型网络身份（TomlConfigLoader::new_from_config）：
 +// 装载完再调 set_secure_mode 只换得来密钥、换不来身份，凭据节点会退化成「正式节点 +
@@ -111,7 +155,7 @@ index add3120..5fa38eb 100644
 +    }
 +    if !options.secure_mode {
 +        return None;
-+    }
+     }
 +    let from_env = options.local_private_key.clone().filter(|key| !key.is_empty());
 +    let from_file = config.get_secure_mode();
 +    let local_public_key = if from_env.is_some() {
@@ -131,8 +175,11 @@ index add3120..5fa38eb 100644
 +        local_private_key,
 +        local_public_key,
 +    })
-+}
-+
+ }
+ 
+-fn validate_config_server(config_server: &str) -> anyhow::Result<()> {
+-    let endpoint = parse_config_server_endpoint(config_server)?;
+-    require_tcp_or_udp(endpoint.connect_url().scheme(), "config server")
 +fn with_secure_mode(text: &str, mode: &SecureModeConfig) -> String {
 +    let mut out = drop_secure_mode_table(text);
 +    out.push_str("\n[secure_mode]\nenabled = true\n");
@@ -143,8 +190,9 @@ index add3120..5fa38eb 100644
 +        out.push_str(&format!("local_public_key = \"{}\"\n", toml_string(key)));
 +    }
 +    out
-+}
-+
+ }
+ 
+-struct MiniWebClientHooks;
 +// 配置里原本的 [secure_mode] 整段丢掉：身份入口只有命令行与环境变量，配置文件里那份
 +// 只可能是过期的副本。
 +fn drop_secure_mode_table(text: &str) -> String {
@@ -167,7 +215,10 @@ index add3120..5fa38eb 100644
 +fn toml_string(value: &str) -> String {
 +    value.replace('\\', "\\\\").replace('"', "\\\"")
 +}
-+
+ 
+-impl WebClientHooks for MiniWebClientHooks {
+-    fn manages_remote_config_instances(&self) -> bool {
+-        true
 +fn load_local_config(
 +    config_path: &PathBuf,
 +    options: &RunOptions,
@@ -178,17 +229,15 @@ index add3120..5fa38eb 100644
 +    let mut config = load_toml_config_from_str_with_source(&source, &text)?;
 +    if let Some(mode) = secure_mode_for(&config, options) {
 +        config = load_toml_config_from_str_with_source(&source, &with_secure_mode(&text, &mode))?;
-+    }
+     }
 +    if let Some(hostname) = options.hostname.clone().filter(|name| !name.is_empty()) {
 +        config.set_hostname(Some(hostname));
 +    }
 +    Ok(config)
-+}
-+
- struct MiniWebClientHooks;
+ }
  
- impl WebClientHooks for MiniWebClientHooks {
-@@ -125,10 +244,7 @@ async fn main() -> anyhow::Result<()> {
+ #[tokio::main(flavor = "current_thread")]
+@@ -125,47 +198,22 @@ async fn main() -> anyhow::Result<()> {
      let local_config = options
          .config
          .as_ref()
@@ -198,12 +247,34 @@ index add3120..5fa38eb 100644
 -        })
 +        .map(|config_path| load_local_config(config_path, &options))
          .transpose()?;
-     if let Some(config_server) = options.config_server.as_deref() {
-         validate_config_server(config_server)?;
-@@ -158,12 +274,15 @@ async fn main() -> anyhow::Result<()> {
-     } else {
-         None
-     };
+-    if let Some(config_server) = options.config_server.as_deref() {
+-        validate_config_server(config_server)?;
+-    }
+-
+     let instances = Arc::new(native_compact_instance_manager_with_runtime(
+         tokio::runtime::Handle::current(),
+     ));
+     let local_instance_id = local_config
+         .map(|config| instances.run_network_instance(config, ConfigFileControl::STATIC_CONFIG))
+         .transpose()?;
+-    let _web_client = if let Some(config_server) = options.config_server.as_deref() {
+-        Some(
+-            run_web_client(
+-                config_server,
+-                MachineIdOptions {
+-                    explicit_machine_id: options.machine_id,
+-                    state_dir: None,
+-                },
+-                options.hostname,
+-                options.secure_mode,
+-                instances.clone(),
+-                Some(Arc::new(MiniWebClientHooks)),
+-            )
+-            .await?,
+-        )
+-    } else {
+-        None
+-    };
 +    let rpc_portal = options
 +        .rpc_portal
 +        .unwrap_or_else(|| DEFAULT_RPC_PORTAL.to_owned());
@@ -212,9 +283,55 @@ index add3120..5fa38eb 100644
 +        ReadOnlyApiRpcServer::new(Some(rpc_portal.clone()), None, instances.clone())?
              .serve()
              .await?;
-     eprintln!(
+-    eprintln!(
 -        "easytier-mini started: local={local_instance_id:?}, web={}; RPC: 127.0.0.1:15888",
-+        "easytier-mini started: local={local_instance_id:?}, web={}; RPC: {rpc_portal}",
-         options.config_server.is_some()
-     );
+-        options.config_server.is_some()
+-    );
++    eprintln!("easytier-mini started: local={local_instance_id:?}; RPC: {rpc_portal}");
  
+     let stopped_unexpectedly = tokio::select! {
+         signal = tokio::signal::ctrl_c() => {
+@@ -201,30 +249,6 @@ mod tests {
+         assert_eq!(options.config, Some(PathBuf::from("mini.toml")));
+     }
+ 
+-    #[test]
+-    fn parses_web_client_arguments_without_a_local_config() {
+-        let Command::Run(options) = parse_args(
+-            [
+-                OsString::from("--config-server"),
+-                OsString::from("token"),
+-                OsString::from("--machine-id"),
+-                OsString::from("machine"),
+-                OsString::from("--hostname"),
+-                OsString::from("mini"),
+-                OsString::from("--secure-mode"),
+-            ]
+-            .into_iter(),
+-        )
+-        .unwrap() else {
+-            panic!("expected run command");
+-        };
+-
+-        assert_eq!(options.config_server.as_deref(), Some("token"));
+-        assert_eq!(options.machine_id.as_deref(), Some("machine"));
+-        assert_eq!(options.hostname.as_deref(), Some("mini"));
+-        assert!(options.secure_mode);
+-    }
+-
+     #[test]
+     fn rejects_unknown_arguments() {
+         let result = parse_args([OsString::from("extra")].into_iter());
+@@ -232,12 +256,6 @@ mod tests {
+         assert!(result.is_err());
+     }
+ 
+-    #[test]
+-    fn accepts_tcp_udp_config_server() {
+-        assert!(validate_config_server("udp://127.0.0.1:22020/token").is_ok());
+-        assert!(validate_config_server("quic://127.0.0.1:22020/token").is_err());
+-    }
+-
+     #[tokio::test]
+     async fn compact_factory_accepts_unsupported_config_without_changing_it() {
+         let config = TomlConfigLoader::new_from_str(

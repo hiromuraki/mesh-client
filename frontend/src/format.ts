@@ -40,3 +40,32 @@ export function errorMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   return String(err);
 }
+
+const PATH_TEXT: Record<string, string> = {
+  me: "本机",
+  direct: "直连",
+  relay: "中继",
+};
+
+export function pathText(kind: string | undefined): string {
+  if (!kind) return "—";
+  return PATH_TEXT[kind] ?? kind;
+}
+
+// 延迟以毫秒下发，未知就是 null；显示成 0 会误导人。
+export function latencyText(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return "—";
+  return ms.toFixed(2) + " ms";
+}
+
+// core 的版本串形如 2.6.4-8428a89d，列表只显示发行号。
+export function releaseVersion(version: string | undefined): string {
+  if (!version) return "—";
+  const cut = version.indexOf("-");
+  return cut > 0 ? version.slice(0, cut) : version;
+}
+
+export function joinOrDash(items: string[] | undefined): string {
+  const kept = (items ?? []).filter((item) => item.trim() !== "");
+  return kept.length ? kept.join(",") : "—";
+}

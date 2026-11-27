@@ -28,7 +28,9 @@ pub(crate) enum ConnectError {
 }
 
 /// 没有凭据时 core 不起：下一轮心跳拿到就会重试。
-pub(crate) const NO_CREDENTIAL: &str = "尚未拿到凭据";
+pub(crate) fn no_credential() -> String {
+    mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_CREDENTIAL).to_string()
+}
 
 /// 时钟偏差上限：与服务端校验签名的时间窗一致（契约 1.3：`|now-ts| <= 300` 秒）。
 const CLOCK_SKEW_LIMIT_SECONDS: i64 = 300;
@@ -49,10 +51,12 @@ impl Engine {
     /// 打一次心跳把配置要回来：服务端在哈希对不上时直接随响应下发整份 `config.toml`，
     /// 所以启动不需要单独的取配置接口。
     pub(crate) fn connect(&mut self, config: &ClientConfig) -> Result<(), ConnectError> {
-        let key = self
-            .store
-            .signing_key()
-            .map_err(|err| ConnectError::Failed(format!("读取设备私钥失败: {err}")))?;
+        let key = self.store.signing_key().map_err(|err| {
+            ConnectError::Failed(mesh_text::format(
+                mesh_text::id::ENGINE_TEXT_READ_DEVICE_KEY_FAILED,
+                &[&err],
+            ))
+        })?;
         let api = Arc::new(remote::Client::new(
             &config.server_url,
             &config.device_id,
@@ -85,7 +89,10 @@ impl Engine {
                     };
                     return Err(ConnectError::Failed(reason));
                 }
-                return Err(ConnectError::Failed(format!("连接服务端失败: {err}")));
+                return Err(ConnectError::Failed(mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_CONNECT_SERVER_FAILED,
+                    &[&err],
+                )));
             }
         };
         self.reset_auth_fails();
@@ -93,12 +100,18 @@ impl Engine {
         // 首次心跳就可能带上凭据：先落盘，下面才有身份去起 core。少了这一步，第一轮
         // 必然起不来，只能等三十秒后的下一次心跳。
         if self.save_credential(&heartbeat) {
-            self.logf("app", "已收到新凭据");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_CREDENTIAL_RECEIVED),
+            );
         }
         let (toml, hash) = if !heartbeat.config_b64.is_empty() {
-            let toml = heartbeat
-                .config_toml()
-                .map_err(|err| ConnectError::Failed(format!("配置解码失败: {err}")))?;
+            let toml = heartbeat.config_toml().map_err(|err| {
+                ConnectError::Failed(mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_CONFIG_DECODE_FAILED,
+                    &[&err],
+                ))
+            })?;
             (toml, heartbeat.config_hash.clone())
         } else {
             // 心跳没带配置：服务端认为本地已是最新，直接用磁盘上那份。
@@ -109,7 +122,7 @@ impl Engine {
                 }
                 _ => {
                     return Err(ConnectError::Failed(
-                        "服务端未下发配置，本地也没有 config.toml".to_string(),
+                        mesh_text::get(mesh_text::id::ENGINE_TEXT_NO_CONFIG_LOCAL).to_string(),
                     ))
                 }
             }
@@ -147,7 +160,10 @@ impl Engine {
             if self.start_core_or_report(running) {
                 self.logf(
                     "app",
-                    &format!("配置未变，已启动 core {}", short_hash(hash)),
+                    &mesh_text::format(
+                        mesh_text::id::ENGINE_LOG_CONFIG_UNCHANGED_CORE_STARTED,
+                        &[&short_hash(hash)],
+                    ),
                 );
             }
             return Ok(());
@@ -155,16 +171,22 @@ impl Engine {
         if running {
             self.stop_core()?;
         }
-        self.store
-            .write_config(toml)
-            .map_err(|err| format!("写入 config.toml 失败: {err}"))?;
+        self.store.write_config(toml).map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_WRITE_CONFIG_FAILED, &[&err])
+        })?;
         // 配置换了，认证方式、加密算法与修改时间都可能变。
         self.refresh_identity();
         self.local_ip.clear();
         // 起不来就是起不来，不退回上一份：回滚只把设备留在旧配置上，服务端下一轮
         // 心跳还会把同一份新配置发下来，除了多绕一圈没有任何作用。
         self.start_core_or_report(true);
-        self.logf("app", &format!("配置已应用 {}", short_hash(hash)));
+        self.logf(
+            "app",
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_CONFIG_APPLIED,
+                &[&short_hash(hash)],
+            ),
+        );
         Ok(())
     }
 
@@ -173,12 +195,18 @@ impl Engine {
         let toml = match heartbeat.config_toml() {
             Ok(toml) => toml,
             Err(err) => {
-                self.logf("app", &format!("配置解码失败: {err}"));
+                self.logf(
+                    "app",
+                    &mesh_text::format(mesh_text::id::ENGINE_TEXT_CONFIG_DECODE_FAILED, &[&err]),
+                );
                 return;
             }
         };
         if toml.is_empty() {
-            self.logf("app", "服务端报告配置已变更，但没有下发内容");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_CONFIG_CHANGED_WITHOUT_BODY),
+            );
             return;
         }
         if self.api.is_none() {
@@ -223,9 +251,7 @@ impl Engine {
             let skew = clock::skew_seconds(*server_time);
             if skew.abs() > CLOCK_SKEW_LIMIT_SECONDS {
                 self.reset_auth_fails();
-                let msg = format!(
-                    "本机时间与服务端相差 {skew} 秒，签名请求被拒（401）；请校准本机时间后重试"
-                );
+                let msg = mesh_text::format(mesh_text::id::ENGINE_TEXT_CLOCK_SKEW, &[&skew]);
                 self.logf("app", &msg);
                 self.set_status(Status::Degraded, msg);
                 return false;
@@ -235,13 +261,16 @@ impl Engine {
         if failures >= AUTH_FAIL_LIMIT {
             self.logf(
                 "app",
-                &format!("连续 {failures} 次 401，按设备身份失效处理"),
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_AUTH_FAILURES_LIMIT, &[&failures]),
             );
             self.reset_auth_fails();
             self.handle_identity_invalid(err);
             return true;
         }
-        let msg = format!("签名请求被拒（401，第 {failures}/{AUTH_FAIL_LIMIT} 次），稍后重试");
+        let msg = mesh_text::format(
+            mesh_text::id::ENGINE_TEXT_AUTH_REJECTED_RETRY,
+            &[&failures, &AUTH_FAIL_LIMIT],
+        );
         self.set_status(Status::Degraded, msg);
         false
     }
@@ -263,10 +292,16 @@ impl Engine {
         };
         self.logf(
             "app",
-            &format!("设备身份失效（{detail}），已清空 device_id"),
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_IDENTITY_INVALID_CLEARED,
+                &[&detail],
+            ),
         );
         if let Err(err) = self.store.clear_device() {
-            self.logf("app", &format!("清空 device_id 失败: {err}"));
+            self.logf(
+                "app",
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_CLEAR_DEVICE_FAILED, &[&err]),
+            );
         }
         let _ = self.stop_core();
         // 本地凭据这时已经作废（服务端删设备是先撤销凭据再删记录），留着只是把一份
@@ -277,7 +312,10 @@ impl Engine {
         self.local_ip.clear();
         self.set_status(
             Status::Unconfigured,
-            format!("设备身份已失效（{detail}），请重新获取 token 注册"),
+            mesh_text::format(
+                mesh_text::id::ENGINE_TEXT_IDENTITY_INVALID_REGISTER,
+                &[&detail],
+            ),
         );
         self.trigger_restart();
     }
@@ -375,7 +413,7 @@ impl Engine {
             protect: String::new(),
         };
         if let Err(err) = self.store.save_credential(&credential) {
-            let msg = format!("保存凭据失败: {err}");
+            let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_SAVE_CREDENTIAL_FAILED, &[&err]);
             self.logf("app", &msg);
             self.degrade(&msg);
             return false;
@@ -389,7 +427,10 @@ impl Engine {
         if !self.save_credential(heartbeat) {
             return false;
         }
-        self.logf("app", "已收到新凭据，重启 core");
+        self.logf(
+            "app",
+            mesh_text::get(mesh_text::id::ENGINE_LOG_CREDENTIAL_RECEIVED_RESTART),
+        );
         true
     }
 }
@@ -406,7 +447,13 @@ pub(crate) fn rpc_listen_addr() -> Result<SocketAddr, String> {
             .parse::<SocketAddr>()
             // 解析不了就报错：这个端口能签发凭据，静默换成随机端口会让控制面的转发
             // 打到一个没人监听的地址上，表现成“签发一直超时”。
-            .map_err(|err| format!("MESH_RPC_PORTAL 不是有效的监听地址 {value:?}: {err}")),
+            .map_err(|err| {
+                let shown = format!("{value:?}");
+                mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_RPC_PORTAL_INVALID,
+                    &[&shown, &err],
+                )
+            }),
         None => Ok(mesh_etrpc::free_loopback_addr()),
     }
 }

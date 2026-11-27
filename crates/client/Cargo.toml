@@ -11,6 +11,7 @@ name = "mesh-client"
 path = "src/main.rs"
 
 [dependencies]
+mesh-text = { workspace = true }
 mesh-install = { workspace = true }
 mesh-state = { workspace = true }
 mesh-engine = { workspace = true }

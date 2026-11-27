@@ -62,17 +62,17 @@ mod imp {
         };
         let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid) };
         if process.is_null() {
-            return Err(format!(
-                "OpenProcess({pid}) 失败: {}",
-                std::io::Error::last_os_error()
+            return Err(mesh_text::format(
+                mesh_text::id::CORE_ERROR_OPEN_PROCESS,
+                &[&pid, &std::io::Error::last_os_error()],
             ));
         }
         let assigned = unsafe { AssignProcessToJobObject(job.0, process) };
         unsafe { CloseHandle(process) };
         if assigned == 0 {
-            return Err(format!(
-                "AssignProcessToJobObject 失败: {}",
-                std::io::Error::last_os_error()
+            return Err(mesh_text::format(
+                mesh_text::id::CORE_ERROR_ASSIGN_JOB,
+                &[&std::io::Error::last_os_error()],
             ));
         }
         Ok(())
@@ -81,9 +81,9 @@ mod imp {
     fn create_job() -> Result<Job, String> {
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
-            return Err(format!(
-                "CreateJobObject 失败: {}",
-                std::io::Error::last_os_error()
+            return Err(mesh_text::format(
+                mesh_text::id::CORE_ERROR_CREATE_JOB,
+                &[&std::io::Error::last_os_error()],
             ));
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -99,7 +99,10 @@ mod imp {
         if configured == 0 {
             let err = std::io::Error::last_os_error();
             unsafe { CloseHandle(handle) };
-            return Err(format!("SetInformationJobObject 失败: {err}"));
+            return Err(mesh_text::format(
+                mesh_text::id::CORE_ERROR_SET_JOB,
+                &[&err],
+            ));
         }
         Ok(Job(handle))
     }
@@ -118,15 +121,14 @@ mod imp {
         // 控制台会把它打进客户端/启动器的输出里；真正失败时并进错误信息更有用。
         let output = cmd
             .output()
-            .map_err(|err| format!("调用 taskkill 失败: {err}"))?;
+            .map_err(|err| mesh_text::format(mesh_text::id::CORE_ERROR_TASKKILL_CALL, &[&err]))?;
         if output.status.success() {
             Ok(())
         } else {
             let detail = String::from_utf8_lossy(&output.stderr);
-            Err(format!(
-                "taskkill 退出 {}: {}",
-                output.status,
-                detail.trim()
+            Err(mesh_text::format(
+                mesh_text::id::CORE_ERROR_TASKKILL_STATUS,
+                &[&output.status, &detail.trim()],
             ))
         }
     }
@@ -166,6 +168,9 @@ mod imp {
         if unsafe { libc::kill(pid, signal) } == 0 {
             return Ok(());
         }
-        Err(format!("向进程 {pid} 发信号失败: {group_error}"))
+        Err(mesh_text::format(
+            mesh_text::id::CORE_ERROR_SIGNAL,
+            &[&pid, &group_error],
+        ))
     }
 }

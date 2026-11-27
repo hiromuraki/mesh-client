@@ -1,8 +1,9 @@
-# 客户端 workspace：九个成员，依赖方向由 crates/client/tests/dependency_direction.rs 盯着。
+# 客户端 workspace：十个成员，依赖方向由 crates/client/tests/dependency_direction.rs 盯着。
 # 划分依据与硬规则见 MODULES.md，不要在这里加“临时共享”的成员。
 [workspace]
 resolver = "2"
 members = [
+  "crates/text",
   "crates/install",
   "crates/state",
   "crates/remote",
@@ -20,6 +21,7 @@ edition = "2021"
 rust-version = "1.83"
 
 [workspace.dependencies]
+mesh-text = { path = "crates/text" }
 mesh-install = { path = "crates/install" }
 mesh-state = { path = "crates/state" }
 mesh-remote = { path = "crates/remote" }

@@ -1,6 +1,6 @@
 //! 依赖方向的闸门。
 //!
-//! MODULES.md 第 2 节的规则（install 是地板、叶子 crate 不许依赖引擎、engine 不认识
+//! MODULES.md 第 2 节的规则（text 是地板、叶子 crate 不许依赖引擎、engine 不认识
 //! 面板与进程形态……）靠人记不住，也不该靠 review 时逐个 crate 翻 manifest。
 //! 这里把“允许的边”写成一张表，多一条边就让 `cargo test` 红。
 //!
@@ -11,15 +11,19 @@ use std::path::{Path, PathBuf};
 
 /// 每个成员允许依赖的 workspace 内 crate（只写短名，前缀 `mesh-` 自动补）。
 const MEMBERS: &[(&str, &[&str])] = &[
-    ("install", &[]),
-    ("state", &["install"]),
-    ("remote", &["install"]),
-    ("etrpc", &[]),
-    ("core", &["etrpc"]),
-    ("engine", &["install", "state", "remote", "core", "etrpc"]),
-    ("panel", &["engine", "etrpc"]),
-    ("client", &["install", "state", "engine", "panel"]),
-    ("launcher", &["install"]),
+    ("text", &[]),
+    ("install", &["text"]),
+    ("state", &["install", "text"]),
+    ("remote", &["install", "text"]),
+    ("etrpc", &["text"]),
+    ("core", &["etrpc", "text"]),
+    (
+        "engine",
+        &["install", "state", "remote", "core", "etrpc", "text"],
+    ),
+    ("panel", &["engine", "etrpc", "text"]),
+    ("client", &["install", "state", "engine", "panel", "text"]),
+    ("launcher", &["install", "text"]),
 ];
 
 fn workspace_root() -> PathBuf {
@@ -103,7 +107,7 @@ fn no_member_depends_outside_the_allowed_edges() {
 }
 
 #[test]
-fn workspace_lists_exactly_the_nine_members() {
+fn workspace_lists_exactly_the_ten_members() {
     let root = workspace_root();
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap();
     let manifest: toml::Value = manifest.parse().unwrap();

@@ -200,7 +200,7 @@ pub fn spawn(
         Ok(log) => (log, String::new()),
         Err(err) => (
             Log::unavailable(&log_path),
-            format!("日志文件不可用: {err}"),
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_LOG_UNAVAILABLE, &[&err]),
         ),
     };
     let log = Arc::new(log);
@@ -291,7 +291,13 @@ enum Flow {
 impl Engine {
     fn run(mut self) {
         // 第一行永远写清自己在跑哪个版本：headless 上只有日志可看。
-        self.logf("app", &format!("客户端启动 {}", self.config.self_version));
+        self.logf(
+            "app",
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_CLIENT_STARTED,
+                &[&self.config.self_version],
+            ),
+        );
         self.clean_update_dir();
         self.refresh_identity();
         self.refresh_autostart();
@@ -313,7 +319,10 @@ impl Engine {
             let config = match self.load_client() {
                 sync::Loaded::Failed(err) => {
                     self.set_client(None);
-                    let msg = format!("读取本地状态失败: {err}");
+                    let msg = mesh_text::format(
+                        mesh_text::id::ENGINE_LOG_LOCAL_STATE_READ_FAILED,
+                        &[&err],
+                    );
                     self.set_status(Status::Error, msg.clone());
                     self.logf("app", &msg);
                     if !self.wait(Duration::from_secs(5)) {
@@ -344,7 +353,10 @@ impl Engine {
                     }
                     connect_failures += 1;
                     self.set_status(Status::Error, err.clone());
-                    self.logf("app", &format!("连接失败: {err}"));
+                    self.logf(
+                        "app",
+                        &mesh_text::format(mesh_text::id::ENGINE_LOG_CONNECT_FAILED, &[&err]),
+                    );
                     if !self.wait(connect_backoff(connect_failures)) {
                         return;
                     }
@@ -358,7 +370,13 @@ impl Engine {
             if self.core_running() {
                 self.mark_online();
             }
-            self.logf("app", &format!("已连接服务端 {}", config.server_url));
+            self.logf(
+                "app",
+                &mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_CONNECTED_SERVER,
+                    &[&config.server_url],
+                ),
+            );
             self.start_heartbeat();
             self.start_stun_loop();
             self.publish();
@@ -451,10 +469,16 @@ impl Engine {
         match self.start_core(false) {
             Ok(()) => {
                 // 等 Started 事件；这一步只说明“已经把启动请求发出去了”。
-                self.logf("app", "core 已重新拉起");
+                self.logf(
+                    "app",
+                    mesh_text::get(mesh_text::id::ENGINE_LOG_CORE_REVIVED),
+                );
             }
             Err(err) => {
-                let msg = format!("core 启动失败（第 {} 次）: {err}", revive.attempt);
+                let msg = mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_CORE_START_FAILED_ATTEMPT,
+                    &[&revive.attempt, &err],
+                );
                 self.set_status(Status::Degraded, msg.clone());
                 self.logf("app", &msg);
                 self.schedule_revive(revive.attempt + 1);
@@ -485,7 +509,10 @@ impl Engine {
                 let result = self.save_settings(input);
                 let restart = result.is_ok();
                 if let Err(err) = &result {
-                    self.notify(&format!("保存设置失败: {err}"));
+                    self.notify(&mesh_text::format(
+                        mesh_text::id::ENGINE_TEXT_SAVE_SETTINGS_FAILED,
+                        &[&err],
+                    ));
                 }
                 let snapshot = self.snapshot();
                 let _ = reply.send(result.map(|()| snapshot).map_err(|err| err.to_string()));
@@ -501,7 +528,10 @@ impl Engine {
             Cmd::SetAutostart(enabled, reply) => {
                 let result = self.set_autostart(enabled);
                 if let Err(err) = &result {
-                    self.notify(&format!("设置开机自启失败: {err}"));
+                    self.notify(&mesh_text::format(
+                        mesh_text::id::ENGINE_TEXT_SET_AUTOSTART_FAILED,
+                        &[&err],
+                    ));
                 }
                 let snapshot = self.snapshot();
                 let _ = reply.send(result.map(|()| snapshot).map_err(|err| err.to_string()));
@@ -513,7 +543,10 @@ impl Engine {
                 false
             }
             Cmd::Reconnect => {
-                self.logf("app", "手动触发重新连接");
+                self.logf(
+                    "app",
+                    mesh_text::get(mesh_text::id::ENGINE_LOG_RECONNECT_MANUAL),
+                );
                 true
             }
         }
@@ -538,7 +571,7 @@ impl Engine {
                     }
                     return;
                 }
-                let msg = format!("心跳失败: {err}");
+                let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_HEARTBEAT_FAILED, &[&err]);
                 self.logf("app", &msg);
                 self.degrade(&msg);
                 return;
@@ -558,7 +591,10 @@ impl Engine {
             false
         };
         if recovered {
-            self.logf("app", "心跳恢复，状态回到在线");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_HEARTBEAT_RECOVERED),
+            );
         }
         let res = heartbeat.unwrap_or_default();
         if res.app_update.is_some() {
@@ -574,7 +610,10 @@ impl Engine {
             self.trigger_restart();
         }
         if !res.config_hash.is_empty() && res.config_hash != self.hash() {
-            self.logf("app", "服务端配置已变更，开始同步");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_CONFIG_CHANGED_SYNC),
+            );
             self.apply_remote(&res);
         }
         // 自启状态只在启动、用户改动和这里刷新：快照两秒一次，不可能每次都去起进程。
@@ -613,7 +652,10 @@ impl Engine {
                 }
                 self.logf(
                     "app",
-                    &format!("core 已就绪 pid={pid} ip={}", self.local_ip),
+                    &mesh_text::format(
+                        mesh_text::id::ENGINE_LOG_CORE_READY,
+                        &[&pid, &self.local_ip],
+                    ),
                 );
             }
             mesh_core::Event::StartFailed { gen, reason } => {
@@ -621,7 +663,8 @@ impl Engine {
                     return;
                 }
                 self.core = None;
-                let msg = format!("启动 core 失败: {reason}");
+                let msg =
+                    mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&reason]);
                 self.set_status(Status::Error, msg.clone());
                 self.logf("app", &msg);
                 let attempt = self.on_start_failed_attempt();
@@ -636,10 +679,17 @@ impl Engine {
                 let suffix = if detail.is_empty() {
                     String::new()
                 } else {
-                    format!("（{detail}）")
+                    mesh_text::format(mesh_text::id::ENGINE_TEXT_EXITED_DETAIL, &[&detail])
                 };
-                self.logf("app", &format!("core 已退出{suffix}，准备重新拉起"));
-                self.set_status(Status::Degraded, "core 未运行，正在重新启动".to_string());
+                self.logf(
+                    "app",
+                    &mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_EXITED, &[&suffix]),
+                );
+                self.set_status(
+                    Status::Degraded,
+                    mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_NOT_RUNNING_RESTARTING)
+                        .to_string(),
+                );
                 let attempt = self.next_revive_attempt();
                 self.schedule_revive(attempt);
             }
@@ -694,7 +744,10 @@ impl Engine {
     pub(crate) fn refresh_autostart(&mut self) {
         match autostart::enabled() {
             Ok(on) => self.autostart_on = on,
-            Err(err) => self.logf("app", &format!("读取开机自启状态失败: {err}")),
+            Err(err) => self.logf(
+                "app",
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_READ_AUTOSTART_FAILED, &[&err]),
+            ),
         }
     }
 
@@ -706,10 +759,16 @@ impl Engine {
                 .root
                 .join(mesh_install::platform::launcher_name());
             autostart::enable(&launcher)?;
-            self.logf("app", "已开启开机自启");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_AUTOSTART_ENABLED),
+            );
         } else {
             autostart::disable()?;
-            self.logf("app", "已关闭开机自启");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_AUTOSTART_DISABLED),
+            );
         }
         self.refresh_autostart();
         Ok(())
@@ -794,12 +853,18 @@ impl Engine {
                 Ok(())
             }
             Ok(Err(err)) => {
-                self.logf("app", &format!("停止 core 失败: {err}"));
+                self.logf(
+                    "app",
+                    &mesh_text::format(mesh_text::id::ENGINE_LOG_STOP_CORE_FAILED, &[&err]),
+                );
                 self.core = Some(core);
                 Err(err)
             }
             Err(_) => {
-                let err = format!("等待 core 停止超时（{}s）", STOP_REPLY_TIMEOUT.as_secs());
+                let err = mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_STOP_CORE_TIMEOUT,
+                    &[&STOP_REPLY_TIMEOUT.as_secs()],
+                );
                 self.logf("app", &err);
                 self.core = Some(core);
                 Err(err)
@@ -815,7 +880,10 @@ impl Engine {
         };
         self.set_client(Some(config.clone()));
         if self.start_core_or_report(false) {
-            self.logf("app", "已按本地配置启动 core，正在连接服务端");
+            self.logf(
+                "app",
+                mesh_text::get(mesh_text::id::ENGINE_LOG_CORE_STARTED_FROM_DISK),
+            );
         }
     }
 
@@ -824,7 +892,7 @@ impl Engine {
         match self.start_core(replace) {
             Ok(()) => true,
             Err(err) => {
-                let msg = format!("启动 core 失败: {err}");
+                let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&err]);
                 self.set_status(Status::Error, msg.clone());
                 self.logf("app", &msg);
                 false
@@ -842,7 +910,7 @@ impl Engine {
             self.stop_core()?;
         }
         let Some(config) = self.client.clone() else {
-            return Err("尚未注册".to_string());
+            return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED).to_string());
         };
         // 提示字段现读现算（Go 的 hints() 也是每次读文件）：配置刚被写盘时，
         // 就绪判据与身份选择都必须基于新内容。
@@ -854,10 +922,9 @@ impl Engine {
         // 身份二选一，由配置里有没有 network_secret 决定：正式节点（含管理节点）用
         // secure_mode 的本地私钥，忽略本地凭据；其余节点只能用凭据，没有就不起 core。
         let (identity, cred_id) = if hints.formal() {
-            let key = self
-                .store
-                .secure_key()
-                .map_err(|err| format!("读取节点私钥失败: {err}"))?;
+            let key = self.store.secure_key().map_err(|err| {
+                mesh_text::format(mesh_text::id::ENGINE_TEXT_READ_NODE_KEY_FAILED, &[&err])
+            })?;
             (mesh_core::Identity::Formal { key }, String::new())
         } else {
             match self.store.load_credential() {
@@ -868,8 +935,13 @@ impl Engine {
                     },
                     credential.id,
                 ),
-                Ok(None) => return Err(sync::NO_CREDENTIAL.to_string()),
-                Err(err) => return Err(format!("读取凭据失败: {err}")),
+                Ok(None) => return Err(sync::no_credential()),
+                Err(err) => {
+                    return Err(mesh_text::format(
+                        mesh_text::id::ENGINE_TEXT_READ_CREDENTIAL_FAILED,
+                        &[&err],
+                    ))
+                }
             }
         };
         let spec = mesh_core::StartSpec {
@@ -897,7 +969,7 @@ impl Engine {
         self.core_path_used = core_path.display().to_string();
         if self.core_tx.send(mesh_core::Cmd::Start(spec)).is_err() {
             self.core = None;
-            return Err("core 线程已结束".to_string());
+            return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_THREAD_CLOSED).to_string());
         }
         Ok(())
     }

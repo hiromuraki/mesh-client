@@ -3,6 +3,7 @@ use crate::launch;
 use crate::log;
 use mesh_install::failures::Failures;
 use mesh_install::version;
+use mesh_text::id;
 use std::fs;
 use std::path::Path;
 use std::process::Child;
@@ -25,23 +26,29 @@ pub fn run(root: &Path) -> Result<i32, String> {
         apply_pending(root);
 
         let version = install::installed_version(&bin).ok_or_else(|| {
-            format!(
-                "{}/version.json 不存在，先用 mesh --file <包> 装一个",
-                bin.display()
+            mesh_text::format(
+                id::LAUNCHER_ERROR_NO_VERSION_JSON_SUPERVISOR,
+                &[&bin.display()],
             )
         })?;
         let exe = bin.join(launch::CLIENT_EXE);
         if !exe.is_file() {
-            return Err(format!("{} 不存在", exe.display()));
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_EXE_MISSING,
+                &[&exe.display()],
+            ));
         }
 
         let token = install::token();
         let mut child = launch::start(&exe, root, Some(&token))?
-            .ok_or_else(|| "启动客户端没有拿到子进程".to_string())?;
-        log::line(&format!("启动 {version}，等待启动确认"));
+            .ok_or_else(|| mesh_text::get(id::LAUNCHER_ERROR_NO_CHILD).to_string())?;
+        log::line(&mesh_text::format(id::LAUNCHER_TEXT_STARTING, &[&version]));
 
         if let Err(reason) = wait_boot(&mut child, root, &token) {
-            log::line(&format!("{version} 启动失败: {reason}"));
+            log::line(&mesh_text::format(
+                id::LAUNCHER_TEXT_START_FAILED,
+                &[&version, &reason],
+            ));
             stop_child(&mut child);
             Failures::load(root).record(&version);
             // 回到 bin.old：这一版起不来就当没装过。
@@ -52,11 +59,14 @@ pub fn run(root: &Path) -> Result<i32, String> {
         Failures::load(root).clear(&version);
         // 验过了，旧的那一份和更新包都可以扔了。
         install::commit(root);
-        log::line(&format!("{version} 启动确认成功"));
+        log::line(&mesh_text::format(
+            id::LAUNCHER_TEXT_BOOT_CONFIRMED,
+            &[&version],
+        ));
 
         let status = child
             .wait()
-            .map_err(|e| format!("等待客户端退出失败: {e}"))?;
+            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_WAIT_CLIENT_EXIT, &[&e]))?;
         let code = status.code().unwrap_or(1);
         // 以 0 退出不等于“服务该停了”：它可能刚下好一个更新包。
         if code != 0 {
@@ -65,7 +75,7 @@ pub fn run(root: &Path) -> Result<i32, String> {
         if !root.join(install::UPDATE_FILE).is_file() {
             return Ok(0);
         }
-        log::line("客户端已退出并留下更新包");
+        log::line(mesh_text::get(id::LAUNCHER_TEXT_CLIENT_LEFT_UPDATE));
     }
 }
 
@@ -87,16 +97,19 @@ fn apply_pending(root: &Path) {
                 .map(|c| version::is_newer(&v, c))
                 .unwrap_or(true) =>
         {
-            log::line(&format!("按更新包装 {v}"));
+            log::line(&mesh_text::format(id::LAUNCHER_TEXT_INSTALL_UPDATE, &[&v]));
         }
         Ok(v) => {
             // 残留的包（上次没清掉、或装完没来得及删）不该再拉起一次安装。
-            log::line(&format!("丢弃不比当前新的更新包 {v}"));
+            log::line(&mesh_text::format(
+                id::LAUNCHER_TEXT_DISCARD_NOT_NEWER,
+                &[&v],
+            ));
             let _ = fs::remove_file(&pkg);
             return;
         }
         Err(e) => {
-            log::line(&format!("更新包不可用，已丢弃: {e}"));
+            log::line(&mesh_text::format(id::LAUNCHER_TEXT_UPDATE_UNUSABLE, &[&e]));
             let _ = fs::remove_file(&pkg);
             return;
         }
@@ -104,7 +117,10 @@ fn apply_pending(root: &Path) {
 
     if let Err(e) = install::install_from_file(root, &pkg, false) {
         // 失败已经在 install_from_file 里记进 Failures，客户端下轮会看到。
-        log::line(&format!("安装失败: {e}，继续启动当前版本"));
+        log::line(&mesh_text::format(
+            id::LAUNCHER_TEXT_INSTALL_FAILED_KEEP_RUNNING,
+            &[&e],
+        ));
     }
     // 不管装没装上，这个包都不再有用：失败时 bin 已经回到旧的那一套。
     let _ = fs::remove_file(&pkg);
@@ -121,15 +137,22 @@ fn wait_boot(child: &mut Child, root: &Path, token: &str) -> Result<(), String> 
             return Ok(());
         }
         match child.try_wait() {
-            Ok(Some(status)) => return Err(format!("客户端启动后立即退出（{status}）")),
+            Ok(Some(status)) => {
+                return Err(mesh_text::format(
+                    id::LAUNCHER_ERROR_CLIENT_EXITED_IMMEDIATELY,
+                    &[&status],
+                ));
+            }
             Ok(None) => {}
-            Err(e) => return Err(format!("等待客户端失败: {e}")),
+            Err(e) => {
+                return Err(mesh_text::format(id::LAUNCHER_ERROR_WAIT_CLIENT, &[&e]));
+            }
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    Err(format!(
-        "客户端 {}s 内没有确认启动",
-        install::WAIT_BOOT.as_secs()
+    Err(mesh_text::format(
+        id::LAUNCHER_ERROR_BOOT_TIMEOUT,
+        &[&install::WAIT_BOOT.as_secs()],
     ))
 }
 
@@ -150,7 +173,7 @@ fn stop_child(child: &mut Child) {
             Err(_) => return,
         }
     }
-    log::line("客户端没有响应 SIGTERM，强制结束");
+    log::line(mesh_text::get(id::LAUNCHER_TEXT_KILL_CLIENT));
     let _ = child.kill();
 }
 

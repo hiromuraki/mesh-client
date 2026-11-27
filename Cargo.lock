@@ -513,6 +513,7 @@ dependencies = [
  "mesh-install",
  "mesh-panel",
  "mesh-state",
+ "mesh-text",
  "signal-hook",
  "toml 0.8.23",
  "windows-sys 0.59.0",
@@ -525,6 +526,7 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "mesh-etrpc",
+ "mesh-text",
  "windows-sys 0.59.0",
 ]
 
@@ -539,6 +541,7 @@ dependencies = [
  "mesh-install",
  "mesh-remote",
  "mesh-state",
+ "mesh-text",
  "rand",
  "serde",
  "sha2",
@@ -549,6 +552,7 @@ dependencies = [
 name = "mesh-etrpc"
 version = "0.1.0"
 dependencies = [
+ "mesh-text",
  "thiserror",
 ]
 
@@ -557,6 +561,7 @@ name = "mesh-install"
 version = "0.1.0"
 dependencies = [
  "fs4",
+ "mesh-text",
  "serde",
  "serde_json",
  "thiserror",
@@ -567,6 +572,7 @@ name = "mesh-launcher"
 version = "0.1.0"
 dependencies = [
  "mesh-install",
+ "mesh-text",
  "sha2",
  "tar",
  "ureq",
@@ -582,6 +588,7 @@ dependencies = [
  "include_dir",
  "mesh-engine",
  "mesh-etrpc",
+ "mesh-text",
  "serde",
  "serde_json",
  "tiny_http",
@@ -596,6 +603,7 @@ dependencies = [
  "hex",
  "httpdate",
  "mesh-install",
+ "mesh-text",
  "rand",
  "serde",
  "serde_json",
@@ -610,6 +618,7 @@ dependencies = [
  "base64",
  "ed25519-dalek",
  "mesh-install",
+ "mesh-text",
  "rand",
  "serde",
  "serde_json",
@@ -617,6 +626,10 @@ dependencies = [
  "toml 0.8.23",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "mesh-text"
+version = "0.1.0"
 
 [[package]]
 name = "native-tls"

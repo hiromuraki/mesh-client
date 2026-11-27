@@ -27,7 +27,12 @@ pub(crate) fn attempt(
     match child.try_wait() {
         Ok(Some(status)) => return Attempt::Exited(Some(status)),
         Ok(None) => {}
-        Err(err) => return Attempt::NotYet(format!("等待 core 进程失败: {err}")),
+        Err(err) => {
+            return Attempt::NotYet(mesh_text::format(
+                mesh_text::id::CORE_ERROR_WAIT_FAILED,
+                &[&err],
+            ))
+        }
     }
     match mesh_etrpc::show_node_info(rpc, options.probe_timeout) {
         Ok(node) => match check(&node, expect) {
@@ -42,28 +47,31 @@ pub(crate) fn attempt(
 pub(crate) fn check(node: &NodeInfo, expect: &Expect) -> Result<(), String> {
     if !expect.hostname.is_empty() {
         if node.hostname != expect.hostname {
-            return Err(format!(
-                "core 返回的节点与本机配置不匹配 (hostname={} ip={})",
-                node.hostname, node.ipv4
+            return Err(mesh_text::format(
+                mesh_text::id::CORE_ERROR_IDENTITY_MISMATCH,
+                &[&node.hostname, &node.ipv4],
             ));
         }
     } else if !expect.ipv4.is_empty() && !node.ipv4.starts_with(&expect.ipv4) {
-        return Err(format!(
-            "core 返回的节点与本机配置不匹配 (hostname={} ip={})",
-            node.hostname, node.ipv4
+        return Err(mesh_text::format(
+            mesh_text::id::CORE_ERROR_IDENTITY_MISMATCH,
+            &[&node.hostname, &node.ipv4],
         ));
     }
     // 地址还没分配下来（刚起来的 core 常见）：这时候定格会把“未连接”钉死在
     // 快照里，之后再没人改写，而 core 其实早就通了。继续等下一轮。
     if node.ipv4.is_empty() {
-        return Err("节点已上线，等待分配虚拟 IP".to_string());
+        return Err(mesh_text::get(mesh_text::id::CORE_TEXT_NODE_ONLINE).to_string());
     }
     Ok(())
 }
 
 /// 把探测时限拼成人话，供 `StartFailed` 的 reason 用。
 pub(crate) fn timeout_message(timeout: Duration, reason: &str) -> String {
-    format!("{} 秒内未确认 core 就绪: {reason}", timeout.as_secs_f64())
+    mesh_text::format(
+        mesh_text::id::CORE_ERROR_READY_TIMEOUT,
+        &[&timeout.as_secs_f64(), &reason],
+    )
 }
 
 #[cfg(test)]

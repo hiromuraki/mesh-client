@@ -167,7 +167,10 @@ pub fn locate(explicit: &Path) -> Result<PathBuf, String> {
     if let Some(path) = search_path(CORE_NAME) {
         return Ok(path);
     }
-    Err(format!("找不到 {CORE_NAME}，请在设置页填写 core 路径"))
+    Err(mesh_text::format(
+        mesh_text::id::CORE_ERROR_CORE_NOT_FOUND,
+        &[&CORE_NAME],
+    ))
 }
 
 /// 与 `mesh_install::platform::core_name()` 同一个名字。

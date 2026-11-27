@@ -28,7 +28,10 @@ pub(crate) fn pump<R: Read>(mut reader: R, sink: &LineSink) {
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(err) => {
                 // 管道出错时也要把剩下的读空，否则 core 写满缓冲就卡住。
-                emit(sink, &format!("core 输出中断: {err}"));
+                emit(
+                    sink,
+                    &mesh_text::format(mesh_text::id::CORE_ERROR_OUTPUT_INTERRUPTED, &[&err]),
+                );
                 break;
             }
         };
@@ -52,7 +55,7 @@ pub(crate) fn pump<R: Read>(mut reader: R, sink: &LineSink) {
         // 与 Go 一样：报一句之后不再逐行转交，但必须把管道读空。
         emit(
             sink,
-            &format!("core 输出中断: 单行超过 {} 字节，已丢弃剩余内容", MAX_LINE),
+            &mesh_text::format(mesh_text::id::CORE_ERROR_LINE_TOO_LONG, &[&MAX_LINE]),
         );
         let mut sink_bytes = [0u8; 64 * 1024];
         while matches!(reader.read(&mut sink_bytes), Ok(n) if n > 0) {}

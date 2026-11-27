@@ -124,7 +124,10 @@ impl CoreThread {
             }),
             Err(err) => self.emit(Event::Exited {
                 gen: running.gen,
-                err: Some(format!("等待 core 退出失败: {err}")),
+                err: Some(mesh_text::format(
+                    mesh_text::id::CORE_ERROR_WAIT_EXIT,
+                    &[&err],
+                )),
             }),
         }
     }
@@ -213,7 +216,10 @@ impl CoreThread {
                 }
                 self.emit(Event::StartFailed {
                     gen: running.gen,
-                    reason: format!("core 进程已退出（{}）", describe_status_opt(status)),
+                    reason: mesh_text::format(
+                        mesh_text::id::CORE_ERROR_PROCESS_EXITED,
+                        &[&describe_status_opt(status)],
+                    ),
                 });
             }
         }
@@ -222,12 +228,14 @@ impl CoreThread {
     /// 到时限还没确认就绪：停掉那个进程，报启动失败。
     fn fail_ready(&mut self, pending: Pending) {
         let gen = pending.running.gen;
-        let reason = pending.last.unwrap_or_else(|| "超时".to_string());
+        let reason = pending
+            .last
+            .unwrap_or_else(|| mesh_text::get(mesh_text::id::CORE_TEXT_TIMEOUT).to_string());
         // 探测期间进程可能已经半起来：先当成“在跑”交给 stop 处理，停不掉就报出来。
         self.running = Some(pending.running);
         let stop_note = match self.stop(false) {
             Ok(()) => String::new(),
-            Err(err) => format!("；停止 core 失败: {err}"),
+            Err(err) => mesh_text::format(mesh_text::id::CORE_ERROR_STOP_FAILED, &[&err]),
         };
         self.emit(Event::StartFailed {
             gen,
@@ -287,12 +295,15 @@ impl CoreThread {
         process::configure(&mut cmd);
         let mut child = cmd
             .spawn()
-            .map_err(|err| format!("启动 core 失败: {err}"))?;
+            .map_err(|err| mesh_text::format(mesh_text::id::CORE_ERROR_LAUNCH, &[&err]))?;
         let pid = child.id();
         if let Err(err) = process::assign_to_job(pid) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!("接管 core 进程生命周期失败: {err}"));
+            return Err(mesh_text::format(
+                mesh_text::id::CORE_ERROR_ASSIGN_JOB_LIFECYCLE,
+                &[&err],
+            ));
         }
         let mut pumps = Vec::with_capacity(2);
         for pipe in [
@@ -373,7 +384,12 @@ fn terminate_and_reap(mut running: Running) -> Result<Option<ExitStatus>, (Runni
             let _ = process::terminate(pid, true);
             match wait_exit(&mut running.child, KILL_GRACE) {
                 Some(status) => Some(status),
-                None => return Err((running, format!("core 进程 {pid} 未能退出"))),
+                None => {
+                    return Err((
+                        running,
+                        mesh_text::format(mesh_text::id::CORE_ERROR_PROCESS_STUCK, &[&pid]),
+                    ))
+                }
             }
         }
     };
@@ -403,7 +419,7 @@ fn wait_exit(child: &mut Child, grace: Duration) -> Option<ExitStatus> {
 fn describe_status_opt(status: Option<ExitStatus>) -> String {
     match status.and_then(describe_status) {
         Some(err) => err,
-        None => "进程已退出".to_string(),
+        None => mesh_text::get(mesh_text::id::CORE_TEXT_PROCESS_EXITED).to_string(),
     }
 }
 
@@ -416,11 +432,17 @@ fn describe_status(status: ExitStatus) -> Option<String> {
     {
         use std::os::unix::process::ExitStatusExt;
         if let Some(signal) = status.signal() {
-            return Some(format!("被信号 {signal} 终止"));
+            return Some(mesh_text::format(
+                mesh_text::id::CORE_TEXT_KILLED_BY_SIGNAL,
+                &[&signal],
+            ));
         }
     }
     match status.code() {
-        Some(code) => Some(format!("退出码 {code}")),
-        None => Some("非正常退出".to_string()),
+        Some(code) => Some(mesh_text::format(
+            mesh_text::id::CORE_TEXT_EXIT_CODE,
+            &[&code],
+        )),
+        None => Some(mesh_text::get(mesh_text::id::CORE_TEXT_ABNORMAL_EXIT).to_string()),
     }
 }

@@ -70,31 +70,39 @@ impl Engine {
             config.created_at = clock::unix_now();
             // 注册成功即已消耗 token：身份必须立刻落盘。后面停 core / 写配置失败只
             // 影响“生效”，不能让用户拿着一个已经作废的 token 重来。
-            self.store
-                .save_client(&config)
-                .map_err(|err| format!("保存注册结果失败: {err}"))?;
+            self.store.save_client(&config).map_err(|err| {
+                mesh_text::format(mesh_text::id::ENGINE_TEXT_SAVE_REGISTER_FAILED, &[&err])
+            })?;
             // 设备身份变了（管理端新建了槽位、或这台机器改绑另一台设备）：上一台设备
             // 的凭据还留在磁盘上，core 会先带着它启动，而控制面要等冷却才会签发新的。
             // 丢掉旧的那份，下一轮心跳就按「没有凭据」重签。
             if previous_device_id != config.device_id {
-                self.store
-                    .remove_credential()
-                    .map_err(|err| format!("清理旧设备的凭据失败: {err}"))?;
+                self.store.remove_credential().map_err(|err| {
+                    mesh_text::format(
+                        mesh_text::id::ENGINE_TEXT_REMOVE_OLD_CREDENTIAL_FAILED,
+                        &[&err],
+                    )
+                })?;
             }
             self.stop_core()?;
-            self.store
-                .write_config(&reply.config_toml)
-                .map_err(|err| format!("写入 config.toml 失败: {err}"))?;
+            self.store.write_config(&reply.config_toml).map_err(|err| {
+                mesh_text::format(mesh_text::id::ENGINE_TEXT_WRITE_CONFIG_FAILED, &[&err])
+            })?;
             self.refresh_identity();
             self.client = Some(config.clone());
             self.local_ip.clear();
             self.set_status(Status::Connecting, String::new());
-            self.logf("app", &format!("注册成功，设备 ID {}", config.device_id));
+            self.logf(
+                "app",
+                &mesh_text::format(mesh_text::id::ENGINE_LOG_REGISTERED, &[&config.device_id]),
+            );
             return Ok(());
         }
 
         if config.device_id.is_empty() {
-            return Err("尚未注册，请填写 token".to_string());
+            return Err(
+                mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED_TOKEN).to_string(),
+            );
         }
         self.stop_core()?;
         self.store
@@ -102,7 +110,10 @@ impl Engine {
             .map_err(|err| err.to_string())?;
         self.client = Some(config);
         self.set_status(Status::Connecting, String::new());
-        self.logf("app", "设置已保存");
+        self.logf(
+            "app",
+            mesh_text::get(mesh_text::id::ENGINE_LOG_SETTINGS_SAVED),
+        );
         Ok(())
     }
 
@@ -110,12 +121,12 @@ impl Engine {
     /// 服务端上的设备记录不受影响，重新注册即可再次绑定。
     pub(crate) fn reset_config(&mut self) -> Result<(), String> {
         self.stop_core()?;
-        self.store
-            .clear_device()
-            .map_err(|err| format!("清空设备身份失败: {err}"))?;
-        self.store
-            .remove_config()
-            .map_err(|err| format!("删除 config.toml 失败: {err}"))?;
+        self.store.clear_device().map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_CLEAR_DEVICE_FAILED, &[&err])
+        })?;
+        self.store.remove_config().map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err])
+        })?;
         let _ = self.store.remove_credential();
         self.refresh_identity();
         self.client = None;
@@ -123,7 +134,10 @@ impl Engine {
         self.core_version.clear();
         self.network_name.clear();
         self.set_status(Status::Unconfigured, String::new());
-        self.logf("app", "已删除本地配置");
+        self.logf(
+            "app",
+            mesh_text::get(mesh_text::id::ENGINE_LOG_LOCAL_CONFIG_DELETED),
+        );
         Ok(())
     }
 }
@@ -132,7 +146,7 @@ impl Engine {
 fn normalize_server_url(raw: &str) -> Result<String, String> {
     let text = raw.trim();
     if text.is_empty() {
-        return Err("请填写服务端地址".to_string());
+        return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_SERVER_URL_REQUIRED).to_string());
     }
     let with_scheme = if text.contains("://") {
         text.to_string()
@@ -141,14 +155,14 @@ fn normalize_server_url(raw: &str) -> Result<String, String> {
     };
     let (scheme, rest) = with_scheme
         .split_once("://")
-        .ok_or_else(|| "服务端地址无效".to_string())?;
+        .ok_or_else(|| mesh_text::get(mesh_text::id::ENGINE_TEXT_SERVER_URL_INVALID).to_string())?;
     let scheme = scheme.to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
-        return Err("服务端地址只支持 http/https".to_string());
+        return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_SERVER_URL_SCHEME).to_string());
     }
     let host = rest.split('/').next().unwrap_or_default();
     if host.is_empty() {
-        return Err("服务端地址缺少主机".to_string());
+        return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_SERVER_URL_NO_HOST).to_string());
     }
     Ok(format!("{scheme}://{}", rest.trim_end_matches('/')))
 }
@@ -156,15 +170,21 @@ fn normalize_server_url(raw: &str) -> Result<String, String> {
 /// 注册失败的原因，翻成用户能看懂的一句话。
 fn register_error(err: &remote::Error) -> String {
     match err {
-        remote::Error::Unauthorized { .. } => "token 无效或已过期".to_string(),
-        remote::Error::Api { status: 401, .. } => "token 无效或已过期".to_string(),
+        remote::Error::Unauthorized { .. } => {
+            mesh_text::get(mesh_text::id::ENGINE_TEXT_TOKEN_INVALID).to_string()
+        }
+        remote::Error::Api { status: 401, .. } => {
+            mesh_text::get(mesh_text::id::ENGINE_TEXT_TOKEN_INVALID).to_string()
+        }
         remote::Error::Api {
             status: 409,
             message,
             ..
-        } => format!("服务端拒绝注册: {message}"),
-        remote::Error::Api { .. } => format!("注册失败: {err}"),
-        _ => format!("无法连接服务端: {err}"),
+        } => mesh_text::format(mesh_text::id::ENGINE_TEXT_REGISTER_REJECTED, &[&message]),
+        remote::Error::Api { .. } => {
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_REGISTER_FAILED, &[&err])
+        }
+        _ => mesh_text::format(mesh_text::id::ENGINE_TEXT_REGISTER_CONNECT_FAILED, &[&err]),
     }
 }
 

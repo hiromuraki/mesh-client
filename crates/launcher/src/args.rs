@@ -1,3 +1,4 @@
+use mesh_text::id;
 use std::path::PathBuf;
 
 /// 启动器只做三件事：启动、装本地包、从地址拉包装。没有别的开关。
@@ -32,8 +33,19 @@ pub enum ParseError {
     Invalid(String),
 }
 
-pub fn usage() -> &'static str {
-    "启动\n  mesh [--root <安装根>]\n\n安装本地包\n  mesh --file <包> [--root <安装根>] [--wait-for <进程号>] [--sha256 <摘要>] [--force]\n\n从地址下载并安装\n  mesh --url <地址> [--sha256 <摘要>] [--force]"
+pub fn usage() -> String {
+    let indented = |key: &'static str| format!("  {}", mesh_text::get(key));
+    [
+        mesh_text::get(id::LAUNCHER_TEXT_USAGE_LAUNCH).to_string(),
+        indented(id::LAUNCHER_TEXT_USAGE_LAUNCH_LINE),
+        String::new(),
+        mesh_text::get(id::LAUNCHER_TEXT_USAGE_INSTALL_HEAD).to_string(),
+        indented(id::LAUNCHER_TEXT_USAGE_INSTALL_LINE),
+        String::new(),
+        mesh_text::get(id::LAUNCHER_TEXT_USAGE_URL_HEAD).to_string(),
+        indented(id::LAUNCHER_TEXT_USAGE_URL_LINE),
+    ]
+    .join("\n")
 }
 
 pub fn parse(argv: &[String]) -> Result<Options, ParseError> {
@@ -57,19 +69,30 @@ pub fn parse(argv: &[String]) -> Result<Options, ParseError> {
             "--sha256" => sha = Some(value(argv, &mut i, inline, name)?),
             "--wait-for" => {
                 let v = value(argv, &mut i, inline, name)?;
-                wait = Some(
-                    v.parse::<u32>()
-                        .map_err(|_| ParseError::Invalid(format!("--wait-for 不是进程号: {v}")))?,
-                );
+                wait = Some(v.parse::<u32>().map_err(|_| {
+                    ParseError::Invalid(mesh_text::format(
+                        id::LAUNCHER_ERROR_WAIT_FOR_INVALID,
+                        &[&v],
+                    ))
+                })?);
             }
             "--force" => force = true,
             "-h" | "--help" => return Err(ParseError::Help),
-            other => return Err(ParseError::Invalid(format!("未知参数: {other}"))),
+            other => {
+                return Err(ParseError::Invalid(mesh_text::format(
+                    id::LAUNCHER_ERROR_UNKNOWN_OPTION,
+                    &[&other],
+                )));
+            }
         }
         i += 1;
     }
     let command = match (file, url) {
-        (Some(_), Some(_)) => return Err(ParseError::Invalid("--file 与 --url 只能给一个".into())),
+        (Some(_), Some(_)) => {
+            return Err(ParseError::Invalid(
+                mesh_text::get(id::LAUNCHER_ERROR_FILE_AND_URL).to_string(),
+            ));
+        }
         (Some(f), None) => Command::Install {
             source: Source::File(f),
             sha256: sha,
@@ -85,7 +108,7 @@ pub fn parse(argv: &[String]) -> Result<Options, ParseError> {
         (None, None) => {
             if sha.is_some() || wait.is_some() || force {
                 return Err(ParseError::Invalid(
-                    "--sha256 / --wait-for / --force 只在安装时使用".into(),
+                    mesh_text::get(id::LAUNCHER_ERROR_INSTALL_ONLY_FLAGS).to_string(),
                 ));
             }
             Command::Launch
@@ -104,9 +127,12 @@ fn value(
         return Ok(v);
     }
     *i += 1;
-    argv.get(*i)
-        .cloned()
-        .ok_or_else(|| ParseError::Invalid(format!("{name} 缺值")))
+    argv.get(*i).cloned().ok_or_else(|| {
+        ParseError::Invalid(mesh_text::format(
+            id::LAUNCHER_ERROR_MISSING_VALUE,
+            &[&name],
+        ))
+    })
 }
 
 #[cfg(test)]

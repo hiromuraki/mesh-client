@@ -5,7 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# 只依赖 etrpc：就绪探测要 NodeInfo，避免两处定义同一个结构。
+mesh-text = { workspace = true }
+# 只有 etrpc 还带语义：就绪探测要 NodeInfo，避免两处定义同一个结构。
 mesh-etrpc = { workspace = true }
 
 # Job 对象（KILL_ON_JOB_CLOSE）与进程组信号（setsid / kill(-pid)）各要一份系统调用。

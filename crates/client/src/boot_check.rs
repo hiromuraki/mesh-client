@@ -7,8 +7,12 @@ use std::path::Path;
 /// 在安装根写 .boot-ok-<标记>。
 pub(crate) fn write_marker(root: &Path, token: &str) -> Result<(), String> {
     let marker = root.join(format!(".boot-ok-{token}"));
-    std::fs::write(&marker, b"ok")
-        .map_err(|err| format!("写入启动标记 {} 失败: {err}", marker.display()))
+    std::fs::write(&marker, b"ok").map_err(|err| {
+        mesh_text::format(
+            mesh_text::id::CLIENT_ERROR_WRITE_BOOT_MARKER,
+            &[&marker.display(), &err],
+        )
+    })
 }
 
 #[cfg(test)]

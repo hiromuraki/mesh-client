@@ -7,6 +7,7 @@ use crate::assets;
 use crate::guard;
 use mesh_engine::{build_nodes, Cmd, LocalNode, NodeRow, SettingsInput, Snapshot, StateCell};
 use mesh_etrpc::{Peer, Route};
+use mesh_text::id;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::net::SocketAddr;
@@ -61,7 +62,10 @@ impl Response {
                 body,
                 after_send: None,
             },
-            Err(err) => Response::error(500, &format!("序列化响应失败: {err}")),
+            Err(err) => Response::error(
+                500,
+                &mesh_text::format(id::PANEL_ERROR_SERIALIZE_RESPONSE, &[&err]),
+            ),
         }
     }
 
@@ -332,7 +336,7 @@ impl Router {
         match reply_rx.recv() {
             Ok(Ok(snapshot)) => Response::json(&snapshot),
             Ok(Err(message)) => Response::error(400, &message),
-            Err(_) => Response::error(500, "引擎未运行"),
+            Err(_) => Response::error(500, mesh_text::get(id::PANEL_TEXT_ENGINE_NOT_RUNNING)),
         }
     }
 
@@ -350,7 +354,7 @@ impl Router {
         match reply_rx.recv() {
             Ok(Ok(snapshot)) => Response::json(&snapshot),
             Ok(Err(message)) => Response::error(400, &message),
-            Err(_) => Response::error(500, "引擎未运行"),
+            Err(_) => Response::error(500, mesh_text::get(id::PANEL_TEXT_ENGINE_NOT_RUNNING)),
         }
     }
 
@@ -362,7 +366,7 @@ impl Router {
         match reply_rx.recv() {
             Ok(Ok(snapshot)) => Response::json(&snapshot),
             Ok(Err(message)) => Response::error(500, &message),
-            Err(_) => Response::error(500, "引擎未运行"),
+            Err(_) => Response::error(500, mesh_text::get(id::PANEL_TEXT_ENGINE_NOT_RUNNING)),
         }
     }
 
@@ -377,7 +381,9 @@ impl Router {
         match reply_rx.recv_timeout(UPDATE_REPLY_TIMEOUT) {
             Ok(Ok(())) | Err(RecvTimeoutError::Timeout) => Response::json(&snapshot),
             Ok(Err(message)) => Response::error(400, &message),
-            Err(RecvTimeoutError::Disconnected) => Response::error(500, "引擎未运行"),
+            Err(RecvTimeoutError::Disconnected) => {
+                Response::error(500, mesh_text::get(id::PANEL_TEXT_ENGINE_NOT_RUNNING))
+            }
         }
     }
 
@@ -397,8 +403,12 @@ impl Router {
     }
 
     fn send(&self, cmd: Cmd) -> Result<(), String> {
-        let tx = self.tx.lock().map_err(|_| "引擎未运行".to_string())?;
-        tx.send(cmd).map_err(|_| "引擎未运行".to_string())
+        let tx = self
+            .tx
+            .lock()
+            .map_err(|_| mesh_text::get(id::PANEL_TEXT_ENGINE_NOT_RUNNING).to_string())?;
+        tx.send(cmd)
+            .map_err(|_| mesh_text::get(id::PANEL_TEXT_ENGINE_NOT_RUNNING).to_string())
     }
 }
 

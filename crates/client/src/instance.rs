@@ -19,10 +19,11 @@ pub(crate) fn wake_existing(
         if open(&url).is_ok() {
             return Ok(());
         }
-        crate::platform::say_err(&format!("{APP_TITLE}: 已有实例在运行，面板地址: {url}"));
+        let message = mesh_text::format(mesh_text::id::CLIENT_TEXT_INSTANCE_RUNNING, &[&url]);
+        crate::platform::say_err(&format!("{APP_TITLE}: {message}"));
         return Ok(());
     }
-    Err("已有实例在运行".to_string())
+    Err(mesh_text::get(mesh_text::id::CLIENT_ERROR_INSTANCE_RUNNING).to_string())
 }
 
 #[cfg(test)]
@@ -68,7 +69,7 @@ mod tests {
         let path = temp_ui("missing", None);
         assert_eq!(
             wake_existing(&path, |_| Ok(())).unwrap_err(),
-            "已有实例在运行"
+            mesh_text::get(mesh_text::id::CLIENT_ERROR_INSTANCE_RUNNING)
         );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { applyUpdate, reconnect, select, setActionError, useClient } from "../client";
-import { clockTime, dateTime, errorMessage, statusText } from "../format";
+import { clockTime, dateTime, errorMessage, joinOrDash, latencyText, pathText, releaseVersion, statusText } from "../format";
 import type { NodeRow } from "../api/types";
 import TopologyView from "./TopologyView.vue";
 
@@ -16,11 +16,11 @@ const localRow = computed(() => nodes.value.find((node) => node.pathKind === "me
 const directCount = computed(() => remote.value.filter((node) => node.pathKind === "direct").length);
 const relayCount = computed(() => remote.value.filter((node) => node.pathKind === "relay").length);
 
-// latency 是 "6.73 ms" 这种展示串，取数字部分做统计；"—" 会变成 NaN 被丢掉。
+// 延迟以毫秒下发，未知是 null；统计只算有数的那些。
 const latency = computed(() => {
   const values = remote.value
-    .map((node) => Number.parseFloat(node.latency))
-    .filter((value) => Number.isFinite(value));
+    .map((node) => node.latencyMs)
+    .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   if (!values.length) return null;
   const sum = values.reduce((total, value) => total + value, 0);
   return {
@@ -124,9 +124,9 @@ async function copyIp(ip: string): Promise<void> {
 
 // 延迟条按最慢那个节点做归一，颜色沿用路径标签的语义。
 function barWidth(node: NodeRow): number {
-  const ms = Number.parseFloat(node.latency);
+  const ms = node.latencyMs;
   const max = latency.value?.max ?? 0;
-  if (!Number.isFinite(ms) || max <= 0) return 0;
+  if (ms === null || !Number.isFinite(ms) || max <= 0) return 0;
   return Math.max(6, Math.round((ms / max) * 100));
 }
 
@@ -283,9 +283,9 @@ async function runApplyUpdate(): Promise<void> {
                     <span class="route-text">不参与延迟统计</span>
                   </span>
                 </td>
-                <td class="col-proto">{{ localRow?.proto || "—" }}</td>
+                <td class="col-proto">{{ joinOrDash(localRow?.tunnels) }}</td>
                 <td class="col-nat" :title="'本机 STUN 判定（UDP）'">{{ localRow?.natType || snapshot?.natTypeUdp || "—" }}</td>
-                <td class="col-ver">{{ localRow?.coreVersion || snapshot?.coreVersion || "—" }}</td>
+                <td class="col-ver">{{ localRow ? releaseVersion(localRow.version) : snapshot?.coreVersion || "—" }}</td>
                 <td class="num"><span class="lat"><b>—</b></span></td>
               </tr>
               <tr v-for="node in remote" :key="node.ip">
@@ -303,17 +303,17 @@ async function runApplyUpdate(): Promise<void> {
                 </td>
                 <td class="col-route">
                   <span class="route">
-                    <span class="tag" :class="node.pathKind">{{ node.pathKind === "relay" ? "中继" : node.pathKind === "route" ? "路由" : "直连" }}</span>
+                    <span class="tag" :class="node.pathKind">{{ pathText(node.pathKind) }}</span>
                     <span class="route-text" :title="routeText(node)">{{ routeText(node) }}</span>
                     <span v-if="node.hops > 1" class="hops">{{ node.hops }} 跳</span>
                   </span>
                 </td>
-                <td class="col-proto">{{ node.proto }}</td>
-                <td class="col-nat">{{ node.natType }}</td>
-                <td class="col-ver" :title="node.coreVersion">{{ node.coreVersion }}</td>
+                <td class="col-proto">{{ joinOrDash(node.tunnels) }}</td>
+                <td class="col-nat">{{ node.natType || "—" }}</td>
+                <td class="col-ver" :title="node.version">{{ releaseVersion(node.version) }}</td>
                 <td class="num">
                   <span class="lat">
-                    <b :class="node.pathKind">{{ node.latency }}</b>
+                    <b :class="node.pathKind">{{ latencyText(node.latencyMs) }}</b>
                     <i class="bar"><i :class="node.pathKind" :style="{ width: barWidth(node) + '%' }" /></i>
                   </span>
                 </td>

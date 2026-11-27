@@ -36,15 +36,21 @@ pub enum Error {
         /// 响应 `Date` 头解析出的服务端时间；缺失或无法解析时是 `None`。
         server_time: Option<SystemTime>,
     },
-    #[error("{message}（HTTP {status}）")]
+    #[error(
+        "{}",
+        mesh_text::format(mesh_text::id::REMOTE_ERROR_API, &[message, &status])
+    )]
     Api {
         status: u16,
         code: String,
         message: String,
     },
-    #[error("传输失败: {0}")]
+    #[error(
+        "{}",
+        mesh_text::format(mesh_text::id::REMOTE_ERROR_TRANSPORT, &[.0])
+    )]
     Transport(String),
-    #[error("响应解析失败: {0}")]
+    #[error("{}", mesh_text::format(mesh_text::id::REMOTE_ERROR_DECODE, &[.0]))]
     Decode(String),
 }
 
@@ -165,15 +171,30 @@ impl Client {
         if response.status() != 200 {
             return Err(api_error(response.status(), response));
         }
-        let mut file = File::create(dst)
-            .map_err(|err| Error::Transport(format!("创建 {} 失败: {err}", dst.display())))?;
+        let mut file = File::create(dst).map_err(|err| {
+            Error::Transport(mesh_text::format(
+                mesh_text::id::REMOTE_ERROR_CREATE_FILE,
+                &[&dst.display(), &err],
+            ))
+        })?;
         let mut reader = response.into_reader().take(limit + 1);
-        let written = io::copy(&mut reader, &mut file)
-            .map_err(|err| Error::Transport(format!("写入 {} 失败: {err}", dst.display())))?;
-        file.flush()
-            .map_err(|err| Error::Transport(format!("写入 {} 失败: {err}", dst.display())))?;
+        let written = io::copy(&mut reader, &mut file).map_err(|err| {
+            Error::Transport(mesh_text::format(
+                mesh_text::id::REMOTE_ERROR_WRITE_FILE,
+                &[&dst.display(), &err],
+            ))
+        })?;
+        file.flush().map_err(|err| {
+            Error::Transport(mesh_text::format(
+                mesh_text::id::REMOTE_ERROR_WRITE_FILE,
+                &[&dst.display(), &err],
+            ))
+        })?;
         if written > limit {
-            return Err(Error::Transport(format!("响应超过 {limit} 字节上限")));
+            return Err(Error::Transport(mesh_text::format(
+                mesh_text::id::REMOTE_ERROR_BODY_TOO_LARGE,
+                &[&limit],
+            )));
         }
         Ok(written)
     }
@@ -247,10 +268,18 @@ impl Heartbeat {
         if self.config_b64.is_empty() {
             return Ok(String::new());
         }
-        let raw = BASE64
-            .decode(&self.config_b64)
-            .map_err(|err| Error::Decode(format!("配置解码失败: {err}")))?;
-        String::from_utf8(raw).map_err(|err| Error::Decode(format!("配置不是 UTF-8: {err}")))
+        let raw = BASE64.decode(&self.config_b64).map_err(|err| {
+            Error::Decode(mesh_text::format(
+                mesh_text::id::REMOTE_ERROR_CONFIG_DECODE,
+                &[&err],
+            ))
+        })?;
+        String::from_utf8(raw).map_err(|err| {
+            Error::Decode(mesh_text::format(
+                mesh_text::id::REMOTE_ERROR_CONFIG_NOT_UTF8,
+                &[&err],
+            ))
+        })
     }
 }
 
@@ -343,9 +372,12 @@ fn api_error(status: u16, response: ureq::Response) -> Error {
 fn decode<T: DeserializeOwned>(response: ureq::Response, limit: u64) -> Result<T, Error> {
     let mut limited = response.into_reader().take(limit);
     let mut raw = Vec::new();
-    limited
-        .read_to_end(&mut raw)
-        .map_err(|err| Error::Decode(format!("读响应失败: {err}")))?;
+    limited.read_to_end(&mut raw).map_err(|err| {
+        Error::Decode(mesh_text::format(
+            mesh_text::id::REMOTE_ERROR_READ_RESPONSE,
+            &[&err],
+        ))
+    })?;
     serde_json::from_slice(&raw).map_err(|err| Error::Decode(err.to_string()))
 }
 

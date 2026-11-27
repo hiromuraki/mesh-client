@@ -15,6 +15,7 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [dependencies]
+mesh-text = { workspace = true }
 # mesh-install 提供 atomic_replace：本地文件要么是旧的、要么是新的，不能写一半。
 mesh-install = { workspace = true }
 serde = { workspace = true }

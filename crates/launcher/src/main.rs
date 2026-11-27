@@ -50,7 +50,10 @@ fn main() -> ExitCode {
     match outcome {
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
-            log::line(&format!("失败: {e}"));
+            log::line(&mesh_text::format(
+                mesh_text::id::LAUNCHER_TEXT_FAILED,
+                &[&e],
+            ));
             eprintln!("mesh: {e}");
             ExitCode::FAILURE
         }
@@ -59,10 +62,11 @@ fn main() -> ExitCode {
 
 /// root_dir 就是启动器所在目录：bin/、packages/、config/、log/ 都在它下面。
 fn root_dir() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("取自身路径失败: {e}"))?;
+    let exe = std::env::current_exe()
+        .map_err(|e| mesh_text::format(mesh_text::id::LAUNCHER_ERROR_EXE_PATH, &[&e]))?;
     exe.parent()
         .map(Path::to_path_buf)
-        .ok_or_else(|| "取安装目录失败".to_string())
+        .ok_or_else(|| mesh_text::get(mesh_text::id::LAUNCHER_ERROR_INSTALL_DIR).to_string())
 }
 
 /// launch_installed 在 Windows 上拉起客户端就放手：客户端是独立进程，
@@ -73,12 +77,12 @@ fn launch_installed(root: &Path) -> Result<i32, String> {
     install::recover(root)?;
     let exe = root.join("bin").join(launch::CLIENT_EXE);
     if !exe.is_file() {
-        return Err(format!(
-            "{} 不存在；用 mesh --url <包地址> 装一个",
-            exe.display()
+        return Err(mesh_text::format(
+            mesh_text::id::LAUNCHER_ERROR_CLIENT_MISSING,
+            &[&exe.display()],
         ));
     }
-    log::line("启动客户端");
+    log::line(mesh_text::get(mesh_text::id::LAUNCHER_TEXT_START_CLIENT));
     launch::start(&exe, root, None)?;
     Ok(0)
 }

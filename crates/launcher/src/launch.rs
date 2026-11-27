@@ -59,7 +59,10 @@ mod imp {
                 runas(exe, root, boot_check)?;
                 Ok(None)
             }
-            Err(e) => Err(format!("启动客户端失败: {e}")),
+            Err(e) => Err(mesh_text::format(
+                mesh_text::id::LAUNCHER_ERROR_START_CLIENT,
+                &[&e],
+            )),
         }
     }
 
@@ -86,9 +89,12 @@ mod imp {
         if ok == 0 {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(ERROR_CANCELLED) {
-                return Err("已取消管理员授权（UAC），客户端未启动".into());
+                return Err(mesh_text::get(mesh_text::id::LAUNCHER_TEXT_UAC_CANCELLED).to_string());
             }
-            return Err(format!("启动客户端失败（需要管理员权限）: {err}"));
+            return Err(mesh_text::format(
+                mesh_text::id::LAUNCHER_ERROR_START_CLIENT_ADMIN,
+                &[&err],
+            ));
         }
         if !info.hProcess.is_null() {
             unsafe { CloseHandle(info.hProcess) };
@@ -120,8 +126,14 @@ mod imp {
             CloseHandle(handle);
             match code {
                 WAIT_OBJECT_0 => Ok(()),
-                WAIT_TIMEOUT => Err(format!("进程 {pid} 在 {}s 内没有退出", timeout.as_secs())),
-                other => Err(format!("等待进程 {pid} 失败: {other}")),
+                WAIT_TIMEOUT => Err(mesh_text::format(
+                    mesh_text::id::LAUNCHER_ERROR_WAIT_EXIT_TIMEOUT,
+                    &[&pid, &timeout.as_secs()],
+                )),
+                other => Err(mesh_text::format(
+                    mesh_text::id::LAUNCHER_ERROR_WAIT_EXIT,
+                    &[&pid, &other],
+                )),
             }
         }
     }
@@ -144,7 +156,9 @@ mod imp {
             cmd.arg("--boot-check").arg(token);
         }
         cmd.current_dir(root);
-        let child = cmd.spawn().map_err(|e| format!("启动客户端失败: {e}"))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| mesh_text::format(mesh_text::id::LAUNCHER_ERROR_START_CLIENT, &[&e]))?;
         Ok(Some(child))
     }
 
@@ -160,6 +174,9 @@ mod imp {
             }
             std::thread::sleep(Duration::from_millis(200));
         }
-        Err(format!("进程 {pid} 在 {}s 内没有退出", timeout.as_secs()))
+        Err(mesh_text::format(
+            mesh_text::id::LAUNCHER_ERROR_WAIT_EXIT_TIMEOUT,
+            &[&pid, &timeout.as_secs()],
+        ))
     }
 }

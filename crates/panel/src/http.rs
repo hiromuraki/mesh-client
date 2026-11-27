@@ -31,9 +31,9 @@ pub(crate) fn listen(first: u16, attempts: u16) -> Result<(Server, u16), String>
             Err(err) => last = err.to_string(),
         }
     }
-    Err(format!(
-        "127.0.0.1:{first}..{} 都被占用: {last}",
-        first + attempts - 1
+    Err(mesh_text::format(
+        mesh_text::id::PANEL_ERROR_LISTEN,
+        &[&first, &(first + attempts - 1), &last],
     ))
 }
 

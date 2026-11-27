@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 mesh-engine = { workspace = true }
 mesh-etrpc = { workspace = true }
+mesh-text = { workspace = true }
 
 # 回环 HTTP 服务端。只监听 127.0.0.1、没有 SSE/WebSocket，请求量是浏览器 2 秒
 # 一次的轮询；tiny_http 是写完的 HTTP/1.1 实现，自己写协议没有收益。

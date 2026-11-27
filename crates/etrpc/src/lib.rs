@@ -29,15 +29,21 @@ use std::time::Duration;
 /// 两种状态（就绪探测要区分它们）。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("连接 rpc portal {addr} 失败: {reason}")]
+    #[error(
+        "{}",
+        mesh_text::format(mesh_text::id::ETRPC_ERROR_CONNECT, &[&addr, &reason])
+    )]
     Connect { addr: SocketAddr, reason: String },
-    #[error("rpc 帧错误: {0}")]
+    #[error("{}", mesh_text::format(mesh_text::id::ETRPC_ERROR_FRAME, &[.0]))]
     Frame(String),
-    #[error("{field} 的 protobuf 字段非法")]
+    #[error(
+        "{}",
+        mesh_text::format(mesh_text::id::ETRPC_ERROR_PROTOCOL, &[field])
+    )]
     Protocol { field: &'static str },
     #[error("{0}")]
     Rpc(String),
-    #[error("rpc 查询超时")]
+    #[error("{}", mesh_text::get(mesh_text::id::ETRPC_ERROR_TIMEOUT))]
     Timeout,
 }
 

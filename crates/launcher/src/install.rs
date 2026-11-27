@@ -5,6 +5,7 @@ use mesh_install::failures::Failures;
 use mesh_install::layout;
 use mesh_install::manifest::Manifest;
 use mesh_install::version;
+use mesh_text::id;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::Read;
@@ -42,7 +43,7 @@ pub fn run(
     // 不能拿唯一的回滚材料去换一份还没验过的新包。
     recover(root)?;
     if let Some(pid) = wait_for {
-        log::line(&format!("等待进程 {pid} 退出"));
+        log::line(&mesh_text::format(id::LAUNCHER_TEXT_WAIT_PROCESS, &[&pid]));
         launch::wait_exit(pid, WAIT_CLIENT)?;
     }
 
@@ -50,7 +51,7 @@ pub fn run(
         Source::File(p) => p,
         Source::Url(url) => {
             let dest = root.join(UPDATE_FILE);
-            log::line(&format!("下载 {url}"));
+            log::line(&mesh_text::format(id::LAUNCHER_TEXT_DOWNLOAD, &[&url]));
             download(&url, &dest)?;
             dest
         }
@@ -66,13 +67,19 @@ pub fn run(
             if owned {
                 let _ = fs::remove_file(&pkg);
             }
-            return Err(format!("包摘要不符：得到 {sum}，期望 {want}"));
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_DIGEST_MISMATCH,
+                &[&sum, &want],
+            ));
         }
     }
-    log::line(&format!("包摘要 {sum}"));
+    log::line(&mesh_text::format(
+        id::LAUNCHER_TEXT_PACKAGE_DIGEST,
+        &[&sum],
+    ));
 
     if let Err(e) = install_from_file(root, &pkg, force) {
-        log::line(&format!("安装失败: {e}"));
+        log::line(&mesh_text::format(id::LAUNCHER_TEXT_INSTALL_FAILED, &[&e]));
         if owned {
             let _ = fs::remove_file(&pkg);
         }
@@ -80,9 +87,10 @@ pub fn run(
         // 必须把它拉回来——否则节点就此静默离线，直到有人去双击 UAC。
         #[cfg(windows)]
         {
-            reload_current(root)
-                .map_err(|reload| format!("安装失败: {e}；重新拉起当前版本也失败: {reload}"))?;
-            log::line("已重新拉起当前版本");
+            reload_current(root).map_err(|reload| {
+                mesh_text::format(id::LAUNCHER_ERROR_INSTALL_AND_RELOAD, &[&e, &reload])
+            })?;
+            log::line(mesh_text::get(id::LAUNCHER_TEXT_RELOADED));
             return Ok(());
         }
         #[cfg(unix)]
@@ -95,7 +103,7 @@ pub fn run(
     }
     #[cfg(unix)]
     {
-        log::line("安装完成，由 systemd 拉起启动器");
+        log::line(mesh_text::get(id::LAUNCHER_TEXT_INSTALLED_FOR_SYSTEMD));
     }
     Ok(())
 }
@@ -108,9 +116,9 @@ pub(crate) fn recover(root: &Path) -> Result<(), String> {
     if !old.exists() {
         return Ok(());
     }
-    log::line("上次安装没有走完，回滚到 bin.old");
+    log::line(mesh_text::get(id::LAUNCHER_TEXT_RECOVER_STALE));
     let _ = fs::remove_dir_all(&bin);
-    fs::rename(&old, &bin).map_err(|e| format!("回滚失败: {e}"))?;
+    fs::rename(&old, &bin).map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_ROLLBACK, &[&e]))?;
     Ok(())
 }
 
@@ -127,10 +135,9 @@ pub(crate) fn install_from_file(
     let old_version = installed_version(&bin);
 
     let manifest = read_manifest(pkg)?;
-    log::line(&format!(
-        "安装 {}（清单 {} 个文件）",
-        manifest.version,
-        manifest.files.len()
+    log::line(&mesh_text::format(
+        id::LAUNCHER_TEXT_INSTALLING,
+        &[&manifest.version, &manifest.files.len()],
     ));
 
     // 降级防护：服务端把发布记录指回旧包时，客户端会当成“有新版本”下载下来。
@@ -138,18 +145,17 @@ pub(crate) fn install_from_file(
     if !force {
         if let Some(old) = old_version.as_deref() {
             if !version::is_newer(&manifest.version, old) {
-                return Err(format!(
-                    "拒绝安装 {}：不比已安装的 {old} 新（确实要装请加 --force）",
-                    manifest.version
+                return Err(mesh_text::format(
+                    id::LAUNCHER_ERROR_NOT_NEWER,
+                    &[&manifest.version, &old],
                 ));
             }
         }
         let failed = Failures::load(root);
         if failed.exhausted(&manifest.version) {
-            return Err(format!(
-                "拒绝安装 {}：已经失败过 {} 次，需要人工处理（确实要装请加 --force）",
-                manifest.version,
-                failed.count(&manifest.version)
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_FAILURES_EXHAUSTED,
+                &[&manifest.version, &failed.count(&manifest.version)],
             ));
         }
     }
@@ -158,17 +164,18 @@ pub(crate) fn install_from_file(
     // 那一步。宁可失败，也不要删掉唯一的回滚材料。
     let old = root.join(BIN_OLD);
     if old.exists() {
-        return Err(format!(
-            "{} 仍然存在：上次安装没有走完，先回滚再装",
-            old.display()
+        return Err(mesh_text::format(
+            id::LAUNCHER_ERROR_BIN_OLD_REMAINS,
+            &[&old.display()],
         ));
     }
     if bin.exists() {
-        fs::rename(&bin, &old).map_err(|e| format!("挪开旧 bin 失败: {e}"))?;
+        fs::rename(&bin, &old)
+            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MOVE_OLD_BIN, &[&e]))?;
     }
     if let Err(e) = fs::create_dir_all(&bin) {
         restore(root);
-        return Err(format!("创建 bin 失败: {e}"));
+        return Err(mesh_text::format(id::LAUNCHER_ERROR_CREATE_BIN, &[&e]));
     }
 
     if let Err(e) = unpack(pkg, &bin).and_then(|_| verify(&bin, &manifest)) {
@@ -177,7 +184,7 @@ pub(crate) fn install_from_file(
         Failures::load(root).record(&manifest.version);
         return Err(e);
     }
-    log::line("解包结果校验通过");
+    log::line(mesh_text::get(id::LAUNCHER_TEXT_VERIFIED));
     Ok(old_version)
 }
 
@@ -197,7 +204,7 @@ pub(crate) fn restore(root: &Path) {
     }
     let _ = fs::remove_dir_all(&bin);
     if let Err(e) = fs::rename(&old, &bin) {
-        log::line(&format!("回滚失败: {e}"));
+        log::line(&mesh_text::format(id::LAUNCHER_ERROR_ROLLBACK, &[&e]));
     }
 }
 
@@ -209,19 +216,19 @@ fn launch_and_check(root: &Path) -> Result<(), String> {
     let version = installed_version(&bin).unwrap_or_default();
     let token = token();
     launch::start(&bin.join(launch::CLIENT_EXE), root, Some(&token))?;
-    log::line("已启动新版本，等待启动确认");
+    log::line(mesh_text::get(id::LAUNCHER_TEXT_STARTED_NEW));
 
     if wait_boot_ok(root, &token, WAIT_BOOT) {
-        log::line("启动确认成功");
+        log::line(mesh_text::get(id::LAUNCHER_TEXT_BOOT_OK));
         Failures::load(root).clear(&version);
         commit(root);
         return Ok(());
     }
 
-    log::line("新版本没有确认启动，回退");
+    log::line(mesh_text::get(id::LAUNCHER_TEXT_BOOT_FAILED_ROLLBACK));
     Failures::load(root).record(&version);
     restore(root);
-    reload_current(root).map_err(|r| format!("回退后拉起旧版本失败: {r}"))
+    reload_current(root).map_err(|r| mesh_text::format(id::LAUNCHER_ERROR_RELOAD_OLD, &[&r]))
 }
 
 /// reload_current 拉起 bin/ 里现有的版本（不等启动确认）。
@@ -229,7 +236,10 @@ fn launch_and_check(root: &Path) -> Result<(), String> {
 fn reload_current(root: &Path) -> Result<(), String> {
     let exe = root.join("bin").join(launch::CLIENT_EXE);
     if !exe.is_file() {
-        return Err(format!("{} 不存在", exe.display()));
+        return Err(mesh_text::format(
+            id::LAUNCHER_ERROR_EXE_MISSING,
+            &[&exe.display()],
+        ));
     }
     launch::start(&exe, root, None)?;
     Ok(())
@@ -252,58 +262,73 @@ pub(crate) fn package_version(pkg: &Path) -> Result<String, String> {
 }
 
 fn read_manifest(pkg: &Path) -> Result<Manifest, String> {
-    let file = File::open(pkg).map_err(|e| format!("打开 {} 失败: {e}", pkg.display()))?;
-    let decoder =
-        zstd::Decoder::new(file).map_err(|e| format!("解压 {} 失败: {e}", pkg.display()))?;
+    let file = File::open(pkg)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_OPEN_PACKAGE, &[&pkg.display(), &e]))?;
+    let decoder = zstd::Decoder::new(file).map_err(|e| {
+        mesh_text::format(id::LAUNCHER_ERROR_DECOMPRESS_PACKAGE, &[&pkg.display(), &e])
+    })?;
     let mut archive = tar::Archive::new(decoder);
-    let entries = archive.entries().map_err(|e| format!("读取包失败: {e}"))?;
+    let entries = archive
+        .entries()
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_PACKAGE, &[&e]))?;
     for entry in entries {
-        let mut entry = entry.map_err(|e| format!("读取包条目失败: {e}"))?;
-        let path = entry.path().map_err(|e| format!("读取条目名失败: {e}"))?;
+        let mut entry =
+            entry.map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_PACKAGE_ENTRY, &[&e]))?;
+        let path = entry
+            .path()
+            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_ENTRY_NAME, &[&e]))?;
         if path.as_os_str() == "version.json" {
             let mut text = String::new();
             entry
                 .read_to_string(&mut text)
-                .map_err(|e| format!("读 version.json 失败: {e}"))?;
-            return Manifest::parse(&text).map_err(|e| format!("解析 version.json 失败: {e}"));
+                .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_VERSION_JSON, &[&e]))?;
+            return Manifest::parse(&text)
+                .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_PARSE_VERSION_JSON, &[&e]));
         }
     }
-    Err("包里没有 version.json".into())
+    Err(mesh_text::get(id::LAUNCHER_ERROR_NO_VERSION_JSON).to_string())
 }
 
 fn unpack(pkg: &Path, dest: &Path) -> Result<(), String> {
-    let file = File::open(pkg).map_err(|e| format!("打开 {} 失败: {e}", pkg.display()))?;
-    let decoder =
-        zstd::Decoder::new(file).map_err(|e| format!("解压 {} 失败: {e}", pkg.display()))?;
+    let file = File::open(pkg)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_OPEN_PACKAGE, &[&pkg.display(), &e]))?;
+    let decoder = zstd::Decoder::new(file).map_err(|e| {
+        mesh_text::format(id::LAUNCHER_ERROR_DECOMPRESS_PACKAGE, &[&pkg.display(), &e])
+    })?;
     let mut archive = tar::Archive::new(decoder);
     archive
         .unpack(dest)
-        .map_err(|e| format!("解包到 {} 失败: {e}", dest.display()))
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_UNPACK, &[&dest.display(), &e]))
 }
 
 /// verify 只认清单里列出的文件：多出来的忽略，少了或对不上就判包不可用。
 fn verify(bin: &Path, manifest: &Manifest) -> Result<(), String> {
     for (name, want) in &manifest.files {
         if name.contains("..") || Path::new(name).is_absolute() {
-            return Err(format!("清单里有非法路径: {name}"));
+            return Err(mesh_text::format(id::LAUNCHER_ERROR_ILLEGAL_PATH, &[&name]));
         }
         let path = bin.join(name);
-        let got = sha256_file(&path).map_err(|_| format!("包里缺少 {name}"))?;
+        let got = sha256_file(&path)
+            .map_err(|_| mesh_text::format(id::LAUNCHER_ERROR_MISSING_FILE, &[&name]))?;
         if !got.eq_ignore_ascii_case(want) {
-            return Err(format!("{name} 摘要不符"));
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_FILE_DIGEST_MISMATCH,
+                &[&name],
+            ));
         }
     }
     Ok(())
 }
 
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path).map_err(|e| format!("打开 {} 失败: {e}", path.display()))?;
+    let mut file = File::open(path)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_OPEN_PACKAGE, &[&path.display(), &e]))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 256 * 1024];
     loop {
         let n = file
             .read(&mut buf)
-            .map_err(|e| format!("读 {} 失败: {e}", path.display()))?;
+            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_FILE, &[&path.display(), &e]))?;
         if n == 0 {
             break;
         }
@@ -354,11 +379,12 @@ pub(crate) fn token() -> String {
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     let response = ureq::get(url)
         .call()
-        .map_err(|e| format!("下载失败: {e}"))?;
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_DOWNLOAD, &[&e]))?;
     let mut reader = response.into_reader();
-    let mut file = File::create(dest).map_err(|e| format!("创建 {} 失败: {e}", dest.display()))?;
+    let mut file = File::create(dest)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_CREATE_FILE, &[&dest.display(), &e]))?;
     std::io::copy(&mut reader, &mut file)
-        .map_err(|e| format!("写入 {} 失败: {e}", dest.display()))?;
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_WRITE_FILE, &[&dest.display(), &e]))?;
     Ok(())
 }
 
@@ -370,9 +396,12 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         .arg(dest)
         .arg(url)
         .status()
-        .map_err(|e| format!("调用 curl 失败: {e}"))?;
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_CALL_CURL, &[&e]))?;
     if !status.success() {
-        return Err(format!("下载失败: curl 退出 {status}"));
+        return Err(mesh_text::format(
+            id::LAUNCHER_ERROR_DOWNLOAD_CURL,
+            &[&status],
+        ));
     }
     Ok(())
 }

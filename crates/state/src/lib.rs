@@ -47,21 +47,33 @@ const SECURE_KEY_LEN: usize = 32;
 /// 身份，用户会被迫重新注册），要人工看一眼那个文件。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("{} 读写失败: {source}", path.display())]
+    #[error(
+        "{}",
+        mesh_text::format(mesh_text::id::STATE_ERROR_IO, &[&path.display(), &source])
+    )]
     Io {
         path: PathBuf,
         #[source]
         source: io::Error,
     },
-    #[error("{} 内容不合格式: {reason}", path.display())]
+    #[error(
+        "{}",
+        mesh_text::format(mesh_text::id::STATE_ERROR_PARSE, &[&path.display(), &reason])
+    )]
     Parse { path: PathBuf, reason: String },
-    #[error("{} 长度异常: {len}（应为 {expected}）", path.display())]
+    #[error(
+        "{}",
+        mesh_text::format(
+            mesh_text::id::STATE_ERROR_KEY_LENGTH,
+            &[&path.display(), &len, &expected]
+        )
+    )]
     KeyLength {
         path: PathBuf,
         len: usize,
         expected: usize,
     },
-    #[error("状态目录不能为空")]
+    #[error("{}", mesh_text::get(mesh_text::id::STATE_ERROR_EMPTY_ROOT))]
     EmptyRoot,
 }
 
@@ -305,7 +317,10 @@ impl Store {
     pub fn save_credential(&self, credential: &Credential) -> Result<(), Error> {
         let path = self.credential_path();
         if credential.secret.is_empty() {
-            return Err(Error::parse(&path, "凭据私钥为空"));
+            return Err(Error::parse(
+                &path,
+                mesh_text::get(mesh_text::id::STATE_ERROR_EMPTY_CREDENTIAL_SECRET),
+            ));
         }
         let (secret, protect) = seal_secret(&path, &credential.secret)?;
         let stored = Credential {
@@ -349,9 +364,12 @@ impl Store {
             Err(err) => return Err(Error::io(&path, err)),
         };
         // 下发的配置一定是 UTF-8；不是就别猜（猜测会把摘要也算错）。
-        String::from_utf8(bytes)
-            .map(Some)
-            .map_err(|err| Error::parse(&path, format!("不是 UTF-8: {err}")))
+        String::from_utf8(bytes).map(Some).map_err(|err| {
+            Error::parse(
+                &path,
+                mesh_text::format(mesh_text::id::STATE_ERROR_NOT_UTF8, &[&err]),
+            )
+        })
     }
 
     /// 原子写 `config.toml`：先写临时文件再改名，core 永远不会读到半份配置。
@@ -393,7 +411,7 @@ fn open_key(path: &Path, stored: &[u8]) -> Result<Vec<u8>, Error> {
     let Some(blob) = stored.strip_prefix(SEALED_MAGIC.as_slice()) else {
         return Err(Error::parse(
             path,
-            "密钥是明文存的：删掉这个文件，重新注册这台设备",
+            mesh_text::get(mesh_text::id::STATE_ERROR_KEY_NOT_SEALED),
         ));
     };
     win::unprotect(blob).map_err(|err| Error::io(path, err))
@@ -408,9 +426,12 @@ fn open_key(_path: &Path, stored: &[u8]) -> Result<Vec<u8>, Error> {
 /// 入参出参都是 base64 的 32 字节私钥（线上格式），这里只负责「落盘形态」。
 #[cfg(windows)]
 fn seal_secret(path: &Path, secret: &str) -> Result<(String, String), Error> {
-    let raw = BASE64
-        .decode(secret)
-        .map_err(|err| Error::parse(path, format!("凭据私钥不是 base64: {err}")))?;
+    let raw = BASE64.decode(secret).map_err(|err| {
+        Error::parse(
+            path,
+            mesh_text::format(mesh_text::id::STATE_ERROR_CREDENTIAL_NOT_BASE64, &[&err]),
+        )
+    })?;
     let blob = win::protect(&raw).map_err(|err| Error::io(path, err))?;
     Ok((BASE64.encode(blob), "dpapi".to_string()))
 }
@@ -426,12 +447,18 @@ fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<String, Error
     if protect != "dpapi" {
         return Err(Error::parse(
             path,
-            "凭据是明文写的：删掉这个文件，等控制面重签一张",
+            mesh_text::get(mesh_text::id::STATE_ERROR_CREDENTIAL_PLAINTEXT),
         ));
     }
-    let blob = BASE64
-        .decode(stored)
-        .map_err(|err| Error::parse(path, format!("凭据密文不是 base64: {err}")))?;
+    let blob = BASE64.decode(stored).map_err(|err| {
+        Error::parse(
+            path,
+            mesh_text::format(
+                mesh_text::id::STATE_ERROR_CREDENTIAL_CIPHER_NOT_BASE64,
+                &[&err],
+            ),
+        )
+    })?;
     let raw = win::unprotect(&blob).map_err(|err| Error::io(path, err))?;
     Ok(BASE64.encode(raw))
 }
@@ -441,7 +468,7 @@ fn open_secret(path: &Path, stored: &str, protect: &str) -> Result<String, Error
     if !protect.is_empty() {
         return Err(Error::parse(
             path,
-            "凭据是用 Windows DPAPI 加密的，本机解不开：删掉这个文件，等控制面重签一张",
+            mesh_text::get(mesh_text::id::STATE_ERROR_CREDENTIAL_DPAPI_UNREADABLE),
         ));
     }
     Ok(stored.to_string())

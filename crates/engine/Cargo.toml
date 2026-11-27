@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+mesh-text = { workspace = true }
 # 依赖集合就是 MODULES.md 第 1 节那张图里指向 engine 的全部边。
 mesh-install = { workspace = true }
 mesh-state = { workspace = true }

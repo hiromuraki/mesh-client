@@ -4,6 +4,7 @@
 //! 帮助文本走 stdout、退出码 0（启动器一致）；Go 的 flag 包帮到 stderr、退出码 2，
 //! 这是有意的差异（见 README 的偏差表）。
 
+use mesh_text::id;
 use std::path::PathBuf;
 
 /// 一次解析的结果。
@@ -29,23 +30,27 @@ pub(crate) enum ParseError {
 
 pub(crate) fn usage() -> String {
     let mut text = [
-        "用法: mesh-client [选项]",
-        "",
-        "  --headless             无界面运行，日志输出到控制台",
-        "  --version              打印当前版本后退出",
-        "  --root <目录>          安装根目录，默认为可执行文件所在的版本目录的上一级",
-        "  --server <地址>        控制面地址，如 http://10.8.0.1:8088",
-        "  --token <令牌>         注册令牌，只在首次注册时需要",
-        "  --name <名字>          设备名，留空使用本机主机名",
-        "  --core <路径>          easytier-core 路径，留空自动查找",
-        "  --boot-check <标记>    安装器给的一次性标记；启动成功后在安装根写 .boot-ok-<标记>",
-        "  --disable-auto-update  忽略服务端下发的自动更新指示，一律等手动安装",
-        "  -h, --help             显示这份帮助",
+        mesh_text::get(id::CLIENT_TEXT_USAGE_HEAD).to_string(),
+        String::new(),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_HEADLESS)),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_VERSION)),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_ROOT)),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_SERVER)),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_TOKEN)),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_NAME)),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_CORE)),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_BOOT_CHECK)),
+        format!(
+            "  {}",
+            mesh_text::get(id::CLIENT_TEXT_USAGE_DISABLE_AUTO_UPDATE)
+        ),
+        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_HELP)),
     ]
     .join("\n");
-    text.push_str(&format!(
-        "\n\n构建版本 {}",
-        env!("MESH_CLIENT_BUILD_VERSION")
+    text.push_str("\n\n");
+    text.push_str(&mesh_text::format(
+        id::CLIENT_TEXT_USAGE_BUILD_VERSION,
+        &[&env!("MESH_CLIENT_BUILD_VERSION")],
     ));
     text
 }
@@ -58,17 +63,17 @@ pub(crate) fn parse(argv: &[String]) -> Result<Options, ParseError> {
         if raw == "--" {
             // 与 Go 的 flag 一样：-- 之后都是位置参数，而这里没有位置参数。
             if index + 1 < argv.len() {
-                return Err(ParseError::Invalid(format!(
-                    "多余的参数: {}",
-                    argv[index + 1..].join(" ")
+                return Err(ParseError::Invalid(mesh_text::format(
+                    id::CLIENT_ERROR_EXTRA_ARGS,
+                    &[&argv[index + 1..].join(" ")],
                 )));
             }
             break;
         }
         if !raw.starts_with('-') || raw == "-" {
-            return Err(ParseError::Invalid(format!(
-                "多余的参数: {}",
-                argv[index..].join(" ")
+            return Err(ParseError::Invalid(mesh_text::format(
+                id::CLIENT_ERROR_EXTRA_ARGS,
+                &[&argv[index..].join(" ")],
             )));
         }
         let name = raw.trim_start_matches('-');
@@ -89,7 +94,12 @@ pub(crate) fn parse(argv: &[String]) -> Result<Options, ParseError> {
             "boot-check" => {
                 options.boot_check = Some(value(argv, &mut index, inline, name)?);
             }
-            other => return Err(ParseError::Invalid(format!("未知参数: {other}"))),
+            other => {
+                return Err(ParseError::Invalid(mesh_text::format(
+                    id::CLIENT_ERROR_UNKNOWN_OPTION,
+                    &[&other],
+                )));
+            }
         }
         index += 1;
     }
@@ -106,9 +116,9 @@ fn value(
         return Ok(value);
     }
     *index += 1;
-    argv.get(*index)
-        .cloned()
-        .ok_or_else(|| ParseError::Invalid(format!("--{name} 缺值")))
+    argv.get(*index).cloned().ok_or_else(|| {
+        ParseError::Invalid(mesh_text::format(id::CLIENT_ERROR_MISSING_VALUE, &[&name]))
+    })
 }
 
 /// 布尔开关；--flag=false 也认（Go 的 flag 支持 strconv.ParseBool 的那几种写法）。
@@ -118,8 +128,9 @@ fn boolean(inline: Option<String>, name: &str) -> Result<bool, ParseError> {
         Some(raw) => match raw.to_ascii_lowercase().as_str() {
             "true" | "t" | "1" => Ok(true),
             "false" | "f" | "0" => Ok(false),
-            _ => Err(ParseError::Invalid(format!(
-                "--{name} 只接受 true 或 false: {raw}"
+            _ => Err(ParseError::Invalid(mesh_text::format(
+                id::CLIENT_ERROR_BOOLEAN_INVALID,
+                &[&name, &raw],
             ))),
         },
     }

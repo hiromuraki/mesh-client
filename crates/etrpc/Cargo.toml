@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# 只有 std：裸 TCP + 手写 protobuf。这个 crate 是升级 EasyTier 时唯一要改的地方，
-# 依赖越少越容易和 client/internal/easytierrpc/wire.go 逐条对读。
+# 文案从语言清单取：错误说明是给日志与面板看的，不进代码。
+mesh-text = { workspace = true }
+# 除文案之外只有 std：裸 TCP + 手写 protobuf。这个 crate 是升级 EasyTier 时唯一
+# 要改的地方，依赖越少越容易和 client/internal/easytierrpc/wire.go 逐条对读。
 thiserror = { workspace = true }

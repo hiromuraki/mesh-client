@@ -25,13 +25,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// 普通 IO 错误、以及“锁被占着”——最后一条必须独立，上层要走“唤起已有实例”而不是报错。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("{} 读取或解析失败: {reason}", path.display())]
+    #[error(
+        "{}",
+        mesh_text::format(
+            mesh_text::id::INSTALL_ERROR_MANIFEST_READ,
+            &[&path.display(), &reason]
+        )
+    )]
     ManifestRead { path: PathBuf, reason: String },
-    #[error("{} 里的版本号不合法: {version:?}", path.display())]
+    #[error(
+        "{}",
+        mesh_text::format(
+            mesh_text::id::INSTALL_ERROR_VERSION_INVALID,
+            &[&path.display(), &format!("{version:?}")]
+        )
+    )]
     VersionInvalid { path: PathBuf, version: String },
     #[error("{0}")]
     Io(#[from] io::Error),
-    #[error("已有客户端实例在运行")]
+    #[error("{}", mesh_text::get(mesh_text::id::INSTALL_ERROR_ALREADY_RUNNING))]
     AlreadyRunning,
 }
 
@@ -49,7 +61,12 @@ pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|dir| !dir.as_os_str().is_empty())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "路径没有父目录"))?;
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                mesh_text::get(mesh_text::id::INSTALL_ERROR_NO_PARENT_DIR),
+            )
+        })?;
     let mut last_error = None;
     for _ in 0..8 {
         let tmp = dir.join(temp_name());
@@ -76,7 +93,11 @@ pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()> {
             }
         };
     }
-    Err(last_error.unwrap_or_else(|| io::Error::other("临时文件名一直撞车")))
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::other(mesh_text::get(
+            mesh_text::id::INSTALL_ERROR_TEMP_NAME_COLLISION,
+        ))
+    }))
 }
 
 fn create_private(path: &Path, perm: u32) -> io::Result<File> {

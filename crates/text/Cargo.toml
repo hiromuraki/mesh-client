@@ -1,0 +1,8 @@
+[package]
+name = "mesh-text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# 零依赖：只有 std 与 include_str! 嵌进来的两份语言清单。
+# 它是整个 workspace 的地板，不允许再加任何依赖（见 MODULES.md 第 2 节）。

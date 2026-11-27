@@ -62,9 +62,9 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
     let root = resolve_root(options.root.as_deref())?;
     // 安装不完整就直接失败：读不到 bin/version.json 就不知道要报哪一版给服务端。
     let version = layout::read_version(&root).map_err(|err| {
-        format!(
-            "{} 不是完整的安装目录（读不到 bin/version.json）: {err}",
-            root.display()
+        mesh_text::format(
+            mesh_text::id::CLIENT_ERROR_INSTALL_DIR,
+            &[&root.display(), &err],
         )
     })?;
     if options.version {
@@ -129,7 +129,7 @@ fn serve(
     let quit: mesh_panel::Quit = Box::new(move || quit_shutdown.run_and_exit(0));
     let log_path = root.join(layout::LOG).join("client.log");
     let panel = mesh_panel::start(Arc::clone(cell), tx.clone(), log_path.clone(), quit)
-        .map_err(|err| format!("启动面板失败: {err}"))?;
+        .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_START_PANEL, &[&err]))?;
     let panel_closer = panel.clone();
     shutdown.register(move || panel_closer.close());
     let _ = mesh_panel::write_url(&root.join(layout::CONFIG).join("ui.json"), &panel.url);
@@ -142,7 +142,10 @@ fn serve(
     if desktop {
         return desktop_main(&panel, root, version, cell, tx, shutdown, ready);
     }
-    platform::say(&format!("{APP_TITLE} 面板 {}", panel.url));
+    platform::say(&mesh_text::format(
+        mesh_text::id::CLIENT_TEXT_PANEL_URL,
+        &[&APP_TITLE, &panel.url],
+    ));
     headless::run(Arc::clone(cell), &log_path, ready)
 }
 
@@ -194,8 +197,9 @@ fn desktop_main(
     _cell: &Arc<StateCell>,
     _tx: &Sender<Cmd>,
     _shutdown: &Arc<Shutdown>,
+    _ready: Box<dyn Fn() + Send + Sync>,
 ) -> Result<(), String> {
-    Err("当前平台没有桌面形态".to_string())
+    Err(mesh_text::get(mesh_text::id::CLIENT_TEXT_NO_DESKTOP).to_string())
 }
 
 /// 把参数合并到已有配置上再提交给引擎；没给的字段沿用本地值。
@@ -218,7 +222,7 @@ fn configure(
             .map(|config| config.device_id.is_empty())
             .unwrap_or(true);
         if unregistered && !desktop {
-            return Err("尚未注册：用 --server 与 --token 运行一次".to_string());
+            return Err(mesh_text::get(mesh_text::id::CLIENT_ERROR_NOT_REGISTERED).to_string());
         }
         return Ok(());
     }
@@ -241,11 +245,11 @@ fn configure(
     }
     let (reply_tx, reply_rx) = channel();
     tx.send(Cmd::Settings(input, reply_tx))
-        .map_err(|_| "引擎未运行".to_string())?;
+        .map_err(|_| mesh_text::get(mesh_text::id::CLIENT_ERROR_ENGINE_NOT_RUNNING).to_string())?;
     match reply_rx.recv() {
         Ok(Ok(_)) => Ok(()),
         Ok(Err(message)) => Err(message),
-        Err(_) => Err("引擎未运行".to_string()),
+        Err(_) => Err(mesh_text::get(mesh_text::id::CLIENT_ERROR_ENGINE_NOT_RUNNING).to_string()),
     }
 }
 
@@ -257,9 +261,10 @@ fn resolve_root(given: Option<&Path>) -> Result<PathBuf, String> {
         } else {
             std::env::current_dir()
                 .map(|cwd| cwd.join(path))
-                .map_err(|err| format!("取当前目录失败: {err}"))
+                .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_CURRENT_DIR, &[&err]))
         };
     }
-    let exe = std::env::current_exe().map_err(|err| format!("取自身路径失败: {err}"))?;
+    let exe = std::env::current_exe()
+        .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&err]))?;
     Ok(layout::find_root(&exe))
 }

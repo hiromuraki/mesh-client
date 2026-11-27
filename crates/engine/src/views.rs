@@ -171,7 +171,8 @@ impl Engine {
         if !core_running && snapshot.status == Status::Online.as_str() {
             snapshot.status = Status::Degraded.as_str().to_string();
             if snapshot.last_error.is_empty() {
-                snapshot.last_error = "core 未运行".to_string();
+                snapshot.last_error =
+                    mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_NOT_RUNNING).to_string();
             }
         }
         if snapshot.last_error.is_empty() && !self.log_error.is_empty() {
@@ -212,15 +213,18 @@ pub struct NodeRow {
     pub ip: String,
     pub hostname: String,
     pub path_kind: String,
-    pub path_label: String,
     /// 从本机到该节点途经的中间节点，不含目标自身；直连是空数组。
     pub path: Vec<Hop>,
-    pub proto: String,
-    pub nat_type: String,
-    pub latency: String,
-    pub core_version: String,
     pub hops: i32,
-    pub proxy_cidrs: String,
+    /// 本行用到的隧道协议，已去重排序；本机那一行是整张网的聚合。
+    pub tunnels: Vec<String>,
+    /// `ListRoute` 给的原值，可能是空串。
+    pub nat_type: String,
+    /// 到该节点的延迟（毫秒）；`None` 表示未知。
+    pub latency_ms: Option<f64>,
+    /// core 上报的完整版本串；截取发行号由前端做。
+    pub version: String,
+    pub proxy_cidrs: Vec<String>,
 }
 
 /// 本机那一行需要的字段。`ListPeer` 与 `ListRoute` 都不含本机，只能由调用方补。
@@ -245,12 +249,8 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
             ip: local.ip.clone(),
             hostname: local.hostname.clone(),
             path_kind: "me".to_string(),
-            path_label: "本机".to_string(),
-            proto: "—".to_string(),
-            nat_type: dash_if_empty(&local.nat),
-            latency: "—".to_string(),
-            core_version: release_version(&local.version),
-            proxy_cidrs: "—".to_string(),
+            nat_type: local.nat.clone(),
+            version: local.version.clone(),
             ..NodeRow::default()
         });
     }
@@ -265,36 +265,34 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
             ip: ip.clone(),
             hostname: route.hostname.clone(),
             path_kind: "direct".to_string(),
-            path_label: "直连".to_string(),
             path: Vec::new(),
-            proto: "—".to_string(),
-            nat_type: dash_if_empty(&route.nat_type),
-            latency: latency_text(route.path_latency),
-            core_version: release_version(&route.version),
+            tunnels: Vec::new(),
+            nat_type: route.nat_type.clone(),
+            latency_ms: millis(route.path_latency),
+            version: route.version.clone(),
             hops: route.cost,
-            proxy_cidrs: proxy_or_dash(&route.proxy_cidrs.join(",")),
+            proxy_cidrs: route.proxy_cidrs.clone(),
         };
         // 直连时隧道实测延迟比路由表里的整数毫秒准，有就优先用它。
         if let Some(peer) = peer {
-            row.proto = dash_if_empty(&peer.tunnels().join(","));
+            row.tunnels = peer.tunnels();
             let measured = peer.latency();
             if !measured.is_zero() {
-                row.latency = latency_text(measured);
+                row.latency_ms = millis(measured);
             }
         }
         if route.cost > 1 {
             row.path_kind = "relay".to_string();
-            row.path_label = "中继".to_string();
             row.path = resolver.to(&ip);
         }
         rows.push(row);
     }
     // 本机没有“到自己的隧道”。协议列显示这张网里实际在用哪些传输，比“本机监听
     // 了哪些入口”更贴这一列的含义，也不会被 core 默认监听的长列表撑爆。
-    if let Some(protos) = peer_protos(&rows) {
+    if let Some(tunnels) = peer_tunnels(&rows) {
         for row in rows.iter_mut() {
             if row.path_kind == "me" {
-                row.proto = protos.clone();
+                row.tunnels = tunnels.clone();
             }
         }
     }
@@ -363,67 +361,39 @@ impl<'a> PathResolver<'a> {
     }
 }
 
-fn latency_text(duration: Duration) -> String {
+/// `Duration` 换成毫秒；零值表示未知。
+fn millis(duration: Duration) -> Option<f64> {
     if duration.is_zero() {
-        return "—".to_string();
+        return None;
     }
-    format!("{:.2} ms", duration.as_secs_f64() * 1000.0)
+    Some(duration.as_secs_f64() * 1000.0)
 }
 
-/// 把对等节点用到的隧道协议摊平、去重、排序：`udp/tcp` → `tcp,udp`。
-fn peer_protos(rows: &[NodeRow]) -> Option<String> {
+/// 把各行的隧道协议摊平、去重、排序：`udp` 与 `tcp` → `["tcp", "udp"]`。
+fn peer_tunnels(rows: &[NodeRow]) -> Option<Vec<String>> {
     let mut names: Vec<String> = Vec::new();
     for row in rows {
         if row.path_kind == "me" {
             continue;
         }
-        for proto in row.proto.split(',') {
-            let proto = proto.trim();
-            if proto.is_empty() || proto == "—" || names.iter().any(|known| known == proto) {
+        for name in &row.tunnels {
+            if name.is_empty() || names.iter().any(|known| known == name) {
                 continue;
             }
-            names.push(proto.to_string());
+            names.push(name.clone());
         }
     }
     if names.is_empty() {
         return None;
     }
     names.sort();
-    Some(names.join(","))
-}
-
-/// 只留版本号的发行部分：`2.6.4-8428a89d` → `2.6.4`。
-fn release_version(full: &str) -> String {
-    if full.is_empty() {
-        return "—".to_string();
-    }
-    match full.find('-') {
-        Some(index) if index > 0 => full[..index].to_string(),
-        _ => full.to_string(),
-    }
-}
-
-fn proxy_or_dash(raw: &str) -> String {
-    if raw.is_empty() || raw == "[]" {
-        "—".to_string()
-    } else {
-        raw.to_string()
-    }
+    Some(names)
 }
 
 fn strip_cidr(ip: &str) -> &str {
     match ip.find('/') {
         Some(index) => &ip[..index],
         None => ip,
-    }
-}
-
-fn dash_if_empty(text: &str) -> String {
-    let text = text.trim();
-    if text.is_empty() || text == "-" {
-        "—".to_string()
-    } else {
-        text.to_string()
     }
 }
 
@@ -489,12 +459,11 @@ mod tests {
         assert_eq!(rows[0].path_kind, "me");
         assert_eq!(rows[0].ip, "10.126.126.100");
         // 实测延迟比路由表的整数毫秒准：6ms 覆盖 12ms。
-        assert_eq!(rows[1].latency, "6.00 ms");
-        assert_eq!(rows[1].proto, "tcp,udp");
-        assert_eq!(rows[1].path_label, "直连");
+        assert_eq!(rows[1].latency_ms, Some(6.0));
+        assert_eq!(rows[1].tunnels, vec!["tcp".to_string(), "udp".to_string()]);
         assert!(rows[1].path.is_empty());
         // 本机那一行的协议列跟着本网实际在用的协议。
-        assert_eq!(rows[0].proto, "tcp,udp");
+        assert_eq!(rows[0].tunnels, vec!["tcp".to_string(), "udp".to_string()]);
     }
 
     #[test]
@@ -507,12 +476,11 @@ mod tests {
         let rows = build_nodes(&[], &routes, LocalNode::default());
         let relay = rows.iter().find(|row| row.ip == "10.126.126.5").unwrap();
         assert_eq!(relay.path_kind, "relay");
-        assert_eq!(relay.path_label, "中继");
         assert_eq!(relay.hops, 2);
         assert_eq!(relay.path.len(), 1);
         assert_eq!(relay.path[0].ip, "10.126.126.2");
         assert_eq!(relay.path[0].hostname, "tencent-seed");
-        assert_eq!(relay.latency, "18.00 ms");
+        assert_eq!(relay.latency_ms, Some(18.0));
     }
 
     #[test]
@@ -531,12 +499,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_protocols_show_a_dash() {
+    fn unknown_values_stay_empty_for_the_frontend() {
         let peers = vec![peer(1, &[("", 0)])];
         let routes = vec![route(1, "10.0.0.1/24", "node", 1, 1, 0)];
         let rows = build_nodes(&peers, &routes, LocalNode::default());
-        assert_eq!(rows[0].proto, "—");
-        assert_eq!(rows[0].latency, "—");
-        assert_eq!(rows[0].core_version, "2.7.1");
+        assert!(rows[0].tunnels.is_empty());
+        assert_eq!(rows[0].latency_ms, None);
+        assert_eq!(rows[0].version, "2.7.1-abc");
     }
 }

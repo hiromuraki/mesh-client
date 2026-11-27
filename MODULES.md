@@ -1,6 +1,6 @@
 # 模块划分（cargo workspace）
 
-九个成员：七个库 crate、两个二进制。整个 workspace 就是 `client/`；启动器原来是一个独立仓库
+十个成员：八个库 crate、两个二进制。整个 workspace 就是 `client/`；启动器原来是一个独立仓库
 （`client-launcher`），已经并进 `crates/launcher`。
 
 ## 1. 形状与依赖图
@@ -11,6 +11,7 @@ client/
   .cargo/config.toml    # musl 目标用 musl-gcc（从原来的启动器仓库搬来）
   frontend/             # pnpm + Vue 3 的面板前端，dist 在编译期嵌进 panel
   crates/
+    text/               # mesh-text      语言清单、get/format、id 常量（唯一零依赖地板）
     install/            # mesh-install   安装根形状、版本、失败计数、单实例锁、平台名
     state/              # mesh-state     config/ 下的身份与配置（含 config.toml 提示字段）
     remote/             # mesh-remote    设备面 HTTP + 签名
@@ -24,6 +25,7 @@ client/
 
 ```mermaid
 graph TD
+  text["mesh-text<br/>零依赖地板"]
   client["mesh-client<br/>bin: mesh-client(.exe)"] --> engine["mesh-engine"]
   client --> panel["mesh-panel"]
   client --> install["mesh-install"]
@@ -38,13 +40,21 @@ graph TD
   remote --> install
   core --> etrpc
   launcher["mesh-launcher<br/>bin: mesh(.exe)"] --> install
+  install --> text
+  state --> text
+  remote --> text
+  etrpc --> text
+  core --> text
 ```
+
+图上只画已经接上的边；`mesh-text` 对每个 crate 都是允许的（见第 2 节）。
 
 ## 2. 依赖方向（硬规则）
 
-允许的边只有上图那几条，其余一律禁止：
+除 `mesh-text` 以外，允许的边只有上图那几条，其余一律禁止：
 
-- `mesh-install` 不依赖任何 crate。它是两个二进制共享的地板。
+- `mesh-text` 是唯一零依赖的地板；`mesh-install` 只依赖它。
+- 其余九个成员都可以依赖 `mesh-text`（文案从语言清单取），`mesh-text` 不依赖任何人。
 - `mesh-state` / `mesh-remote` / `mesh-etrpc` / `mesh-core` 是叶子能力，**不得**依赖 `mesh-engine`、`mesh-panel`、`mesh-client`。
 - `mesh-engine` 不得依赖 `mesh-panel`、`mesh-client`（引擎不知道面板与进程形态存在，退出通过注入的 `Shutdown` 句柄）。
 - `mesh-panel` 不得依赖 `mesh-client`；`mesh-client` 是唯一知道「线程怎么排、托盘在哪」的地方。
@@ -52,6 +62,22 @@ graph TD
 - 禁止出现 `common`/`util`/`types` 之类的筐。
 
 ## 3. 逐个 crate
+
+### 3.0 `mesh-text`
+
+**职责**：文案。`lang/chinese.lang` 与 `lang/english.lang` 是全部用户可见文本（含日志与错误说明）的唯一来源，代码里只引用 `id` 常量。规范见 [../docs/i18n.md](../docs/i18n.md)。
+
+**对外 API**：
+
+```rust
+pub fn get(id: &'static str) -> &'static str;                      // 查不到原样返回 id，不 panic
+pub fn format(id: &'static str, args: &[&dyn Display]) -> String;  // 替换 {0}、{1}……
+pub mod id { pub const STATE_ERROR_IO: &str = "state.error.io"; /* …… */ }
+```
+
+**拥有的状态**：首次调用时装载一次的只读表（`OnceLock<HashMap<&'static str, &'static str>>`）。当前只装载中文；英文清单已嵌入并参与测试，不参与运行。
+
+**依赖**：无。它是整个 workspace 的地板，`mesh-install` 只依赖它。
 
 ### 3.1 `mesh-install`
 
@@ -76,7 +102,7 @@ pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()>;
 
 **拥有的状态**：无内存状态。`Failures` 是 `.update-failures.json` 的读写视图；`Lock` 是 `instance.lock` 的 OS 锁句柄（进程退出即释放）。
 
-**依赖**：无（Windows 侧用 `windows-sys` 的 `LockFileEx`，Unix 侧用 `libc` 的 `flock`，都由 `fs4` 覆盖）。
+**依赖**：`mesh-text`（文案）；`fs4` 覆盖两个平台的锁（Windows 的 `LockFileEx`、Unix 的 `flock`）。
 
 **注**：`read_version` 与 `Failures` 必须同时被客户端与启动器使用——「不比当前新不装」和「同版本失败两次就停手」在两侧都要判，重复实现迟早会分叉。
 
@@ -273,6 +299,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 | crate | 对应 Go 包 | 拥有的状态 |
 |---|---|---|
+| `mesh-text` | —（Go 侧后续按同一格式实现） | 首次调用装载的只读表 |
 | `mesh-install` | `internal/layout`、`internal/lockfile`、`internal/platform`、`internal/version` | 无（文件即事实） |
 | `mesh-state` | `internal/state`、`engine/toml.go` | `client.key` / `secure.key` 的内存缓存 |
 | `mesh-remote` | `internal/remote` | 无 |
@@ -377,7 +404,7 @@ Go 里 `quit`（停资源 + 通知主循环）与 `stop`（只停资源）是两
 
 ## 7. 为什么这么切
 
-**切分依据只有两条**：（a）这个模块是否被**两个以上**的消费者使用（`install`、`state`、`remote`、`etrpc`、`core`）；（b）这个模块是否有**独立的并发/线程故事**（`core` 独占子进程、`panel` 独占监听、`client` 独占托盘）。其余一律是 crate 内模块——Rust 的模块边界是免费的，Cargo 成员边界不是。
+**切分依据只有两条**：（a）这个模块是否被**两个以上**的消费者使用（`text`、`install`、`state`、`remote`、`etrpc`、`core`）；（b）这个模块是否有**独立的并发/线程故事**（`core` 独占子进程、`panel` 独占监听、`client` 独占托盘）。其余一律是 crate 内模块——Rust 的模块边界是免费的，Cargo 成员边界不是。
 
 所以 `engine` 是一个大 crate 而不是三个：心跳、配置同步、core 启停共享同一份可变状态（`status`、`core_cred_id`、`identity`、`update`），拆开只能共享锁或再加一层消息转发。`logbook` 与 `autostart` 也是 crate 内模块，因为只有引擎与面板用，而面板经引擎拿日志。
 
@@ -399,8 +426,9 @@ Go 里 `quit`（停资源 + 通知主循环）与 `stop`（只停资源）是两
 [workspace]
 resolver = "2"
 members = [
-  "crates/install", "crates/state", "crates/remote", "crates/etrpc",
-  "crates/core", "crates/engine", "crates/panel", "crates/client", "crates/launcher",
+  "crates/text", "crates/install", "crates/state", "crates/remote",
+  "crates/etrpc", "crates/core", "crates/engine", "crates/panel",
+  "crates/client", "crates/launcher",
 ]
 
 [workspace.package]
@@ -409,6 +437,7 @@ edition = "2021"
 rust-version = "1.83"
 
 [workspace.dependencies]
+mesh-text    = { path = "crates/text" }
 mesh-install = { path = "crates/install" }
 mesh-state   = { path = "crates/state" }
 mesh-remote  = { path = "crates/remote" }
@@ -443,11 +472,12 @@ strip = true
 
 | crate | 依赖 |
 |---|---|
-| `install` | `fs4`（跨平台 `LockFileEx`/`flock`） |
-| `state` | `mesh-install`、`serde`、`serde_json`、`toml`、`ed25519-dalek`、`rand`、`base64` |
-| `remote` | `mesh-install`、`serde`、`serde_json`、`sha2`、`hex`、`base64`、`ed25519-dalek`、`rand`、`ureq`（windows 加 `native-tls`，unix 加 `tls`） |
-| `etrpc` | 无（`std::net` + `std::io`） |
-| `core` | `mesh-etrpc`、`thiserror`；windows: `windows-sys`（`Win32_Foundation`、`Win32_System_JobObjects`、`Win32_System_Threading`）；unix: `libc` |
+| `text` | 无（零依赖地板） |
+| `install` | `mesh-text`、`fs4`（跨平台 `LockFileEx`/`flock`） |
+| `state` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`toml`、`ed25519-dalek`、`rand`、`base64` |
+| `remote` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`sha2`、`hex`、`base64`、`ed25519-dalek`、`rand`、`ureq`（windows 加 `native-tls`，unix 加 `tls`） |
+| `etrpc` | `mesh-text`、`thiserror`（其余是 `std::net` + `std::io`） |
+| `core` | `mesh-etrpc`、`mesh-text`、`thiserror`；windows: `windows-sys`（`Win32_Foundation`、`Win32_System_JobObjects`、`Win32_System_Threading`）；unix: `libc` |
 | `engine` | `mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`、`serde`、`serde_json`、`sha2`、`hex`、`thiserror`、`rand`；不需要 windows-sys（自启只写 UTF-16 文件 + 起 `schtasks.exe`，隐藏窗口用 `CommandExt::creation_flags`） |
 | `panel` | `mesh-engine`、`mesh-etrpc`、`tiny_http`、`include_dir`、`serde_json` |
 | `client` | `mesh-install`、`mesh-engine`、`mesh-panel`；windows: `windows-sys`（`Win32_UI_Shell`、`Win32_UI_WindowsAndMessaging`、`Win32_Graphics_Gdi`、`Win32_System_LibraryLoader`、`Win32_System_Console`）+ `windows`（`Win32_UI_Shell` 的 `IShellDispatch`、`Win32_System_Com`）；unix: `signal-hook`；build: `winresource` |

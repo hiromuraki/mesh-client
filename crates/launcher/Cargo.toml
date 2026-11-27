@@ -12,6 +12,7 @@ path = "src/main.rs"
 # 搬自 client-launcher/Cargo.toml。版本、失败计数、清单解析换成 mesh-install，
 # 所以 serde/serde_json 不再需要；其余依赖与原件一致。
 mesh-install = { workspace = true }
+mesh-text = { workspace = true }
 zstd = { workspace = true }
 tar = { workspace = true }
 sha2 = { workspace = true }

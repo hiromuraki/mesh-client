@@ -18,9 +18,6 @@ const LOST_CHECK: Duration = Duration::from_secs(5);
 /// 等信号的切片长度：够短，identity 状态变化不会被拖住。
 const SIGNAL_SLICE: Duration = Duration::from_millis(250);
 
-/// 身份失效时的退出原因（Go 的同一句话）。
-const IDENTITY_LOST: &str = "设备身份已失效（服务端拒绝签名请求），请先确认本机时间准确，再用 --server 与 --token 重新注册后启动";
-
 pub(crate) fn run(
     cell: Arc<StateCell>,
     log_path: &Path,
@@ -34,19 +31,22 @@ pub(crate) fn run(
         std::thread::Builder::new()
             .name("mesh-follow-log".to_string())
             .spawn(move || follow_log::follow(&path, offset, &stop))
-            .map_err(|err| format!("启动日志跟随失败: {err}"))?
+            .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_FOLLOW_LOG, &[&err]))?
     };
 
     let (signal_tx, signal_rx) = channel();
     platform::spawn_signal_thread(signal_tx)?;
-    platform::say(&format!("{APP_TITLE} 以无界面模式运行，Ctrl+C 退出"));
+    platform::say(&mesh_text::format(
+        mesh_text::id::CLIENT_TEXT_HEADLESS_RUNNING,
+        &[&APP_TITLE],
+    ));
 
     let started = Instant::now();
     let mut next_check = started + LOST_CHECK;
     let outcome = loop {
         match signal_rx.recv_timeout(SIGNAL_SLICE) {
             Ok(()) => {
-                platform::say("正在退出…");
+                platform::say(mesh_text::get(mesh_text::id::CLIENT_TEXT_EXITING));
                 break Ok(());
             }
             // 信号线程不在了（例如控制台事件注册失败）也不该挂着。
@@ -60,7 +60,7 @@ pub(crate) fn run(
         next_check = now + LOST_CHECK;
         // 启动头几秒引擎还在读本地配置，unconfigured 是瞬态；等满一轮再看。
         if started.elapsed() >= LOST_CHECK && cell.get().snapshot.status == "unconfigured" {
-            break Err(IDENTITY_LOST.to_string());
+            break Err(mesh_text::get(mesh_text::id::CLIENT_TEXT_IDENTITY_LOST).to_string());
         }
         // 过了这一关说明进程会留下来：此时才让安装器认为这一版启动成功。
         ready();

@@ -35,17 +35,22 @@ pub(crate) fn enabled() -> Result<bool, String> {
 ///
 /// 目标始终是启动器而不是 `bin/` 里的主程序：开机时该跑的是负责回滚与拉起的那一个。
 pub(crate) fn enable(launcher: &Path) -> Result<(), String> {
-    let absolute =
-        std::path::absolute(launcher).map_err(|err| format!("解析启动器路径失败: {err}"))?;
+    let absolute = std::path::absolute(launcher).map_err(|err| {
+        mesh_text::format(mesh_text::id::ENGINE_TEXT_AUTOSTART_LAUNCHER_PATH, &[&err])
+    })?;
     if !absolute.is_file() {
-        return Err(format!("启动器不存在: {}", absolute.display()));
+        return Err(mesh_text::format(
+            mesh_text::id::ENGINE_TEXT_AUTOSTART_LAUNCHER_MISSING,
+            &[&absolute.display()],
+        ));
     }
     let dir = temp_dir();
-    std::fs::create_dir_all(&dir).map_err(|err| format!("创建临时目录失败: {err}"))?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| mesh_text::format(mesh_text::id::ENGINE_TEXT_AUTOSTART_TEMP_DIR, &[&err]))?;
     // schtasks /XML 只收 UTF-16：写成 UTF-8 会被判成 XML 格式错误。
     let file = dir.join("task.xml");
     let written = std::fs::write(&file, utf16le(&task_xml(&absolute, &account_name())))
-        .map_err(|err| format!("写任务定义失败: {err}"));
+        .map_err(|err| mesh_text::format(mesh_text::id::ENGINE_TEXT_AUTOSTART_WRITE_XML, &[&err]));
     let result = written.and_then(|()| {
         run([
             OsStr::new("/Create"),
@@ -55,7 +60,9 @@ pub(crate) fn enable(launcher: &Path) -> Result<(), String> {
             OsStr::new("/XML"),
             file.as_os_str(),
         ])
-        .map_err(|err| format!("创建开机自启任务失败: {err}"))
+        .map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_AUTOSTART_CREATE_FAILED, &[&err])
+        })
     });
     let _ = std::fs::remove_dir_all(&dir);
     result
@@ -66,7 +73,9 @@ pub(crate) fn disable() -> Result<(), String> {
     if !enabled()? {
         return Ok(());
     }
-    run(["/Delete", "/F", "/TN", TASK_NAME]).map_err(|err| format!("删除开机自启任务失败: {err}"))
+    run(["/Delete", "/F", "/TN", TASK_NAME]).map_err(|err| {
+        mesh_text::format(mesh_text::id::ENGINE_TEXT_AUTOSTART_DELETE_FAILED, &[&err])
+    })
 }
 
 /// schtasks 的一次失败。分两种：进程起不来，和跑完以后非零退出。
@@ -82,9 +91,20 @@ impl std::fmt::Display for Failure {
         match self {
             Failure::Spawn(message) => write!(f, "{message}"),
             Failure::Exit { code, output } if output.is_empty() => {
-                write!(f, "schtasks 退出码 {code}")
+                write!(
+                    f,
+                    "{}",
+                    mesh_text::format(mesh_text::id::ENGINE_TEXT_SCHTASKS_EXIT, &[code])
+                )
             }
-            Failure::Exit { code, output } => write!(f, "schtasks 退出码 {code}: {output}"),
+            Failure::Exit { code, output } => write!(
+                f,
+                "{}",
+                mesh_text::format(
+                    mesh_text::id::ENGINE_TEXT_SCHTASKS_EXIT_OUTPUT,
+                    &[code, output]
+                )
+            ),
         }
     }
 }
@@ -100,7 +120,12 @@ where
         .args(args)
         .creation_flags(CREATE_NO_WINDOW)
         .output()
-        .map_err(|err| Failure::Spawn(format!("无法执行 schtasks.exe: {err}")))?;
+        .map_err(|err| {
+            Failure::Spawn(mesh_text::format(
+                mesh_text::id::ENGINE_TEXT_SCHTASKS_SPAWN,
+                &[&err],
+            ))
+        })?;
     // 被强制终止时没有退出码，按 -1 处理（与 Go 的 ExitCode() 一致）。
     let code = output.status.code().unwrap_or(-1);
     if code == 0 {
@@ -206,7 +231,9 @@ fn task_xml(launcher: &Path, account: &str) -> String {
         "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n",
     );
     xml.push_str("  <RegistrationInfo>\n    <Description>");
-    xml.push_str(&esc("Mesh Client：登录后自动启动客户端"));
+    xml.push_str(&esc(mesh_text::get(
+        mesh_text::id::ENGINE_TEXT_AUTOSTART_TASK_DESCRIPTION,
+    )));
     xml.push_str("</Description>\n  </RegistrationInfo>\n");
     xml.push_str("  <Triggers>\n    <LogonTrigger>\n      <Enabled>true</Enabled>\n");
     xml.push_str(&user_id);

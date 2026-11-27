@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from "vue";
 import { useClient } from "../client";
+import { joinOrDash, latencyText, pathText } from "../format";
 import type { NodeRow } from "../api/types";
 
 const { nodes, snapshot } = useClient();
@@ -243,11 +244,11 @@ const relayCount = computed(() => pickedList.value.filter((node) => node.pathKin
           <span class="body">
             <span class="line1">
               <span class="name">{{ node.hostname || node.ip }}</span>
-              <span class="lat">{{ node.latency }}</span>
+              <span class="lat">{{ latencyText(node.latencyMs) }}</span>
             </span>
             <span class="line2">
               <span class="ip">{{ node.ip }}</span>
-              <span class="tag" :class="node.pathKind">{{ node.pathLabel || "—" }}</span>
+              <span class="tag" :class="node.pathKind">{{ pathText(node.pathKind) }}</span>
             </span>
           </span>
         </label>
@@ -297,7 +298,7 @@ const relayCount = computed(() => pickedList.value.filter((node) => node.pathKin
           <rect :width="BOX_W" :height="BOX_H" rx="8" />
           <text class="n1" x="12" y="22">{{ item.node.hostname || item.node.ip }}</text>
           <text class="n2" x="12" y="40">{{ item.node.ip }}</text>
-          <text class="n3" :x="BOX_W - 12" y="40" text-anchor="end">{{ item.node.hop ? "中继" : item.node.row?.latency }}</text>
+          <text class="n3" :x="BOX_W - 12" y="40" text-anchor="end">{{ item.node.hop ? "中继" : latencyText(item.node.row?.latencyMs) }}</text>
         </g>
       </svg>
 
@@ -316,8 +317,8 @@ const relayCount = computed(() => pickedList.value.filter((node) => node.pathKin
         <dl>
           <dt>地址</dt><dd>{{ focusedNode.ip || "—" }}</dd>
           <dt>路径</dt><dd :title="focusedRoute">{{ focusedRoute }}</dd>
-          <dt>延迟</dt><dd>{{ focusedNode.latency || "—" }}</dd>
-          <dt>协议</dt><dd>{{ focusedNode.proto || "—" }}</dd>
+          <dt>延迟</dt><dd>{{ latencyText(focusedNode.latencyMs) }}</dd>
+          <dt>协议</dt><dd>{{ joinOrDash(focusedNode.tunnels) }}</dd>
           <dt>NAT</dt><dd>{{ focusedNode.natType || "—" }}</dd>
           <dt>跳数</dt><dd>{{ focusedNode.hops || "—" }}</dd>
         </dl>

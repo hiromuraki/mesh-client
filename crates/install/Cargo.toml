@@ -5,8 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# 文案从语言清单取，代码里不写中文（见 docs/i18n.md）。
+mesh-text = { workspace = true }
 # 只有两件事跨平台不一样：锁（LockFileEx / flock）与版本清单的 JSON 编解码。
-# 前者交给 fs4，后者是 serde_json。除这两个以外这个 crate 不依赖任何东西。
+# 前者交给 fs4，后者是 serde_json。
 fs4 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

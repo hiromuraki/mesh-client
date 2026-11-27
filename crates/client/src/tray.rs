@@ -8,6 +8,7 @@
 
 use crate::{platform, APP_TITLE};
 use mesh_engine::{Cmd, StateCell};
+use mesh_text::id;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
@@ -119,9 +120,9 @@ pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
         hIconSm: icon,
     };
     if unsafe { RegisterClassExW(&class) } == 0 {
-        return Err(format!(
-            "注册托盘窗口类失败: {}",
-            std::io::Error::last_os_error()
+        return Err(mesh_text::format(
+            id::CLIENT_ERROR_REGISTER_TRAY_CLASS,
+            &[&std::io::Error::last_os_error()],
         ));
     }
     // 普通隐藏窗口（不加 WS_VISIBLE），不是 message-only 窗口：TaskbarCreated 是
@@ -143,9 +144,9 @@ pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
         )
     };
     if hwnd.is_null() {
-        return Err(format!(
-            "创建托盘窗口失败: {}",
-            std::io::Error::last_os_error()
+        return Err(mesh_text::format(
+            id::CLIENT_ERROR_CREATE_TRAY_WINDOW,
+            &[&std::io::Error::last_os_error()],
         ));
     }
 
@@ -153,7 +154,7 @@ pub(crate) fn run(options: TrayOptions) -> Result<(), String> {
     thread::Builder::new()
         .name("mesh-tray-watch".to_string())
         .spawn(move || watch_state(&watcher))
-        .map_err(|err| format!("启动托盘同步线程失败: {err}"))?;
+        .map_err(|err| mesh_text::format(id::CLIENT_ERROR_START_TRAY_THREAD, &[&err]))?;
     allow_shell_messages(hwnd, taskbar_created);
     add_icon_with_retry(Arc::clone(&context), hwnd as usize);
     // 窗口、监听线程与托盘图标都就位了：这一版算能跑起来。
@@ -298,26 +299,41 @@ fn show_menu(context: &Context, hwnd: HWND) {
     }
     match update_state.as_str() {
         // 下载中只提示、不可点：此时 ApplyUpdate 还没有可安装的文件。
-        "downloading" => append(menu, MF_STRING | MF_GRAYED, ID_UPDATE, "正在下载更新…"),
+        "downloading" => append(
+            menu,
+            MF_STRING | MF_GRAYED,
+            ID_UPDATE,
+            mesh_text::get(id::CLIENT_TEXT_UPDATE_DOWNLOADING),
+        ),
         "ready" => {
             let text = if update_version.is_empty() {
-                "应用可更新".to_string()
+                mesh_text::get(id::CLIENT_TEXT_UPDATE_READY).to_string()
             } else {
-                format!("应用可更新 {update_version}")
+                mesh_text::format(id::CLIENT_TEXT_UPDATE_READY_VERSION, &[&update_version])
             };
             append(menu, MF_STRING, ID_UPDATE, &text);
         }
         _ => {}
     }
     let address_text = if address.is_empty() {
-        "本机地址：未连接".to_string()
+        mesh_text::get(id::CLIENT_TEXT_ADDRESS_UNCONNECTED).to_string()
     } else {
-        format!("本机地址：{address}")
+        mesh_text::format(id::CLIENT_TEXT_ADDRESS, &[&address])
     };
     append(menu, MF_STRING | MF_GRAYED, ID_ADDRESS, &address_text);
     append(menu, MF_SEPARATOR, 0, "");
-    append(menu, MF_STRING, ID_PANEL, "打开面板");
-    append(menu, MF_STRING, ID_DIR, "打开应用目录");
+    append(
+        menu,
+        MF_STRING,
+        ID_PANEL,
+        mesh_text::get(id::CLIENT_MENU_OPEN_PANEL),
+    );
+    append(
+        menu,
+        MF_STRING,
+        ID_DIR,
+        mesh_text::get(id::CLIENT_MENU_OPEN_APP_DIR),
+    );
     append(menu, MF_SEPARATOR, 0, "");
     // 自启只在 Windows 桌面形态下有意义：Linux 上客户端由 systemd 拉起。
     let checked = if context.autostart.load(Ordering::SeqCst) {
@@ -325,9 +341,19 @@ fn show_menu(context: &Context, hwnd: HWND) {
     } else {
         0
     };
-    append(menu, MF_STRING | checked, ID_AUTOSTART, "开机自启");
+    append(
+        menu,
+        MF_STRING | checked,
+        ID_AUTOSTART,
+        mesh_text::get(id::CLIENT_MENU_AUTOSTART),
+    );
     append(menu, MF_SEPARATOR, 0, "");
-    append(menu, MF_STRING, ID_QUIT, "退出");
+    append(
+        menu,
+        MF_STRING,
+        ID_QUIT,
+        mesh_text::get(id::CLIENT_MENU_QUIT),
+    );
 
     let mut point = POINT { x: 0, y: 0 };
     unsafe {
@@ -363,7 +389,10 @@ fn on_command(context: &Arc<Context>, raw: usize) {
                 .name("mesh-open-panel".to_string())
                 .spawn(move || {
                     if let Err(err) = platform::open_browser(&url) {
-                        platform::notify_error(&format!("无法打开面板: {err}"));
+                        platform::notify_error(&mesh_text::format(
+                            id::CLIENT_ERROR_OPEN_PANEL,
+                            &[&err],
+                        ));
                     }
                 });
         }
@@ -373,7 +402,10 @@ fn on_command(context: &Arc<Context>, raw: usize) {
                 .name("mesh-open-dir".to_string())
                 .spawn(move || {
                     if let Err(err) = platform::open_dir(&root) {
-                        platform::notify_error(&format!("无法打开应用目录: {err}"));
+                        platform::notify_error(&mesh_text::format(
+                            id::CLIENT_ERROR_OPEN_APP_DIR,
+                            &[&err],
+                        ));
                     }
                 });
         }
@@ -430,7 +462,8 @@ fn fill_tip(slot: &mut [u16; 128], text: &str) {
 /// LoadImage 的，这里照做，读完立刻删。
 fn load_tray_icon(bytes: &[u8]) -> Result<HICON, String> {
     let path = std::env::temp_dir().join(format!("mesh-client-tray-{}.ico", std::process::id()));
-    std::fs::write(&path, bytes).map_err(|err| format!("写托盘图标临时文件失败: {err}"))?;
+    std::fs::write(&path, bytes)
+        .map_err(|err| mesh_text::format(id::CLIENT_ERROR_WRITE_TRAY_ICON, &[&err]))?;
     let wide = platform::wide(&path.display().to_string());
     let icon = unsafe {
         LoadImageW(
@@ -444,9 +477,9 @@ fn load_tray_icon(bytes: &[u8]) -> Result<HICON, String> {
     };
     let _ = std::fs::remove_file(&path);
     if icon.is_null() {
-        return Err(format!(
-            "加载托盘图标失败: {}",
-            std::io::Error::last_os_error()
+        return Err(mesh_text::format(
+            id::CLIENT_ERROR_LOAD_TRAY_ICON,
+            &[&std::io::Error::last_os_error()],
         ));
     }
     Ok(icon)

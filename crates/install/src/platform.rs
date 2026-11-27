@@ -17,6 +17,9 @@ const PLATFORM_ID: &str = "windows/arm64";
 const PLATFORM_ID: &str = "linux/amd64";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 const PLATFORM_ID: &str = "linux/arm64";
+// 这条文案与 `mesh_text::id::INSTALL_ERROR_UNSUPPORTED_PLATFORM` 同源，但
+// `compile_error!` 只接受字符串字面量，取不到运行时的语言表；模块末尾的测试
+// 保证两处不走样。
 #[cfg(not(any(
     all(target_os = "windows", target_arch = "x86_64"),
     all(target_os = "windows", target_arch = "aarch64"),
@@ -83,5 +86,16 @@ mod tests {
         let (os, arch) = id.split_once('/').unwrap();
         assert_eq!(os, std::env::consts::OS);
         assert!(matches!(arch, "amd64" | "arm64"));
+    }
+
+    /// `compile_error!` 只收字符串字面量，这里核对它与语言清单没有走样。
+    #[test]
+    fn the_unsupported_platform_message_matches_the_language_file() {
+        let source = include_str!("platform.rs");
+        let text = mesh_text::get(mesh_text::id::INSTALL_ERROR_UNSUPPORTED_PLATFORM);
+        assert!(
+            source.contains(text),
+            "platform.rs 的 compile_error! 文案与语言清单不一致: {text}"
+        );
     }
 }

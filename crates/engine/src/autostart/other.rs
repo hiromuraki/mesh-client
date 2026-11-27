@@ -12,10 +12,10 @@ pub(crate) fn enabled() -> Result<bool, String> {
 
 /// 非 Windows 上没有“开机自启”这个能力。
 pub(crate) fn enable(_launcher: &Path) -> Result<(), String> {
-    Err("当前平台不支持开机自启设置".to_string())
+    Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_AUTOSTART_UNSUPPORTED).to_string())
 }
 
 /// 非 Windows 上没有“开机自启”这个能力。
 pub(crate) fn disable() -> Result<(), String> {
-    Err("当前平台不支持开机自启设置".to_string())
+    Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_AUTOSTART_UNSUPPORTED).to_string())
 }

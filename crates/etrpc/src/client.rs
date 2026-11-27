@@ -64,8 +64,9 @@ pub(crate) fn call(
         set_timeout(&stream, deadline)?;
         let (packet_type, raw) = frame::read_frame(&mut stream)?;
         if packet_type != wire::PACKET_RPC_RESP {
-            return Err(Error::Frame(format!(
-                "rpc 应答的 packet_type 是 {packet_type}，不是应答帧"
+            return Err(Error::Frame(mesh_text::format(
+                mesh_text::id::ETRPC_ERROR_UNEXPECTED_PACKET,
+                &[&packet_type],
             )));
         }
         let packet = decode_packet(&raw)?;
@@ -76,14 +77,18 @@ pub(crate) fn call(
             packet.total_pieces
         };
         if total_pieces > MAX_PIECES {
-            return Err(Error::Frame(format!("rpc 应答分片数异常: {total_pieces}")));
+            return Err(Error::Frame(mesh_text::format(
+                mesh_text::id::ETRPC_ERROR_PIECE_COUNT,
+                &[&total_pieces],
+            )));
         }
         if total == 0 {
             total = total_pieces;
         }
         if packet.body.len() > MAX_RESPONSE_BYTES - received {
-            return Err(Error::Frame(format!(
-                "rpc 应答超过 {MAX_RESPONSE_BYTES} 字节"
+            return Err(Error::Frame(mesh_text::format(
+                mesh_text::id::ETRPC_ERROR_RESPONSE_TOO_LARGE,
+                &[&MAX_RESPONSE_BYTES],
             )));
         }
         received += packet.body.len();
@@ -96,7 +101,10 @@ pub(crate) fn call(
         let mut body = Vec::with_capacity(4096);
         for index in 0..total {
             let chunk = pieces.get(&index).ok_or_else(|| {
-                Error::Frame(format!("rpc 应答缺少第 {index} 片（共 {total} 片）"))
+                Error::Frame(mesh_text::format(
+                    mesh_text::id::ETRPC_ERROR_MISSING_PIECE,
+                    &[&index, &total],
+                ))
             })?;
             body.extend_from_slice(chunk);
         }
@@ -154,23 +162,35 @@ fn decode_response(raw: &[u8]) -> Result<Vec<u8>, Error> {
 /// 把 `error.Error` 的 oneof 翻成一句中文。字段号即错误类型，与 common.proto 一致。
 fn rpc_error_text(raw: &[u8]) -> String {
     let Ok(fields) = pb::parse(raw, "error.Error") else {
-        return "rpc 失败（错误内容无法解析）".to_string();
+        return mesh_text::get(mesh_text::id::ETRPC_ERROR_RPC_UNPARSABLE).to_string();
     };
     if fields.is_empty() {
-        return "rpc 失败（未给出原因）".to_string();
+        return mesh_text::get(mesh_text::id::ETRPC_ERROR_RPC_NO_REASON).to_string();
     }
     let kind = fields.first().expect("非空已在上面判过");
     let inner = pb::parse(&kind.data, "error.Error").unwrap_or_default();
     match kind.num {
-        1 => format!("rpc 失败: {}", inner.str(1)),
-        2 => format!("rpc 方法不存在: {} #{}", inner.str(1), inner.uint(2)),
-        3 => format!("rpc 服务不存在: {}", inner.str(1)),
-        4 => "rpc 请求解码失败".to_string(),
-        5 => "rpc 应答编码失败".to_string(),
-        6 => format!("rpc 执行失败: {}", inner.str(1)),
-        7 => format!("rpc 报文格式错误: {}", inner.str(1)),
-        8 => format!("rpc 超时: {}", inner.str(1)),
-        other => format!("rpc 失败（错误类型 {other}）"),
+        1 => mesh_text::format(mesh_text::id::ETRPC_ERROR_RPC_FAILED, &[&inner.str(1)]),
+        2 => mesh_text::format(
+            mesh_text::id::ETRPC_ERROR_METHOD_NOT_FOUND,
+            &[&inner.str(1), &inner.uint(2)],
+        ),
+        3 => mesh_text::format(
+            mesh_text::id::ETRPC_ERROR_SERVICE_NOT_FOUND,
+            &[&inner.str(1)],
+        ),
+        4 => mesh_text::get(mesh_text::id::ETRPC_ERROR_REQUEST_DECODE).to_string(),
+        5 => mesh_text::get(mesh_text::id::ETRPC_ERROR_RESPONSE_ENCODE).to_string(),
+        6 => mesh_text::format(
+            mesh_text::id::ETRPC_ERROR_EXECUTION_FAILED,
+            &[&inner.str(1)],
+        ),
+        7 => mesh_text::format(
+            mesh_text::id::ETRPC_ERROR_PACKET_MALFORMED,
+            &[&inner.str(1)],
+        ),
+        8 => mesh_text::format(mesh_text::id::ETRPC_ERROR_RPC_TIMEOUT, &[&inner.str(1)]),
+        other => mesh_text::format(mesh_text::id::ETRPC_ERROR_RPC_UNKNOWN_TYPE, &[&other]),
     }
 }
 
@@ -329,7 +349,7 @@ mod tests {
         });
         match call(addr, wire::METHOD_SHOW_NODE_INFO, &[], TIMEOUT) {
             Err(Error::Rpc(message)) => {
-                assert_eq!(message, "rpc 方法不存在: PeerManageRpc #9");
+                assert_eq!(message, "rpc 方法不存在：PeerManageRpc #9");
             }
             other => panic!("应是 Rpc 错误，得到 {other:?}"),
         }
