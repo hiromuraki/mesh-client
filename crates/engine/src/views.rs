@@ -237,9 +237,13 @@ pub struct LocalNode {
 /// 类型与实测延迟。中继链路上的节点只有路由、没有 peer。
 pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<NodeRow> {
     let peer_by_id: HashMap<u32, &Peer> = peers.iter().map(|peer| (peer.peer_id, peer)).collect();
-    let mut resolver = PathResolver::new(routes);
+    // 一台机器可能在路由表里占两条：`peer_id` 标识的是「一次进程生命」，重启后旧的那条
+    // 还要在网络里挂一阵（最长一小时），而地址是写死的，于是两个 peer_id 撞同一个 IPv4。
+    // 这一列叫「节点」，一台机器一行，所以先按地址归并再往下拼。
+    let live = one_route_per_address(routes, &peer_by_id);
+    let mut resolver = PathResolver::new(&live);
 
-    let mut rows: Vec<NodeRow> = Vec::with_capacity(routes.len() + 1);
+    let mut rows: Vec<NodeRow> = Vec::with_capacity(live.len() + 1);
     if !local.ip.is_empty() {
         rows.push(NodeRow {
             ip: local.ip.clone(),
@@ -250,7 +254,7 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
             ..NodeRow::default()
         });
     }
-    for route in routes {
+    for route in &live {
         let ip = strip_cidr(&route.ipv4).to_string();
         if !local.ip.is_empty() && ip == local.ip {
             // 对端路由表里尚未过期的旧会话会把本机学回来，跳过以免出现两行本机。
@@ -295,6 +299,42 @@ pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<No
     rows
 }
 
+/// 按地址归并路由：一台机器只留一条。
+///
+/// 优先留「有活隧道」的那条——`list_peer` 只列还连着的对等节点，所以它在表里就说明
+/// 这条路的另一端还活着，另一条同地址的多半是上一个进程留下的。都是残留时按跳数和
+/// 延迟挑，尽量留下代价小的。
+fn one_route_per_address<'a>(
+    routes: &'a [Route],
+    peer_by_id: &HashMap<u32, &Peer>,
+) -> Vec<&'a Route> {
+    let mut chosen: Vec<&Route> = Vec::new();
+    let mut at_by_ip: HashMap<&'a str, usize> = HashMap::new();
+    for route in routes {
+        let ip = strip_cidr(&route.ipv4);
+        match at_by_ip.get(ip) {
+            Some(&at) => {
+                if closer(route, chosen[at], peer_by_id) {
+                    chosen[at] = route;
+                }
+            }
+            None => {
+                at_by_ip.insert(ip, chosen.len());
+                chosen.push(route);
+            }
+        }
+    }
+    chosen
+}
+
+fn closer(candidate: &Route, current: &Route, peer_by_id: &HashMap<u32, &Peer>) -> bool {
+    let tunnel = |route: &Route| peer_by_id.contains_key(&route.peer_id);
+    match (tunnel(candidate), tunnel(current)) {
+        (true, false) => true,
+        (false, true) => false,
+        _ => (candidate.cost, candidate.path_latency) < (current.cost, current.path_latency),
+    }
+}
 /// 把路由表还原成完整路径。路由表每一项只给出「到目标的下一跳」，而下一跳是
 /// `peer_id`，需要先按 `peer_id` 找到它自己那一行的 IP，再逐级回推；结果按 IP 记忆。
 struct PathResolver<'a> {
@@ -304,10 +344,11 @@ struct PathResolver<'a> {
 }
 
 impl<'a> PathResolver<'a> {
-    fn new(routes: &'a [Route]) -> PathResolver<'a> {
+    fn new(routes: &'a [&'a Route]) -> PathResolver<'a> {
         let mut by_ip = HashMap::with_capacity(routes.len());
         let mut ip_by_peer = HashMap::with_capacity(routes.len());
         for route in routes {
+            let route = *route;
             let ip = strip_cidr(&route.ipv4).to_string();
             ip_by_peer.insert(route.peer_id, ip.clone());
             by_ip.insert(ip, route);
@@ -502,5 +543,51 @@ mod tests {
         assert!(rows[0].tunnels.is_empty());
         assert_eq!(rows[0].latency_ms, None);
         assert_eq!(rows[0].version, "2.7.1-abc");
+    }
+
+    #[test]
+    fn a_second_route_for_the_same_address_is_merged() {
+        // 同一台机器的两代 peer_id：有隧道的那条才代表现在的它，另一条是上个进程的残留。
+        let peers = vec![peer(7, &[("udp", 6)])];
+        let routes = vec![
+            route(7, "10.126.126.1/24", "ali-seed", 1, 7, 6),
+            route(8, "10.126.126.1/24", "ali-seed", 2, 2, 525),
+        ];
+        let rows = build_nodes(&peers, &routes, LocalNode::default());
+        assert_eq!(rows.len(), 1, "一台机器只该有一行: {rows:?}");
+        assert_eq!(rows[0].ip, "10.126.126.1");
+        assert_eq!(rows[0].path_kind, "direct");
+        assert_eq!(rows[0].tunnels, vec!["udp".to_string()]);
+        assert_eq!(rows[0].latency_ms, Some(6.0));
+    }
+
+    #[test]
+    fn the_route_with_a_live_tunnel_wins_over_a_cheaper_stale_one() {
+        // 残留那条看起来更近（1 跳），但它没有隧道；跳数少的假象不能压过“还连着”。
+        let peers = vec![peer(9, &[("udp", 20)])];
+        let routes = vec![
+            route(2, "10.126.126.2/24", "tencent-seed", 1, 2, 5),
+            route(10, "10.126.126.9/24", "node", 1, 10, 3),
+            route(9, "10.126.126.9/24", "node", 2, 2, 30),
+        ];
+        let rows = build_nodes(&peers, &routes, LocalNode::default());
+        let node = rows.iter().find(|row| row.ip == "10.126.126.9").unwrap();
+        assert_eq!(node.path_kind, "relay");
+        assert_eq!(node.tunnels, vec!["udp".to_string()]);
+        assert_eq!(node.path.len(), 1);
+        assert_eq!(node.path[0].ip, "10.126.126.2");
+    }
+
+    #[test]
+    fn between_two_stale_routes_the_shorter_one_wins() {
+        let routes = vec![
+            route(2, "10.126.126.2/24", "tencent-seed", 1, 2, 5),
+            route(11, "10.126.126.9/24", "node", 4, 2, 1525),
+            route(12, "10.126.126.9/24", "node", 2, 2, 525),
+        ];
+        let rows = build_nodes(&[], &routes, LocalNode::default());
+        let node = rows.iter().find(|row| row.ip == "10.126.126.9").unwrap();
+        assert_eq!(node.hops, 2);
+        assert_eq!(node.latency_ms, Some(525.0));
     }
 }
