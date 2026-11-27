@@ -1,4 +1,4 @@
-//! 手写 CLI：九个开关、无子命令、无补全。
+//! 手写 CLI：八个开关、无子命令、无补全。
 //!
 //! 风格沿用启动器的 args.rs（支持 --x=y），参数名与含义照 Go 的 flag 定义。
 //! 帮助文本走 stdout、退出码 0（启动器一致）；Go 的 flag 包帮到 stderr、退出码 2，
@@ -16,7 +16,6 @@ pub(crate) struct Options {
     pub server: String,
     pub token: String,
     pub name: String,
-    pub core: String,
     pub boot_check: Option<String>,
     pub disable_auto_update: bool,
 }
@@ -38,7 +37,6 @@ pub(crate) fn usage() -> String {
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_SERVER)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_TOKEN)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_NAME)),
-        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_CORE)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_BOOT_CHECK)),
         format!(
             "  {}",
@@ -90,7 +88,6 @@ pub(crate) fn parse(argv: &[String]) -> Result<Options, ParseError> {
             "server" => options.server = value(argv, &mut index, inline, name)?,
             "token" => options.token = value(argv, &mut index, inline, name)?,
             "name" => options.name = value(argv, &mut index, inline, name)?,
-            "core" => options.core = value(argv, &mut index, inline, name)?,
             "boot-check" => {
                 options.boot_check = Some(value(argv, &mut index, inline, name)?);
             }
@@ -161,8 +158,6 @@ mod tests {
             "--token=t",
             "--name",
             "laptop",
-            "--core",
-            "core.exe",
             "--boot-check",
             "abc",
             "--disable-auto-update",
@@ -173,7 +168,6 @@ mod tests {
         assert_eq!(options.server, "http://10.8.0.1:8088");
         assert_eq!(options.token, "t");
         assert_eq!(options.name, "laptop");
-        assert_eq!(options.core, "core.exe");
         assert_eq!(options.boot_check.as_deref(), Some("abc"));
         assert!(options.disable_auto_update);
     }
@@ -237,7 +231,6 @@ mod tests {
             "--server",
             "--token",
             "--name",
-            "--core",
             "--boot-check",
             "--disable-auto-update",
             "--help",

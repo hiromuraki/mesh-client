@@ -15,7 +15,6 @@ pub struct SettingsInput {
     pub server_url: String,
     pub token: String,
     pub hostname: String,
-    pub core_path: String,
 }
 
 impl Engine {
@@ -33,7 +32,6 @@ impl Engine {
         let server_url = normalize_server_url(&input.server_url)?;
         // 留空表示用本机主机名，不把当前主机名固化进配置。
         let hostname = input.hostname.trim().to_string();
-        let core_path = input.core_path.trim().to_string();
         let token = input.token.trim().to_string();
 
         let current = self.store.load_client().map_err(|err| err.to_string())?;
@@ -43,7 +41,6 @@ impl Engine {
             device_id: String::new(),
             hostname,
             created_at: 0,
-            core_path,
         };
         let previous_device_id = current
             .as_ref()

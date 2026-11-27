@@ -144,33 +144,29 @@ pub fn spawn_with(
     thread::spawn(events, on_line, options)
 }
 
-/// 按契约 2.4 的顺序查找 `easytier-core`：
-/// `client.json` 的 `core_path` → 主程序同一级 `bin/` → 主程序同一级 → PATH。
-pub fn locate(explicit: &Path) -> Result<PathBuf, String> {
-    // 显式路径不存在时继续往下找，与 Go 一致：快照里的 `corePathUsed` 会显示实际
-    // 用了哪一个，用户改错路径时也不会直接失去 core。
-    if !explicit.as_os_str().is_empty() && is_file(explicit) {
-        return Ok(explicit.to_path_buf());
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let in_bin = dir.join("bin").join(CORE_NAME);
-            if is_file(&in_bin) {
-                return Ok(in_bin);
-            }
-            let same_dir = dir.join(CORE_NAME);
-            if is_file(&same_dir) {
-                return Ok(same_dir);
-            }
+/// 按契约 2.4 的顺序查找 `easytier-core`：安装根的 `bin/` → 安装根本身 → PATH。
+///
+/// 返回绝对路径：core 一旦选定就不再变，之后工作目录怎么挪都不影响这一份。
+pub fn locate(root: &Path) -> Result<PathBuf, String> {
+    let root = absolute(root.to_path_buf());
+    for candidate in [root.join("bin").join(CORE_NAME), root.join(CORE_NAME)] {
+        if is_file(&candidate) {
+            return Ok(candidate);
         }
     }
     if let Some(path) = search_path(CORE_NAME) {
-        return Ok(path);
+        return Ok(absolute(path));
     }
     Err(mesh_text::format(
         mesh_text::id::CORE_ERROR_CORE_NOT_FOUND,
         &[&CORE_NAME],
     ))
+}
+
+/// 拼成绝对路径。`std::path::absolute` 不解析符号链接，也不改大小写或短名，
+/// 所以面板上显示的仍是人认得的那个路径；读不到当前目录时退回原样。
+fn absolute(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// 与 `mesh_install::platform::core_name()` 同一个名字。
@@ -206,23 +202,30 @@ mod tests {
 
     #[test]
     fn locate_falls_through_to_an_error_when_nothing_is_installed() {
-        // 测试二进制在 target/debug/deps 里，同级没有 bin/easytier-core；显式路径也
-        // 不存在，于是整条查找链走完只能报“找不到”（PATH 上通常也没有它）。
-        let missing = std::env::temp_dir().join("mesh-core-does-not-exist");
-        match locate(&missing) {
+        // 安装根是空目录，bin/ 与根下都没有 core，于是整条查找链走完只能报“找不到”
+        // （PATH 上通常也没有它）。
+        let empty = std::env::temp_dir().join(format!("mesh-core-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&empty).unwrap();
+        match locate(&empty) {
             Err(err) => assert!(err.contains("找不到"), "err = {err}"),
             // 开发机上真的把 easytier-core 装进 PATH 时，这条用例就退化成交给环境。
-            Ok(found) => assert!(found.ends_with(CORE_NAME), "found = {found:?}"),
+            Ok(found) => assert!(
+                found.is_absolute() && found.ends_with(CORE_NAME),
+                "found = {found:?}"
+            ),
         }
+        let _ = std::fs::remove_dir_all(&empty);
     }
 
     #[test]
-    fn locate_accepts_an_explicit_existing_file() {
-        let dir = std::env::temp_dir().join(format!("mesh-core-locate-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("my-core");
-        std::fs::write(&file, b"stub").unwrap();
-        assert_eq!(locate(&file).unwrap(), file);
-        let _ = std::fs::remove_dir_all(&dir);
+    fn locate_prefers_bin_and_returns_an_absolute_path() {
+        let root = std::env::temp_dir().join(format!("mesh-core-locate-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let core = root.join("bin").join(CORE_NAME);
+        std::fs::write(&core, b"stub").unwrap();
+        let found = locate(&root).unwrap();
+        assert!(found.is_absolute(), "found = {found:?}");
+        assert_eq!(found, core);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

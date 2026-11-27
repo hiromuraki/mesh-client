@@ -84,7 +84,6 @@ client.text.usage_root = --root <目录>          安装根目录，默认为可
 client.text.usage_server = --server <地址>        控制面地址，如 http://10.8.0.1:8088
 client.text.usage_token = --token <令牌>         注册令牌，只在首次注册时需要
 client.text.usage_name = --name <名字>          设备名，留空使用本机主机名
-client.text.usage_core = --core <路径>          easytier-core 路径，留空自动查找
 client.text.usage_boot_check = --boot-check <标记>    安装器给的一次性标记；启动成功后在安装根写 .boot-ok-<标记>
 client.text.usage_disable_auto_update = --disable-auto-update  忽略服务端下发的自动更新指示，一律等手动安装
 client.text.usage_help = -h, --help             显示这份帮助

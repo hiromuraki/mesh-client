@@ -367,7 +367,6 @@ fn settings_are_forwarded_to_the_engine() {
             assert_eq!(input.server_url, "http://10.126.126.1:8088");
             assert_eq!(input.token, "tok");
             assert_eq!(input.hostname, "laptop");
-            assert_eq!(input.core_path, "/x/easytier-core");
             let _ = reply.send(Ok(Snapshot {
                 device_id: "new-id".into(),
                 ..Snapshot::default()
@@ -376,7 +375,8 @@ fn settings_are_forwarded_to_the_engine() {
         _ => panic!("应当是 Cmd::Settings"),
     });
     let mut req = request("PUT", "/api/settings");
-    req.body = br#"{"serverUrl":"http://10.126.126.1:8088","token":"tok","hostname":"laptop","corePath":"/x/easytier-core"}"#.to_vec();
+    req.body =
+        br#"{"serverUrl":"http://10.126.126.1:8088","token":"tok","hostname":"laptop"}"#.to_vec();
     let response = router.handle(req);
     assert_eq!(response.status, 200);
     assert_eq!(body_json(&response)["deviceId"], "new-id");

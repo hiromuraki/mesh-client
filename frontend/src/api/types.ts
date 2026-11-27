@@ -13,7 +13,6 @@ export interface Snapshot {
   hostname: string;
   hostnameSet: string;
   configHash: string;
-  corePath: string;
   corePathUsed: string;
   coreRunning: boolean;
   corePid: number;
@@ -89,5 +88,4 @@ export interface SettingsInput {
   serverUrl: string;
   token: string;
   hostname: string;
-  corePath: string;
 }

@@ -16,7 +16,7 @@ use mesh_remote as remote;
 use mesh_state::hints::ConfigHints;
 use mesh_state::{ClientConfig, Store};
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
@@ -934,7 +934,7 @@ impl Engine {
         // 提示字段现读现算（Go 的 hints() 也是每次读文件）：配置刚被写盘时，
         // 就绪判据与身份选择都必须基于新内容。
         self.refresh_identity();
-        let core_path = mesh_core::locate(Path::new(&config.core_path))?;
+        let core_path = mesh_core::locate(&self.config.root)?;
         let rpc_addr = sync::rpc_listen_addr()?;
         let hostname = self.effective_hostname(&config);
         let hints = self.hints.clone();

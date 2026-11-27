@@ -86,7 +86,6 @@ client.text.usage_root = --root <dir>           Install root; defaults to the pa
 client.text.usage_server = --server <address>     Control plane address, e.g. http://10.8.0.1:8088
 client.text.usage_token = --token <token>        Registration token, needed only for the first registration
 client.text.usage_name = --name <name>          Device name; empty uses the local hostname
-client.text.usage_core = --core <path>          easytier-core path; empty means auto-detect
 client.text.usage_boot_check = --boot-check <token>   One-shot token from the installer; on success write .boot-ok-<token> under the install root
 client.text.usage_disable_auto_update = --disable-auto-update  Ignore server-driven auto updates and wait for a manual install
 client.text.usage_help = -h, --help             Show this help

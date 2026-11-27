@@ -7,18 +7,17 @@ const { snapshot } = useClient();
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8088";
 
-const form = reactive({ serverUrl: "", token: "", hostname: "", corePath: "" });
+const form = reactive({ serverUrl: "", token: "", hostname: "" });
 const message = reactive({ text: "", kind: "" as "" | "ok" | "error" });
 const saving = ref(false);
 
 // 表单只回填一次：之后由用户输入驱动，轮询不会把正在输入的内容覆盖掉。
 let filled = false;
 
-function fill(next: { serverUrl: string; hostname: string; corePath: string } | null): void {
+function fill(next: { serverUrl: string; hostname: string } | null): void {
   if (!next) return;
   form.serverUrl = next.serverUrl || DEFAULT_SERVER_URL;
   form.hostname = next.hostname;
-  form.corePath = next.corePath;
   form.token = "";
 }
 
@@ -26,7 +25,7 @@ watch(
   snapshot,
   (current) => {
     if (!current || filled) return;
-    fill({ serverUrl: current.serverUrl, hostname: current.hostnameSet, corePath: current.corePath });
+    fill({ serverUrl: current.serverUrl, hostname: current.hostnameSet });
     filled = true;
   },
   { immediate: true },
@@ -89,9 +88,8 @@ async function onSave(): Promise<void> {
       serverUrl: form.serverUrl,
       token: form.token,
       hostname: form.hostname,
-      corePath: form.corePath,
     });
-    fill({ serverUrl: next.serverUrl, hostname: next.hostnameSet, corePath: next.corePath });
+    fill({ serverUrl: next.serverUrl, hostname: next.hostnameSet });
     message.kind = "ok";
     message.text = next.deviceId ? "已保存，正在连接…" : "已保存";
   } catch (err) {
@@ -126,17 +124,13 @@ async function onSave(): Promise<void> {
       <section class="card">
         <header>
           <h2>客户端</h2>
-          <p>设备名会出现在其他节点的列表里；core 路径留空则自动查找。</p>
+          <p>设备名会出现在其他节点的列表里。</p>
         </header>
         <div class="field">
           <label for="hostname">设备名</label>
           <input id="hostname" v-model="form.hostname" type="text" placeholder="留空使用本机主机名" autocomplete="off" />
         </div>
-        <div class="field">
-          <label for="corePath">core 路径</label>
-          <input id="corePath" v-model="form.corePath" type="text" placeholder="留空自动查找 bin\easytier-core.exe" autocomplete="off" spellcheck="false" />
-          <span class="note" :title="snapshot?.corePathUsed || ''">当前使用 {{ snapshot?.corePathUsed || "—" }}</span>
-        </div>
+        <p class="note" :title="snapshot?.corePathUsed || ''">core 取自安装根的 bin/，当前使用 {{ snapshot?.corePathUsed || "—" }}</p>
         <div v-if="snapshot?.autostartSupported" class="field">
           <label class="check">
             <input type="checkbox" :checked="autostartOn" :disabled="autostartBusy" @change="onAutostart" />

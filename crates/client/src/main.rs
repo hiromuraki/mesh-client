@@ -212,8 +212,7 @@ fn configure(
     let current = store.load_client().map_err(|err| err.to_string())?;
     let given = !options.server.trim().is_empty()
         || !options.token.trim().is_empty()
-        || !options.name.trim().is_empty()
-        || !options.core.trim().is_empty();
+        || !options.name.trim().is_empty();
     if !given {
         // 还没来得及注册不算错误：桌面模式下面板会停在设置页让用户填服务端
         // 地址与令牌。headless 没人能填，只能直接失败。
@@ -230,7 +229,6 @@ fn configure(
         server_url: options.server.trim().to_string(),
         token: options.token.trim().to_string(),
         hostname: options.name.trim().to_string(),
-        core_path: options.core.trim().to_string(),
     };
     if let Some(current) = current.as_ref() {
         if input.server_url.is_empty() {
@@ -238,9 +236,6 @@ fn configure(
         }
         if input.hostname.is_empty() {
             input.hostname = current.hostname.clone();
-        }
-        if input.core_path.is_empty() {
-            input.core_path = current.core_path.clone();
         }
     }
     let (reply_tx, reply_rx) = channel();

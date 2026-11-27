@@ -327,7 +327,6 @@ impl Router {
             server_url: body.server_url,
             token: body.token,
             hostname: body.hostname,
-            core_path: body.core_path,
         };
         let (reply_tx, reply_rx) = channel();
         if let Err(err) = self.send(Cmd::Settings(input, reply_tx)) {
@@ -424,7 +423,6 @@ struct SettingsBody {
     server_url: String,
     token: String,
     hostname: String,
-    core_path: String,
 }
 
 #[derive(Deserialize, Default)]

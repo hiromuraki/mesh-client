@@ -126,9 +126,6 @@ pub struct ClientConfig {
     pub device_id: String,
     pub hostname: String,
     pub created_at: i64,
-    /// 用户显式指定的 core 路径；空串表示按自动查找顺序找。
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub core_path: String,
 }
 
 /// `config/credential.json`：控制面签发的凭据，取代 `secure.key` 成为这个节点
@@ -579,12 +576,11 @@ mod tests {
             device_id: "0123456789abcdef0123456789abcdef".into(),
             hostname: "laptop".into(),
             created_at: 1795541874,
-            core_path: String::new(),
         };
         store.save_client(&config).unwrap();
         assert_eq!(store.load_client().unwrap(), Some(config.clone()));
         let text = fs::read_to_string(store.client_path()).unwrap();
-        // 磁盘格式是 snake_case，且 core_path 为空时整个键不出现（Go 的 omitempty）。
+        // 磁盘格式是 snake_case，且只有这四个键。
         assert!(text.contains("\"server_url\""));
         assert!(text.contains("\"device_id\""));
         assert!(text.contains("\"created_at\""));

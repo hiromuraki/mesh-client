@@ -23,8 +23,6 @@ pub struct Snapshot {
     /// 配置里保存的设备名；空表示用本机主机名。
     pub hostname_set: String,
     pub config_hash: String,
-    /// 配置里保存的 core 路径；空表示自动查找。
-    pub core_path: String,
     /// 实际使用的 core 路径。
     pub core_path_used: String,
     pub core_running: bool,
@@ -126,7 +124,6 @@ impl Engine {
             hostname: self.config.hostname.clone(),
             hostname_set: String::new(),
             config_hash: hash,
-            core_path: String::new(),
             core_path_used: self.core_path_used.clone(),
             core_running,
             core_pid: 0,
@@ -161,7 +158,6 @@ impl Engine {
             snapshot.server_url = client.server_url.clone();
             snapshot.device_id = client.device_id.clone();
             snapshot.hostname_set = client.hostname.clone();
-            snapshot.core_path = client.core_path.clone();
             if !client.hostname.trim().is_empty() {
                 snapshot.hostname = client.hostname.clone();
             }

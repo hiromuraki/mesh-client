@@ -126,7 +126,7 @@ pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()>;
 
 ```rust
 pub struct Store { /* root, key 缓存, secure_key 缓存 */ }
-pub struct ClientConfig { server_url, device_id, hostname, created_at, core_path }   // snake_case
+pub struct ClientConfig { server_url, device_id, hostname, created_at }   // snake_case
 pub struct Credential { id, secret, expires_at }
 pub struct ConfigHints { hostname, ipv4, network_name, network_secret, encryption }
 impl ConfigHints { pub fn formal(&self) -> bool; }   // network_secret 非空 == 正式节点
@@ -206,7 +206,7 @@ pub struct Route { peer_id, ipv4, hostname, cost, next_hop, path_latency, nat_ty
 
 ### 3.5 `mesh-core`
 
-**职责**：`easytier-core` 子进程。定位（`client.json` 的 `core_path` → 主程序同级 `bin/` → 同级 → PATH）、启动（参数 + 环境变量）、逐行输出转交、软停/强杀、Windows Job 对象、就绪探测（`ShowNodeInfo` 轮询 500ms、上限 25s）、代次计数。
+**职责**：`easytier-core` 子进程。定位（安装根的 `bin/` → 安装根 → PATH，结果固定为绝对路径）、启动（参数 + 环境变量）、逐行输出转交、软停/强杀、Windows Job 对象、就绪探测（`ShowNodeInfo` 轮询 500ms、上限 25s）、代次计数。
 
 **对外 API**（只暴露一个线程的入口和一条命令通道）：
 

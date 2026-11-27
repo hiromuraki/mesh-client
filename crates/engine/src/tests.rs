@@ -119,6 +119,13 @@ fn harness(tag: &str) -> Harness {
         stun_stop: None,
         closed: false,
     };
+    // 安装根里放一份假 core：locate 只认安装根的 bin/，测试走的就是这条路。
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let placed = bin.join(CORE_FILE);
+    if std::fs::hard_link(fake_core(), &placed).is_err() {
+        std::fs::copy(fake_core(), &placed).unwrap();
+    }
     Harness {
         engine,
         core: record_rx,
@@ -149,6 +156,13 @@ impl Drop for Harness {
     }
 }
 
+/// 安装根 `bin/` 里 core 的文件名，与 `mesh_core::locate` 的 CORE_NAME 一致。
+const CORE_FILE: &str = if cfg!(windows) {
+    "easytier-core.exe"
+} else {
+    "easytier-core"
+};
+
 /// 假 core 可执行文件：与 mesh-core 的集成测试用同一个例子程序。
 fn fake_core() -> PathBuf {
     let name = if cfg!(windows) {
@@ -169,17 +183,16 @@ fn fake_core() -> PathBuf {
     panic!("找不到假 core {name}：先跑 `cargo build --examples -p mesh-core`");
 }
 
-fn saved_client(harness: &Harness, core_path: &Path) -> ClientConfig {
-    saved_client_named(harness, core_path, "")
+fn saved_client(harness: &Harness) -> ClientConfig {
+    saved_client_named(harness, "")
 }
 
-fn saved_client_named(harness: &Harness, core_path: &Path, hostname: &str) -> ClientConfig {
+fn saved_client_named(harness: &Harness, hostname: &str) -> ClientConfig {
     let config = ClientConfig {
         server_url: "http://127.0.0.1:1".to_string(),
         device_id: "dev-1".to_string(),
         hostname: hostname.to_string(),
         created_at: 1_700_000_000,
-        core_path: core_path.display().to_string(),
     };
     harness.engine.store.save_client(&config).unwrap();
     config
@@ -215,7 +228,7 @@ fn save_cred(harness: &Harness, id: &str) {
 #[test]
 fn revoked_clears_the_device_identity() {
     let mut harness = harness("revoked");
-    saved_client(&harness, Path::new(""));
+    saved_client(&harness);
     let cleared = harness
         .engine
         .handle_auth_rejected(&remote::Error::Unauthorized {
@@ -237,7 +250,7 @@ fn revoked_clears_the_device_identity() {
 #[test]
 fn a_clock_skew_only_degrades_and_keeps_the_identity() {
     let mut harness = harness("skew");
-    saved_client(&harness, Path::new(""));
+    saved_client(&harness);
     // 本机比服务端快 10 分钟（Date 头是服务端时间）。
     let server_time = SystemTime::now() - Duration::from_secs(600);
     for attempt in 1..=10 {
@@ -263,7 +276,7 @@ fn a_clock_skew_only_degrades_and_keeps_the_identity() {
 #[test]
 fn three_plain_401s_clear_the_identity() {
     let mut harness = harness("401");
-    saved_client(&harness, Path::new(""));
+    saved_client(&harness);
     let plain = remote::Error::Unauthorized {
         code: "unauthorized".to_string(),
         server_time: None,
@@ -278,7 +291,7 @@ fn three_plain_401s_clear_the_identity() {
 #[test]
 fn a_successful_request_resets_the_auth_failure_counter() {
     let mut harness = harness("reset");
-    saved_client(&harness, Path::new(""));
+    saved_client(&harness);
     let plain = remote::Error::Unauthorized {
         code: "unauthorized".to_string(),
         server_time: None,
@@ -335,7 +348,7 @@ fn a_formal_node_reports_an_empty_credential_id() {
 #[test]
 fn a_new_config_is_written_and_the_core_started() {
     let mut harness = harness("apply");
-    let config = saved_client_named(&harness, &fake_core(), "laptop");
+    let config = saved_client_named(&harness, "laptop");
     save_cred(&harness, "cred-1");
     let toml = "hostname = \"laptop\"\nipv4 = \"10.126.126.100/24\"\n";
     harness
@@ -348,7 +361,7 @@ fn a_new_config_is_written_and_the_core_started() {
     );
     match harness.next_core() {
         Recorded::Start(spec) => {
-            assert_eq!(spec.core_path, fake_core());
+            assert_eq!(spec.core_path, harness.dir.join("bin").join(CORE_FILE));
             assert_eq!(spec.config_path, harness.engine.store.config_path());
             assert_eq!(spec.hostname, "laptop");
             // 就绪判据来自刚写下去的配置。
@@ -369,7 +382,7 @@ fn a_new_config_is_written_and_the_core_started() {
 #[test]
 fn an_unchanged_config_neither_rewrites_nor_restarts() {
     let mut harness = harness("same");
-    let config = saved_client(&harness, &fake_core());
+    let config = saved_client(&harness);
     let toml = "hostname = \"laptop\"\nipv4 = \"10.126.126.100/24\"\n";
     harness.engine.store.write_config(toml).unwrap();
     save_cred(&harness, "cred-1");
@@ -388,7 +401,7 @@ fn an_unchanged_config_neither_rewrites_nor_restarts() {
 #[test]
 fn an_unchanged_config_still_starts_a_core_that_is_not_running() {
     let mut harness = harness("restart-after-crash");
-    let config = saved_client(&harness, &fake_core());
+    let config = saved_client(&harness);
     let toml = "hostname = \"laptop\"\nipv4 = \"10.126.126.100/24\"\n";
     harness.engine.store.write_config(toml).unwrap();
     save_cred(&harness, "cred-1");
@@ -402,7 +415,7 @@ fn an_unchanged_config_still_starts_a_core_that_is_not_running() {
 #[test]
 fn a_changed_config_stops_the_old_core_before_starting_the_new_one() {
     let mut harness = harness("replace");
-    let config = saved_client_named(&harness, &fake_core(), "new");
+    let config = saved_client_named(&harness, "new");
     harness
         .engine
         .store
@@ -425,7 +438,7 @@ fn a_changed_config_stops_the_old_core_before_starting_the_new_one() {
 #[test]
 fn starting_without_a_credential_keeps_the_control_plane_alive() {
     let mut harness = harness("no-credential");
-    saved_client(&harness, &fake_core());
+    saved_client(&harness);
     harness
         .engine
         .store
@@ -635,7 +648,7 @@ fn a_heartbeat_401_does_not_clear_the_identity_on_the_first_strike() {
         "dev-1",
         key,
     )));
-    saved_client(&harness, Path::new(""));
+    saved_client(&harness);
     harness
         .engine
         .on_heartbeat(Err(remote::Error::Unauthorized {
@@ -1159,7 +1172,6 @@ fn registering_saves_the_identity_and_the_config() {
             server_url: stub.url.clone(),
             token: "token-1".to_string(),
             hostname: "laptop".to_string(),
-            core_path: String::new(),
         })
         .unwrap();
     let client = harness.engine.store.load_client().unwrap().unwrap();
@@ -1189,7 +1201,6 @@ fn saving_without_a_token_needs_an_existing_identity() {
             server_url: "http://10.0.0.1:8088".to_string(),
             token: String::new(),
             hostname: String::new(),
-            core_path: String::new(),
         })
         .unwrap_err();
     assert!(err.contains("尚未注册"), "err = {err}");
