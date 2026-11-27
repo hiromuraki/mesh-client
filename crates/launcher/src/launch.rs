@@ -43,10 +43,10 @@ impl Client {
 
 /// start 启动客户端并返回进程句柄。
 ///
-/// `boot_check` 是这一次启动的确认 token：客户端起来之后写标记，启动器据此判断
-/// 「这一版能不能跑」。没有 token 的启动（已经确认过的那一份）不等确认。
-pub fn start(exe: &Path, root: &Path, boot_check: Option<&str>) -> Result<Client, String> {
-    imp::start(exe, root, boot_check)
+/// 启动确认不靠参数或标记：客户端就位之后自己提交 `bin/current`，启动器等的是
+/// 那个文件变成正在跑的这个槽（见 `install.rs` 的 `confirm`）。
+pub fn start(exe: &Path, root: &Path) -> Result<Client, String> {
+    imp::start(exe, root)
 }
 
 /// wait_exit 等某个进程退出，仅用于 --wait-for（手动安装时等旧客户端让位）。
@@ -98,16 +98,9 @@ mod imp {
         }
     }
 
-    pub fn start(
-        exe: &Path,
-        root: &Path,
-        boot_check: Option<&str>,
-    ) -> Result<super::Client, String> {
+    pub fn start(exe: &Path, root: &Path) -> Result<super::Client, String> {
         let mut cmd = Command::new(exe);
         cmd.arg("--root").arg(root);
-        if let Some(token) = boot_check {
-            cmd.arg("--boot-check").arg(token);
-        }
         cmd.current_dir(root);
         match cmd.spawn() {
             Ok(child) => Ok(super::Client {
@@ -116,7 +109,7 @@ mod imp {
                 },
             }),
             Err(e) if e.raw_os_error() == Some(ERROR_ELEVATION_REQUIRED) => {
-                let handle = runas(exe, root, boot_check)?;
+                let handle = runas(exe, root)?;
                 Ok(super::Client {
                     inner: Process {
                         slot: Slot::Elevated(handle),
@@ -131,14 +124,11 @@ mod imp {
     }
 
     /// runas 走 UAC，并保留进程句柄：没有它，确认超时之后就无从知道新版退没退。
-    fn runas(exe: &Path, root: &Path, boot_check: Option<&str>) -> Result<OwnedHandle, String> {
+    fn runas(exe: &Path, root: &Path) -> Result<OwnedHandle, String> {
         let verb = wide(OsStr::new("runas"));
         let file = wide(exe.as_os_str());
         let directory = wide(root.as_os_str());
-        let mut params = format!("--root {}", quote(&root.display().to_string()));
-        if let Some(token) = boot_check {
-            params.push_str(&format!(" --boot-check {}", quote(token)));
-        }
+        let params = format!("--root {}", quote(&root.display().to_string()));
         let parameters = wide(OsStr::new(&params));
 
         let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
@@ -255,16 +245,9 @@ mod imp {
         child: Child,
     }
 
-    pub fn start(
-        exe: &Path,
-        root: &Path,
-        boot_check: Option<&str>,
-    ) -> Result<super::Client, String> {
+    pub fn start(exe: &Path, root: &Path) -> Result<super::Client, String> {
         let mut cmd = Command::new(exe);
         cmd.arg("--root").arg(root);
-        if let Some(token) = boot_check {
-            cmd.arg("--boot-check").arg(token);
-        }
         cmd.current_dir(root);
         let child = cmd
             .spawn()

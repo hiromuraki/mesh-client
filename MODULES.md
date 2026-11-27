@@ -86,10 +86,15 @@ pub mod id { pub const STATE_ERROR_IO: &str = "state.error.io"; /* …… */ }
 
 ```rust
 pub mod layout {
-    pub const BIN: &str = "bin";            // 其余：BIN_OLD、BIN_STALE、UPDATE_FILE、INSTALL_STATE、
-                                            //       FAILURES、LOCK、INSTALL_LOCK、LAUNCHER_VERSION、MANIFEST
-    pub fn find_root(exe: &Path) -> PathBuf;              // 主程序在 <root>/bin 里，根是上一级
-    pub fn read_version(root: &Path) -> Result<String, Error>;  // 唯一来源 bin/version.json
+    pub const BIN: &str = "bin";            // 槽的父目录；其余：SLOT_ALICE、SLOT_BOB、CURRENT、
+                                            //       UPDATE_FILE、FAILURES、LOCK、INSTALL_LOCK、
+                                            //       LAUNCHER_VERSION、MANIFEST
+    pub fn slot_name(name: &str) -> Option<&'static str>;   // 只做 ASCII 小写比较，认 alice / bob
+    pub fn slot_dir(root: &Path, slot: &str) -> PathBuf;     // <root>/bin/<槽>
+    pub fn read_current(root: &Path) -> Option<&'static str>; // trim 后只认规范槽名
+    pub fn write_current(root: &Path, slot: &str) -> io::Result<()>; // 临时文件 + 改名，幂等
+    pub fn find_root(exe: &Path) -> PathBuf;              // 主程序在 <root>/bin/<槽> 里，根是往上三级
+    pub fn read_version(slot_dir: &Path) -> Result<String, Error>; // 读这个槽自己的 version.json
     pub fn write_launcher_version(root: &Path, v: &str) -> io::Result<()>;  // launcher.json
     pub fn read_launcher_version(root: &Path) -> Option<String>;            // 缺失或坏掉都是 None
 }
@@ -303,9 +308,9 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.8 `mesh-client`（bin）
 
-**职责**：进程形态。参数解析、根目录、单实例锁、线程装配、退出顺序、桌面/headless 分支、托盘、浏览器与资源管理器、消息框、`--boot-check` 标记、headless 的日志跟随与控制台附着。
+**职责**：进程形态。参数解析、根目录、单实例锁、线程装配、退出顺序、桌面/headless 分支、托盘、浏览器与资源管理器、消息框、启动成功时提交 `bin/current`、headless 的日志跟随与控制台附着。
 
-**模块**：`main`、`cli`（手写，风格同启动器 `args.rs`）、`instance`（锁与「唤起已有实例」）、`shutdown`（唯一的退出路径）、`desktop`（托盘 + 主线程消息泵）、`tray`（Win32）、`headless`、`browser`（COM）、`opendir`、`notify`、`follow_log`。
+**模块**：`main`、`cli`（手写，风格同启动器 `args.rs`）、`instance`（锁与「唤起已有实例」）、`shutdown`（唯一的退出路径）、`commit`（启动成功后提交 `bin/current`）、`desktop`（托盘 + 主线程消息泵）、`tray`（Win32）、`headless`、`browser`（COM）、`opendir`、`notify`、`follow_log`。
 
 **拥有的状态**：`Shutdown`（`Once`，幂等：停面板 → 停 core → 关日志 → `process::exit`）、托盘模型（`Arc<Mutex<TrayModel>>`，只有地址/自启勾选/更新行三项）、启动参数。
 

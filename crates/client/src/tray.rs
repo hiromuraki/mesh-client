@@ -78,7 +78,7 @@ pub(crate) struct TrayOptions {
     pub cell: Arc<StateCell>,
     pub tx: Sender<Cmd>,
     pub quit: Arc<dyn Fn() + Send + Sync>,
-    /// 托盘真的立起来之后调用：安装器等这个信号才敢删 bin.old。
+    /// 托盘真的立起来之后调用：启动器在等这一刻提交的 `bin/current`。
     pub ready: Box<dyn Fn() + Send + Sync>,
 }
 

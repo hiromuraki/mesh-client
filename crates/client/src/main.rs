@@ -6,8 +6,8 @@
 
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
-mod boot_check;
 mod cli;
+mod commit;
 mod follow_log;
 mod headless;
 mod instance;
@@ -59,9 +59,16 @@ fn main() -> ExitCode {
 }
 
 fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
-    let root = resolve_root(options.root.as_deref())?;
-    // 安装不完整就直接失败：读不到 bin/version.json 就不知道要报哪一版给服务端。
-    let version = layout::read_version(&root).map_err(|err| {
+    // 先取自身路径：安装根由它推出，版本也来自它所在的那个槽。
+    let exe = std::env::current_exe()
+        .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&err]))?;
+    let program_dir = exe
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&"<无父目录>"]))?;
+    let root = resolve_root(options.root.as_deref(), &exe)?;
+    // 安装不完整就直接失败：读不到自己槽里的 version.json 就不知道要报哪一版给服务端。
+    let version = layout::read_version(&program_dir).map_err(|err| {
         mesh_text::format(
             mesh_text::id::CLIENT_ERROR_INSTALL_DIR,
             &[&root.display(), &err],
@@ -86,15 +93,9 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
     let shutdown = Shutdown::new();
     let cell = Arc::new(StateCell::new(Published::default()));
     let (notice_tx, notice_rx) = channel::<Notice>();
-    // core 与主程序同层：不拼安装布局，拿不到自身路径就直接失败。
-    let program_dir = std::env::current_exe()
-        .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&err]))?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&"<无父目录>"]))?;
     let config = Config {
         root: root.clone(),
-        program_dir,
+        program_dir: program_dir.clone(),
         self_version: version.clone(),
         hostname: platform::hostname(),
         auto_update_disabled: options.disable_auto_update,
@@ -108,7 +109,15 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
     }
 
     let outcome = serve(
-        &options, desktop, &root, &version, &store, &cell, &tx, &shutdown,
+        &options,
+        desktop,
+        &root,
+        &program_dir,
+        &version,
+        &store,
+        &cell,
+        &tx,
+        &shutdown,
     );
     // 两种结局都要收尾。Unix 上 core 在自己的会话里，进程直接退会留下一个占着
     // 虚拟 IP 的孤儿——headless 收到 SIGTERM 后 serve 是正常返回的，只在失败路径
@@ -123,6 +132,7 @@ fn serve(
     options: &cli::Options,
     desktop: bool,
     root: &Path,
+    program_dir: &Path,
     version: &str,
     store: &Store,
     cell: &Arc<StateCell>,
@@ -141,10 +151,10 @@ fn serve(
     shutdown.register(move || panel_closer.close());
     let _ = mesh_panel::write_url(&root.join(layout::CONFIG).join("ui.json"), &panel.url);
 
-    // 安装器在等这个标记来判断新版本「能不能正常跑起来」：一看到它就删掉 bin.old。
-    // 所以时机不能只看「引擎与面板已就位」——进程形态本身（托盘）也得立起来，否则
-    // 更新已提交、客户端随即退出，下一次登录同样失败，而回滚材料已经没了。
-    let ready = boot_ready(root, options.boot_check.as_deref());
+    // 启动确认就是这一次提交：启动器在等 `bin/current` 变成正在跑的这个槽。
+    // 时机不能只看「引擎与面板已就位」——进程形态本身（托盘）也得立起来，否则
+    // 更新已提交、客户端随即退出，下一次登录同样失败，而新版本已经被当成能跑的了。
+    let ready = boot_ready(root, program_dir);
 
     if desktop {
         return desktop_main(&panel, root, version, cell, tx, shutdown, ready);
@@ -156,19 +166,17 @@ fn serve(
     headless::run(Arc::clone(cell), &log_path, ready)
 }
 
-/// boot_ready 返回「这一版算成功启动」的回调。它只生效一次，可以重复调用。
-fn boot_ready(root: &Path, token: Option<&str>) -> Box<dyn Fn() + Send + Sync> {
-    let Some(token) = token.filter(|token| !token.is_empty()) else {
-        return Box::new(|| {});
-    };
+/// boot_ready 返回「这一版算成功启动」的回调：把正在跑的这个槽提交为 `bin/current`。
+/// 它只生效一次，可以重复调用。
+fn boot_ready(root: &Path, program_dir: &Path) -> Box<dyn Fn() + Send + Sync> {
     let root = root.to_path_buf();
-    let token = token.to_string();
+    let program_dir = program_dir.to_path_buf();
     let done = AtomicBool::new(false);
     Box::new(move || {
         if done.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Err(message) = boot_check::write_marker(&root, &token) {
+        if let Err(message) = commit::commit_current(&root, &program_dir) {
             platform::say_err(&format!("{APP_TITLE}: {message}"));
         }
     })
@@ -255,8 +263,8 @@ fn configure(
     }
 }
 
-/// 确定安装根目录：启动器会显式给出；直接运行 bin/ 里的主程序时，根就是 bin 的上一级。
-fn resolve_root(given: Option<&Path>) -> Result<PathBuf, String> {
+/// 确定安装根目录：启动器会显式给出；直接运行 bin/<槽>/ 里的主程序时，根是槽目录往上第三级。
+fn resolve_root(given: Option<&Path>, exe: &Path) -> Result<PathBuf, String> {
     if let Some(path) = given {
         return if path.is_absolute() {
             Ok(path.to_path_buf())
@@ -266,7 +274,5 @@ fn resolve_root(given: Option<&Path>) -> Result<PathBuf, String> {
                 .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_CURRENT_DIR, &[&err]))
         };
     }
-    let exe = std::env::current_exe()
-        .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&err]))?;
-    Ok(layout::find_root(&exe))
+    Ok(layout::find_root(exe))
 }

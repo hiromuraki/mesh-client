@@ -59,7 +59,7 @@ stateDiagram-v2
 5. 失败不改 `current`、不删候选槽；计数按版本，不按槽。
 6. 清理只在选槽之前发生：`current` 与另一个槽都有效时删另一个槽；确认过程不删任何槽。
 
-依据（当前实现里对应的符号）：`client/crates/launcher/src/install.rs` 的 `Owner`（`own`、`recover`、`abort`、`commit`、`undo`、`install`、`boot_and_settle`、`client_running`）与 `Tx`；`client/crates/install/src/layout.rs` 的 `BIN`、`BIN_OLD`、`BIN_STALE`、`INSTALL_STATE`、`MANIFEST`、`UPDATE_FILE`、`LOCK`、`INSTALL_LOCK`；`client/crates/install/src/lock.rs` 的 `Lock::path`、`Lock::owner_path`；启动确认对应 `client/crates/client/src/boot_check.rs` 的 `write_marker` 与 `client/crates/client/src/main.rs` 的 `boot_ready`。
+依据：`client/crates/launcher/src/install.rs` 的 `Owner`（`own`、`prepare`、`valid_slot`、`migrate_flat_layout`、`clean_legacy`、`install`、`discard_candidate`、`apply_pending`、`boot_candidate`、`candidate_failed`、`confirm`、`start`、`client_running`）与 `candidate`、`other_slot`、`wait_current`；`client/crates/install/src/layout.rs` 的 `BIN`、`SLOT_ALICE`、`SLOT_BOB`、`CURRENT`、`slot_name`、`slot_dir`、`read_current`、`write_current`、`MANIFEST`、`UPDATE_FILE`、`LOCK`、`INSTALL_LOCK`；`client/crates/install/src/lock.rs` 的 `Lock::path`、`Lock::owner_path`；提交对应 `client/crates/client/src/commit.rs` 的 `commit_current` 与 `client/src/main.rs` 的 `boot_ready`。
 
 ## 2. 凭据身份四态
 

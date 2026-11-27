@@ -97,11 +97,11 @@ fn root_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| mesh_text::get(mesh_text::id::LAUNCHER_ERROR_INSTALL_DIR).to_string())
 }
 
-/// launch_installed 在 Windows 上拉起客户端就放手：客户端是独立进程，
-/// 启动器确认它起来之后退出。
+/// launch_installed 在 Windows 上清理、选槽、拉起客户端，确认它提交了
+/// `bin/current` 之后放手：客户端是独立进程，启动器退出。
 ///
-/// 整个启动都在 `install` 里收口：有在途安装时，这一轮启动就是那次安装的确认，
-/// 与安装入口同一个出口；没有时才是「拉起已确认的那一份」。
+/// 与安装入口同一个出口（`install::Owner::boot_current`）：先清理与选槽，再拉起，
+/// 再等确认。
 #[cfg(windows)]
 fn launch_installed(root: &Path) -> Result<i32, String> {
     install::launch_installed(root)?;

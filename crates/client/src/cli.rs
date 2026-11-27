@@ -16,7 +16,6 @@ pub(crate) struct Options {
     pub server: String,
     pub token: String,
     pub name: String,
-    pub boot_check: Option<String>,
     pub disable_auto_update: bool,
 }
 
@@ -37,7 +36,6 @@ pub(crate) fn usage() -> String {
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_SERVER)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_TOKEN)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_NAME)),
-        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_BOOT_CHECK)),
         format!(
             "  {}",
             mesh_text::get(id::CLIENT_TEXT_USAGE_DISABLE_AUTO_UPDATE)
@@ -88,9 +86,6 @@ pub(crate) fn parse(argv: &[String]) -> Result<Options, ParseError> {
             "server" => options.server = value(argv, &mut index, inline, name)?,
             "token" => options.token = value(argv, &mut index, inline, name)?,
             "name" => options.name = value(argv, &mut index, inline, name)?,
-            "boot-check" => {
-                options.boot_check = Some(value(argv, &mut index, inline, name)?);
-            }
             other => {
                 return Err(ParseError::Invalid(mesh_text::format(
                     id::CLIENT_ERROR_UNKNOWN_OPTION,
@@ -158,8 +153,6 @@ mod tests {
             "--token=t",
             "--name",
             "laptop",
-            "--boot-check",
-            "abc",
             "--disable-auto-update",
         ]))
         .unwrap();
@@ -168,7 +161,6 @@ mod tests {
         assert_eq!(options.server, "http://10.8.0.1:8088");
         assert_eq!(options.token, "t");
         assert_eq!(options.name, "laptop");
-        assert_eq!(options.boot_check.as_deref(), Some("abc"));
         assert!(options.disable_auto_update);
     }
 
@@ -231,7 +223,6 @@ mod tests {
             "--server",
             "--token",
             "--name",
-            "--boot-check",
             "--disable-auto-update",
             "--help",
         ] {

@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-/// `bin/version.json`：版本号、槽位、平台加每个文件的 sha256，整体由发布私钥签名。
+/// `bin/<槽>/version.json`：版本号、槽位、平台加每个文件的 sha256，整体由发布私钥签名。
 ///
 /// 四个字段都没有 `#[serde(default)]`：缺了 `files` 等于“零个文件要校验”，
 /// 缺了 `signature` 等于“不验签”。两者都会让坏包直接过闸，必须解析失败。
@@ -43,7 +43,7 @@ impl Manifest {
         &self.files
     }
     /// 解析清单文本。前缀由调用方按场景加：启动器读的是包里的临时成员，客户端
-    /// 读的是 `bin/version.json`，两者措辞不同。
+    /// 读的是槽目录里的 `version.json`，两者措辞不同。
     pub fn parse(text: &str) -> Result<Manifest, String> {
         let manifest: Manifest = serde_json::from_str(text).map_err(|err| err.to_string())?;
         manifest.validate()?;
@@ -106,11 +106,11 @@ impl Manifest {
     }
 }
 
-/// 读某个清单文件（通常是 `<root>/bin/version.json`）。
+/// 读某个清单文件（通常是 `<root>/bin/<槽>/version.json`）。
 ///
 /// 与 [`Manifest::parse`] 的分工：这里负责把“文件不存在”“不是 JSON”收成一个
 /// [`Error::ManifestRead`]，好让上层用 `?` 往上抛；只关心版本号本身的地方
-/// （比如启动器的 `installed_version`）用它自己的宽松处理。
+/// （比如只想知道版本号的地方）用它自己的宽松处理。
 pub fn read(path: &Path) -> Result<Manifest, Error> {
     let text = std::fs::read_to_string(path).map_err(|err| Error::ManifestRead {
         path: path.to_path_buf(),
