@@ -36,6 +36,9 @@ fn main() -> ExitCode {
         },
     };
     log::init(&root);
+    // 一进来就记下自己是哪一版：两条命令都写，手工 scp、`--file`、systemd 重启
+    // 都覆盖得到，客户端下一轮心跳就能拿它判「这份启动器是不是更新的」。
+    record_version(&root);
 
     let outcome: Result<i32, String> = match opts.command {
         args::Command::Launch => launch_installed(&root),
@@ -57,6 +60,21 @@ fn main() -> ExitCode {
             eprintln!("mesh: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// 编进二进制的启动器版本号（`build/launcher.ps1` 通过 `MESH_VERSION` 交给 cargo）。
+const BUILD_VERSION: &str = env!("MESH_LAUNCHER_BUILD_VERSION");
+
+/// record_version 把「盘上这份启动器是哪一版」写进安装根的 launcher.json。
+///
+/// 写不进去只记日志：它只影响下一次替换的判重，不该拦住启动。
+fn record_version(root: &Path) {
+    if let Err(e) = mesh_install::layout::write_launcher_version(root, BUILD_VERSION) {
+        log::line(&mesh_text::format(
+            mesh_text::id::LAUNCHER_TEXT_VERSION_RECORD_FAILED,
+            &[&mesh_install::layout::LAUNCHER_VERSION, &e],
+        ));
     }
 }
 

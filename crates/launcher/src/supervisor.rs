@@ -17,11 +17,12 @@ use std::time::{Duration, Instant};
 /// 它一退 systemd 就认为服务结束，会在安装途中再拉起一个来抢同一个虚拟 IP。
 pub fn run(root: &Path) -> Result<i32, String> {
     clean_stale_markers(root);
-    // 启动前先自愈：上次没走完的安装会留下 bin.old。
-    install::recover(root)?;
     let bin = root.join("bin");
 
     loop {
+        // 每一轮都先自愈：上次没走完的安装在这里退回去，提交之后没删干净的
+        // 备份也在这里清掉。放在循环里而不是循环前，装完一轮之后的残留同样管得到。
+        install::recover(root)?;
         // 有待装的包就装（update.tar.zst 存在就是信号）。
         apply_pending(root);
         // 拉开客户端之前确认 `bin/` 与清单一致：启动器是这台机器上以 root 身份、
@@ -54,14 +55,22 @@ pub fn run(root: &Path) -> Result<i32, String> {
             ));
             stop_child(&mut child);
             Failures::load(root).record(&version);
-            // 回到 bin.old：这一版起不来就当没装过。
-            install::restore(root);
-            continue;
+            // 只有「本次装上、还没确认启动」的新版本才有东西可退；普通启动失败
+            // 保留已安装的文件，按实际错误退出——那时删掉 bin/ 就是删掉唯一的安装。
+            if install::in_flight(root)? {
+                log::line(mesh_text::get(id::LAUNCHER_TEXT_BOOT_FAILED_ROLLBACK));
+                install::abort(root)?;
+                continue;
+            }
+            return Err(reason);
         }
 
         Failures::load(root).clear(&version);
-        // 验过了，旧的那一份和更新包都可以扔了。
-        install::commit(root);
+        // 验过了，旧的那一份和更新包都可以扔了。提交本身失败只影响残留，
+        // 不再影响「这一版算不算装上了」。
+        if let Err(e) = install::commit(root) {
+            log::line(&mesh_text::format(id::LAUNCHER_ERROR_COMMIT_FAILED, &[&e]));
+        }
         log::line(&mesh_text::format(
             id::LAUNCHER_TEXT_BOOT_CONFIRMED,
             &[&version],
@@ -108,12 +117,12 @@ fn apply_pending(root: &Path) {
                 id::LAUNCHER_TEXT_DISCARD_NOT_NEWER,
                 &[&v],
             ));
-            let _ = fs::remove_file(&pkg);
+            remove_package(&pkg);
             return;
         }
         Err(e) => {
             log::line(&mesh_text::format(id::LAUNCHER_TEXT_UPDATE_UNUSABLE, &[&e]));
-            let _ = fs::remove_file(&pkg);
+            remove_package(&pkg);
             return;
         }
     }
@@ -126,7 +135,20 @@ fn apply_pending(root: &Path) {
         ));
     }
     // 不管装没装上，这个包都不再有用：失败时 bin 已经回到旧的那一套。
-    let _ = fs::remove_file(&pkg);
+    remove_package(&pkg);
+}
+
+/// remove_package 删掉不再有用的安装包。删不掉只记日志：文件还在时下一轮会把它
+/// 当成一个“不比当前新”的包再丢一次，不会重新装一遍。
+fn remove_package(pkg: &Path) {
+    if let Err(e) = fs::remove_file(pkg) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            log::line(&mesh_text::format(
+                id::LAUNCHER_TEXT_CLEANUP_FAILED,
+                &[&pkg.display(), &e],
+            ));
+        }
+    }
 }
 
 /// wait_boot 等客户端写启动标记。子进程先退出就不必等满 60 秒了——

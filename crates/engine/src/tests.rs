@@ -105,8 +105,7 @@ fn harness(tag: &str) -> Harness {
         update: Default::default(),
         auto_update: false,
         auto_tried: None,
-        launcher_sum: String::new(),
-        launcher_tried: None,
+        launcher: Default::default(),
         autostart_on: false,
         identity: Default::default(),
         hints: Default::default(),
@@ -1006,7 +1005,7 @@ fn a_launcher_with_an_invalid_signature_is_not_replaced() {
     };
     harness.engine.apply_launcher(&api, Some(&info));
     // 没进替换流程：tried 只在验签通过之后才占位。
-    assert!(harness.engine.launcher_tried.is_none());
+    assert!(harness.engine.launcher.tried.is_none());
 }
 
 #[test]
@@ -1022,9 +1021,57 @@ fn a_signed_launcher_is_offered_for_replacement() {
         signature: sign_release(remote::signing::SLOT_LAUNCHER, "2026.11.26-2", &sum),
     };
     harness.engine.apply_launcher(&api, Some(&info));
-    assert_eq!(harness.engine.launcher_tried.as_deref(), Some(sum.as_str()));
+    assert_eq!(harness.engine.launcher.tried.as_deref(), Some(sum.as_str()));
 }
 
+/// 盘上那份启动器自报的版本比下发的更新才换：摘要证明来源，不证明新鲜度。
+#[test]
+fn a_launcher_older_than_the_recorded_one_is_refused() {
+    let mut harness = harness("launcher-older");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    let sum = digest(0xcf);
+    let info = remote::LauncherInfo {
+        version: "2026.11.26-2".to_string(),
+        url: "http://127.0.0.1:1/mesh.exe".to_string(),
+        sha256: sum.clone(),
+        signature: sign_release(remote::signing::SLOT_LAUNCHER, "2026.11.26-2", &sum),
+    };
+    // 盘上这份自报 2026.11.26-5：下发的 2026.11.26-2 更旧。
+    harness.engine.launcher.version = Some("2026.11.26-5".to_string());
+
+    harness.engine.apply_launcher(&api, Some(&info));
+
+    assert!(
+        !harness.engine.config.root.join("update").exists(),
+        "更旧的启动器不该走到建暂存目录那一步"
+    );
+    assert_eq!(
+        harness.engine.launcher.tried.as_deref(),
+        Some(sum.as_str()),
+        "记下结论，下一轮心跳不再重判同一份"
+    );
+}
+
+/// 比记录新的照常进替换流程。
+#[test]
+fn a_launcher_newer_than_the_recorded_one_passes() {
+    let mut harness = harness("launcher-newer");
+    let key = harness.engine.store.signing_key().unwrap();
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    let sum = digest(0xd0);
+    let info = remote::LauncherInfo {
+        version: "2026.11.26-7".to_string(),
+        url: "http://127.0.0.1:1/mesh.exe".to_string(),
+        sha256: sum.clone(),
+        signature: sign_release(remote::signing::SLOT_LAUNCHER, "2026.11.26-7", &sum),
+    };
+    harness.engine.launcher.version = Some("2026.11.26-5".to_string());
+
+    harness.engine.apply_launcher(&api, Some(&info));
+
+    assert_eq!(harness.engine.launcher.tried.as_deref(), Some(sum.as_str()));
+}
 #[test]
 fn a_failed_download_is_retried_on_a_slim_offer() {
     let mut harness = harness("slim-retry");

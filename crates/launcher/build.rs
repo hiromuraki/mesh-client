@@ -5,6 +5,14 @@
 // `return` 收尾——clippy 会判它 needless_return，而 CI 是 -D warnings。
 fn main() {
     println!("cargo:rerun-if-changed=assets/icon.ico");
+    // 启动器要自己报「我是哪一版」：release 是 windows_subsystem = "windows"，没有
+    // 控制台，`mesh --version` 的输出没有地方去，所以把版本号编进二进制。
+    println!("cargo:rerun-if-env-changed=MESH_VERSION");
+    let version = std::env::var("MESH_VERSION")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| std::env::var("CARGO_PKG_VERSION").unwrap_or_default());
+    println!("cargo:rustc-env=MESH_LAUNCHER_BUILD_VERSION={version}");
     #[cfg(windows)]
     {
         // 只有 release 产物需要资源：把 manifest 嵌进测试二进制会让它在 SxS 里

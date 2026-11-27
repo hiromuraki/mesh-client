@@ -73,12 +73,27 @@ pub(crate) struct UpdateState {
     pub attempts: u32,
     /// 下一次自动重试的时刻；退避由它算，不额外排定时器：心跳就是节拍。
     pub retry_at: Option<Instant>,
-    /// 启动器替换任务正在跑。
+}
+
+/// 启动器槽位的本地状态。
+///
+/// 与 [`UpdateState`] 分开：那份状态会随客户端包 offer 整体重建为默认值，而启动器
+/// 的已知摘要、尝试记录、自报版本与在途任务要活到进程结束——否则一次普通的客户端
+/// offer 变化就会把正在跑的替换任务放开给第二个任务，两份下载互相截断。
+#[derive(Default)]
+pub(crate) struct LauncherState {
+    /// 安装根下这份启动器的完整摘要。
+    pub sum: String,
+    /// 本进程对哪一份 offer 已经有结论（换掉了，或拒绝换成）：同一份不再重试。
+    pub tried: Option<String>,
+    /// 启动器自报的版本号（`launcher.json`）；读不到就是 None，那时不判降级。
+    pub version: Option<String>,
+    /// 替换任务正在跑。
     ///
     /// 换启动器是进程级动作，暂存文件只有一个：两个任务同时进来，后一个的
     /// 「先删再下」会把前一个正在写的文件截断，两边都算出对不上的摘要。
     /// 同一时刻只放一个进去，后来的等下一轮心跳再说。
-    pub launcher_busy: Arc<AtomicBool>,
+    pub busy: Arc<AtomicBool>,
 }
 
 /// 启动器替换的占坑守卫：线程从任何一条路径退出都把坑放掉，包括提前 return。
@@ -141,7 +156,7 @@ impl Engine {
             return;
         }
         // 版本号会被拼进安装目录里的路径，先按 layout 的规则挡掉非法值。
-        if !layout::valid_version(&info.version) {
+        if !version::valid(&info.version) {
             let shown = format!("{:?}", info.version);
             self.logf(
                 "app",
@@ -289,7 +304,7 @@ impl Engine {
             return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_UPDATE_IN_PROGRESS).to_string());
         }
         // 客户端自己查得出来的失败不要拖到进程退出之后。
-        if !layout::valid_version(&self.update.version) {
+        if !version::valid(&self.update.version) {
             let shown = format!("{:?}", self.update.version);
             let msg = mesh_text::format(mesh_text::id::ENGINE_TEXT_VERSION_INVALID, &[&shown]);
             self.fail_update(&msg);
@@ -535,10 +550,27 @@ impl Engine {
             return;
         }
         // 判重与占位在同一处完成：同一台机器只尝试一次，换不掉就等下个版本。
-        if self.launcher_sum.eq_ignore_ascii_case(&info.sha256)
-            || self.launcher_tried.as_deref() == Some(info.sha256.as_str())
+        if self.launcher.sum.eq_ignore_ascii_case(&info.sha256)
+            || self.launcher.tried.as_deref() == Some(info.sha256.as_str())
         {
             return;
+        }
+        // 摘要只证明「是不是同一份」，不证明「是不是更新的」：一份当年真签过的旧
+        // 三元组能让设备退回还没有清单校验的旧启动器。盘上这份自己报的版本号是
+        // 唯一的本地依据，它比下发的更新才换；没有记录时不判，放行这一次。
+        if let Some(current) = self.launcher.version.as_deref() {
+            if !version::is_newer(&info.version, current) {
+                self.logf(
+                    "app",
+                    &mesh_text::format(
+                        mesh_text::id::ENGINE_LOG_LAUNCHER_NOT_NEWER,
+                        &[&info.version, &current],
+                    ),
+                );
+                // 记下结论：下一轮心跳不再重判同一份，也不再刷同一行日志。
+                self.launcher.tried = Some(info.sha256.clone());
+                return;
+            }
         }
         let dir = self.config.root.join(UPDATE_DIR);
         if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -549,11 +581,11 @@ impl Engine {
             return;
         }
         // 占坑放在最后：上面几条都是「不干」，不该把坑占住。
-        if self.update.launcher_busy.swap(true, Ordering::SeqCst) {
+        if self.launcher.busy.swap(true, Ordering::SeqCst) {
             return;
         }
-        let busy_guard = LauncherBusy(Arc::clone(&self.update.launcher_busy));
-        self.launcher_tried = Some(info.sha256.clone());
+        let busy_guard = LauncherBusy(Arc::clone(&self.launcher.busy));
+        self.launcher.tried = Some(info.sha256.clone());
         let api = Arc::clone(api);
         let root = self.config.root.clone();
         let log = Arc::clone(&self.log);

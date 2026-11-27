@@ -21,9 +21,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 本 crate 的错误。变体只有四种，因为上层要据此分支的也只有这四种：
-/// 清单读不出来（安装根不完整/包坏了）、版本号非法（拒绝当文件名用）、
-/// 普通 IO 错误、以及“锁被占着”——最后一条必须独立，上层要走“唤起已有实例”而不是报错。
+/// 本 crate 的错误。变体只有三种，因为上层要据此分支的也只有这三种：
+/// 清单读不出来（安装根不完整/包坏了，版本号非法也归在这里）、普通 IO 错误、
+/// 以及“锁被占着”——最后一条必须独立，上层要走“唤起已有实例”而不是报错。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
@@ -34,14 +34,7 @@ pub enum Error {
         )
     )]
     ManifestRead { path: PathBuf, reason: String },
-    #[error(
-        "{}",
-        mesh_text::format(
-            mesh_text::id::INSTALL_ERROR_VERSION_INVALID,
-            &[&path.display(), &format!("{version:?}")]
-        )
-    )]
-    VersionInvalid { path: PathBuf, version: String },
+
     #[error("{0}")]
     Io(#[from] io::Error),
     #[error("{}", mesh_text::get(mesh_text::id::INSTALL_ERROR_ALREADY_RUNNING))]

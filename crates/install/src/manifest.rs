@@ -10,16 +10,38 @@ use std::path::Path;
 ///
 /// `files` 里不含 `version.json` 自己（自己的哈希写不进去），所以清单本身靠
 /// `signature` 保护：改 `version`、`slot`、`platform`、`files` 任何一处，验签都不过。
+///
+/// 字段是私有的：能读它的地方只需要这几个访问器，而构造只能经过 [`Manifest::parse`]——
+/// 一个「解析成功但没验过 `validate`」的清单不该能被造出来。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
-    pub version: String,
-    pub slot: String,
-    pub platform: String,
-    pub files: BTreeMap<String, String>,
-    pub signature: String,
+    version: String,
+    slot: String,
+    platform: String,
+    files: BTreeMap<String, String>,
+    signature: String,
 }
 
 impl Manifest {
+    /// 发布版本号（`YYYY.MM.DD-N`）。
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// 发布槽位：`client` 或 `launcher`。
+    pub fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    /// `GOOS/GOARCH` 形式的平台标识。
+    pub fn platform(&self) -> &str {
+        &self.platform
+    }
+
+    /// 文件名 → sha256。不含 `version.json` 自己。
+    pub fn files(&self) -> &BTreeMap<String, String> {
+        &self.files
+    }
     /// 解析清单文本。前缀由调用方按场景加：启动器读的是包里的临时成员，客户端
     /// 读的是 `bin/version.json`，两者措辞不同。
     pub fn parse(text: &str) -> Result<Manifest, String> {
@@ -36,14 +58,14 @@ impl Manifest {
     ///
     /// 摘要的长度与大小写也必须定死：`FilesDigest` 按「名字 :: 摘要」拼行，
     /// 长度或大小写不固定就等于同一组文件有几种合法写法，签名覆盖的范围随之模糊。
-    pub fn validate(&self) -> Result<(), String> {
+    fn validate(&self) -> Result<(), String> {
         if !matches!(
             self.slot.as_str(),
             signing::SLOT_CLIENT | signing::SLOT_LAUNCHER
         ) {
             return Err(format!("槽位 {:?} 不在允许范围", self.slot));
         }
-        if !layout::valid_version(&self.version) {
+        if !crate::version::valid(&self.version) {
             return Err(format!("版本号 {:?} 不合法", self.version));
         }
         if !platform_ok(&self.platform) {
@@ -163,11 +185,11 @@ mod tests {
     #[test]
     fn parses_a_complete_manifest() {
         let manifest = Manifest::parse(&complete()).unwrap();
-        assert_eq!(manifest.version, "2026.11.26-13");
-        assert_eq!(manifest.slot, "client");
-        assert_eq!(manifest.platform, "windows/amd64");
-        assert_eq!(manifest.files.len(), 1);
-        assert_eq!(manifest.files["mesh-client.exe"], DIGEST);
+        assert_eq!(manifest.version(), "2026.11.26-13");
+        assert_eq!(manifest.slot(), "client");
+        assert_eq!(manifest.platform(), "windows/amd64");
+        assert_eq!(manifest.files().len(), 1);
+        assert_eq!(manifest.files()["mesh-client.exe"], DIGEST);
     }
 
     /// 契约之外的东西一律在解析时拒绝：签错的东西不该走到解包才发现。
@@ -264,14 +286,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 清单的 `verify` 必须真的看签名：同一份内容换掉一个字段就不该通过。
+    /// 清单的 `verify` 必须真的看签名：被签的四个字段各改一处，每一处都不该通过。
     #[test]
     fn verify_covers_every_field() {
         use ed25519_dalek::Signer;
         let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
         let public = hex::encode(key.verifying_key().to_bytes());
-        let mut files = BTreeMap::new();
-        files.insert("mesh-client.exe".to_string(), "ab".to_string());
+        let files = BTreeMap::from([("mesh-client.exe".to_string(), DIGEST.to_string())]);
         let message = crate::signing::manifest_string(
             "client",
             "windows/amd64",
@@ -279,16 +300,29 @@ mod tests {
             &crate::signing::files_digest(&files),
         );
         let signature = hex::encode(key.sign(message.as_bytes()).to_bytes());
-        let mut manifest = Manifest {
-            version: "2026.11.26-13".into(),
-            slot: "client".into(),
-            platform: "windows/amd64".into(),
-            files,
-            signature,
-        };
-        assert!(manifest.verify_with(&public));
-        assert!(!manifest.verify_with(crate::signing::RELEASE_PUBLIC_KEY));
-        manifest.version = "2026.11.26-14".into();
-        assert!(!manifest.verify_with(&public));
+        let manifest = format!(
+            r#"{{"version":"2026.11.26-13","slot":"client","platform":"windows/amd64","files":{{"mesh-client.exe":"{DIGEST}"}},"signature":"{signature}"}}"#
+        );
+        assert!(Manifest::parse(&manifest).unwrap().verify_with(&public));
+        assert!(!Manifest::parse(&manifest)
+            .unwrap()
+            .verify_with(crate::signing::RELEASE_PUBLIC_KEY));
+
+        let other_digest = "1f".repeat(32);
+        for (case, tampered) in [
+            (
+                "version",
+                manifest.replacen("2026.11.26-13", "2026.11.26-14", 1),
+            ),
+            ("slot", manifest.replacen("\"client\"", "\"launcher\"", 1)),
+            (
+                "platform",
+                manifest.replacen("windows/amd64", "linux/amd64", 1),
+            ),
+            ("files", manifest.replacen(DIGEST, &other_digest, 1)),
+        ] {
+            let parsed = Manifest::parse(&tampered).unwrap();
+            assert!(!parsed.verify_with(&public), "{case} 被改过，签名不该通过");
+        }
     }
 }

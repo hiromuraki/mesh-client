@@ -2,7 +2,11 @@
 //!
 //! 这些字段不参与 core 的启动（配置文件整份交给 core 解释），只用来确认
 //! “刚启动的 core 确实是这份配置对应的节点”，以及决定身份走哪条路
-//! （有 `network_secret` = 正式节点 = `--secure-mode`）。
+//! （`[network_identity]` 里有 `network_secret` = 正式节点 = `--secure-mode`）。
+//!
+//! 身份只看 `[network_identity]`：顶层同名键是早期配置的写法，已经不再支持。
+//! 两处都认的时候，一份「子表为空、顶层有值」的合法 TOML 会让两端判出不同的
+//! 身份，而身份决定客户端要不要等一张服务端根本不会签给它的凭据。
 //!
 //! 对应 Go 的 `engine/toml.go`。
 
@@ -20,6 +24,9 @@ pub struct ConfigHints {
     /// `[flags] encryption_algorithm` 的原文（服务端模板写的是 `chacha20`）。
     /// 老配置没有这一段时为空，界面据此决定要不要显示这一项。
     pub encryption: String,
+    /// 配置读不出来的原因。解析不了就不能拿“没有 `network_secret`”的普通节点
+    /// 语义承接：那会把一台正式节点当成凭据节点。
+    pub parse_error: Option<String>,
 }
 
 impl ConfigHints {
@@ -33,16 +40,18 @@ impl ConfigHints {
     }
 }
 
-/// 尽力读出提示字段；读不出来就给零值，不影响 core 启动。
-///
-/// 这是有意与 Go 版一致的容错：`config.toml` 的唯一权威解释者是 core，
-/// 客户端把整份文件交给它；这里解析失败只说明“提示字段未知”，不该挡住启动。
-/// 反过来，身份选择（`formal()`）在这一刻会退化成“凭据节点”，而 core 自己
-/// 仍按文件里的 `network_secret` 走安全模式——所以解析失败时的行为是保守的：
-/// 不主动把正式节点降级，也不给它塞凭据（塞凭据才是降级）。
+/// 读出提示字段。解析不了时把原因记在 [`ConfigHints::parse_error`] 里，其余字段
+/// 取零值：`config.toml` 的权威解释者是 core，这里读不出来只说明“提示字段未知”，
+/// 由调用方决定要不要继续（启动 core 时不该继续，列表展示时可以照旧）。
 pub fn parse_hints(text: &str) -> ConfigHints {
-    let Ok(doc) = toml::from_str::<Value>(text) else {
-        return ConfigHints::default();
+    let doc = match toml::from_str::<Value>(text) {
+        Ok(doc) => doc,
+        Err(err) => {
+            return ConfigHints {
+                parse_error: Some(err.to_string()),
+                ..ConfigHints::default()
+            }
+        }
     };
     let network_identity = doc.get("network_identity");
     ConfigHints {
@@ -50,13 +59,9 @@ pub fn parse_hints(text: &str) -> ConfigHints {
         ipv4: ipv4_at(&doc).unwrap_or_default(),
         network_name: network_identity
             .and_then(|section| string_at(section, "network_name"))
-            // 顶层那份只为兼容早期配置：模板与所有真实下发配置都写在
-            // `[network_identity]` 段里。
-            .or_else(|| string_at(&doc, "network_name"))
             .unwrap_or_default(),
         network_secret: network_identity
             .and_then(|section| string_at(section, "network_secret"))
-            .or_else(|| string_at(&doc, "network_secret"))
             .map(|secret| secret.trim().to_string())
             .unwrap_or_default(),
         encryption: doc
@@ -64,6 +69,7 @@ pub fn parse_hints(text: &str) -> ConfigHints {
             .and_then(|flags| string_at(flags, "encryption_algorithm"))
             .map(|name| name.trim().to_string())
             .unwrap_or_default(),
+        parse_error: None,
     }
 }
 
@@ -125,16 +131,33 @@ network_name = "test-net"
         assert_eq!(hints.encryption, "");
     }
 
+    /// 顶层同名键不再算身份：与 Go 侧 `identityOf` 同一个判据。
     #[test]
-    fn top_level_identity_is_the_fallback() {
+    fn top_level_identity_is_not_supported() {
         let text = r#"
 network_name = "legacy"
 network_secret = "legacy-secret"
 "#;
         let hints = parse_hints(text);
-        assert_eq!(hints.network_name, "legacy");
-        assert_eq!(hints.network_secret, "legacy-secret");
-        assert!(hints.formal());
+        assert_eq!(hints.network_name, "");
+        assert_eq!(hints.network_secret, "");
+        assert!(!hints.formal());
+        assert!(hints.parse_error.is_none());
+    }
+
+    /// 子表为空、顶层有值：合法 TOML，身份仍是凭据节点。
+    #[test]
+    fn an_empty_section_wins_over_a_top_level_secret() {
+        let text = r#"
+network_secret = "top"
+
+[network_identity]
+network_name = "test-net"
+network_secret = ""
+"#;
+        let hints = parse_hints(text);
+        assert!(!hints.formal());
+        assert_eq!(hints.network_name, "test-net");
     }
 
     #[test]
@@ -143,9 +166,12 @@ network_secret = "legacy-secret"
         assert_eq!(hints.ipv4, "10.126.126.100/24");
     }
 
+    /// 读不出来要说出来：零值字段与「没有 network_secret 的凭据节点」长得一样。
     #[test]
-    fn unparsable_config_yields_zero_values() {
-        assert_eq!(parse_hints("hostname = "), ConfigHints::default());
-        assert!(!parse_hints("").formal());
+    fn unparsable_config_reports_the_reason() {
+        let hints = parse_hints("hostname = ");
+        assert!(hints.parse_error.is_some(), "解析失败必须留下原因");
+        assert!(!hints.formal());
+        assert!(parse_hints("").parse_error.is_none());
     }
 }

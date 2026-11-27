@@ -159,8 +159,8 @@ pub(crate) struct Engine {
     pub(crate) update: update::UpdateState,
     pub(crate) auto_update: bool,
     pub(crate) auto_tried: Option<String>,
-    pub(crate) launcher_sum: String,
-    pub(crate) launcher_tried: Option<String>,
+    /// 启动器槽位的本地状态。与 `update` 分开：那份会随客户端包 offer 重建。
+    pub(crate) launcher: update::LauncherState,
     /// 开机自启任务是否存在。查询要起一个 `schtasks` 进程，所以缓存起来，由
     /// [`Engine::refresh_autostart`] 在启动、改动与每轮心跳后刷新。
     pub(crate) autostart_on: bool,
@@ -250,9 +250,13 @@ pub fn spawn(
         }
     });
 
-    let launcher_sum =
-        sync::file_digest(&config.root.join(mesh_install::platform::launcher_name()))
-            .unwrap_or_default();
+    // 启动器的两件事实只读一次：安装根下那份的摘要，与它自报的版本号。
+    let launcher = update::LauncherState {
+        sum: sync::file_digest(&config.root.join(mesh_install::platform::launcher_name()))
+            .unwrap_or_default(),
+        version: mesh_install::layout::read_launcher_version(&config.root),
+        ..update::LauncherState::default()
+    };
     let engine = Engine {
         store,
         cell,
@@ -277,8 +281,7 @@ pub fn spawn(
         update: update::UpdateState::default(),
         auto_update: false,
         auto_tried: None,
-        launcher_sum,
-        launcher_tried: None,
+        launcher,
         autostart_on: false,
         identity: IdentityMeta::default(),
         hints: ConfigHints::default(),
@@ -937,6 +940,14 @@ impl Engine {
         // 提示字段现读现算（Go 的 hints() 也是每次读文件）：配置刚被写盘时，
         // 就绪判据与身份选择都必须基于新内容。
         self.refresh_identity();
+        // 配置读不出来就不猜身份：把正式节点当成凭据节点，它会拿一张服务端不会签
+        // 给它的凭据去连要求 network_secret 的网，两边都连不上。按实际错误停下。
+        if let Some(err) = self.hints.parse_error.as_deref() {
+            return Err(mesh_text::format(
+                mesh_text::id::ENGINE_TEXT_CONFIG_UNREADABLE,
+                &[&err],
+            ));
+        }
         let core_path = mesh_core::locate(&self.config.program_dir)?;
         let rpc_addr = sync::rpc_listen_addr()?;
         let hostname = self.effective_hostname(&config);

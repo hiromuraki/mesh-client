@@ -9,6 +9,7 @@ use mesh_install::signing;
 use mesh_install::version;
 use mesh_text::id;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -16,14 +17,13 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// BIN_OLD 与 UPDATE_FILE 的形状归 mesh-install::layout 管：客户端也要用同一套
-// 判据（下包前看失败计数、退出前留 update.tar.zst），各写一份迟早分叉。
-// 这里再导出一次，supervisor 与 install 内部原有的 install::UPDATE_FILE 写法不必动。
+// BIN_OLD、UPDATE_FILE 与 INSTALL_STATE 的形状归 mesh-install::layout 管：客户端也要用
+// 同一套判据（下包前看失败计数、退出前留 update.tar.zst），各写一份迟早分叉。
 //
 // BIN_OLD 是上一个版本解包后的样子，只在一次安装的窗口里存在：装之前把 bin
-// 改名到这里，启动确认成功后删掉，失败就改回来。所以「bin.old 存在」就等于
-// 「上次安装没走完」——断电、解包到一半被杀、启动确认超时都落进同一个判据。
-pub(crate) use mesh_install::layout::{BIN_OLD, UPDATE_FILE};
+// 改名到这里，启动确认成功后删掉，失败就改回来。**它存在不等于「上次安装没走完」**：
+// 「这次安装走到哪一步了」由 INSTALL_STATE 表达，理由见 `Tx` 的注释。
+pub(crate) use mesh_install::layout::{BIN_OLD, INSTALL_STATE, UPDATE_FILE};
 /// WAIT_CLIENT 是“等旧客户端退出”的上限，与客户端调用时的预期一致。
 const WAIT_CLIENT: Duration = Duration::from_secs(60);
 /// WAIT_BOOT 是“等新版确认启动”的上限。客户端在引擎与面板起来后立刻写标记，
@@ -110,115 +110,292 @@ pub fn run(
     Ok(())
 }
 
-/// recover 在启动任何东西之前调用：bin.old 还在就说明上次安装没走完，
-/// 无条件回到那一套。宁可退一版，也不要拿一份可能残缺的 bin 去启动。
+/// 一次安装的事务状态，记在 `<root>/install.state` 里。
+///
+/// 没有这个文件就等于「没有在途的安装」：`bin/` 是已经确认能启动的那一份。
+///
+/// ```text
+/// 无 ──开始装──▶ fresh | replaced ──解包校验通过──▶ installed ──启动确认──▶ committed ──清理完──▶ 无
+/// ```
+///
+/// 为什么不用「`bin.old` 存在」当判据：那个判据要同时回答两件事——「上次安装没走完」
+/// 与「旧版本还没删掉」。startup 确认成功之后删备份失败，会让下一次启动把刚跑起来
+/// 的新版本当成没装完退回去。状态写进文件，提交与清理就是两件可以各自失败的事。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tx {
+    /// 安装前没有 `bin/`：现在的 `bin/` 是本次解出来的，退回时整个删掉。
+    Fresh,
+    /// 安装前有 `bin/`，它已经改名到 `bin.old`。
+    Replaced,
+    /// 解包与校验都过了，`bin/` 是完整的新版本，等启动确认。
+    Installed,
+    /// 新版本确认启动过了：`bin/` 不再回滚，只剩清理。
+    Committed,
+}
+
+impl Tx {
+    fn text(self) -> &'static str {
+        match self {
+            Tx::Fresh => "fresh",
+            Tx::Replaced => "replaced",
+            Tx::Installed => "installed",
+            Tx::Committed => "committed",
+        }
+    }
+
+    fn parse(text: &str) -> Option<Tx> {
+        [Tx::Fresh, Tx::Replaced, Tx::Installed, Tx::Committed]
+            .into_iter()
+            .find(|tx| tx.text() == text)
+    }
+}
+
+fn tx_path(root: &Path) -> PathBuf {
+    root.join(INSTALL_STATE)
+}
+
+/// 读事务状态。文件不存在是「没有在途安装」；内容不认识是错误——安装根被人动过，
+/// 猜一个状态只会拿错的前提去删文件。
+fn read_tx(root: &Path) -> Result<Option<Tx>, String> {
+    let path = tx_path(root);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_INSTALL_STATE_IO,
+                &[&path.display(), &e],
+            ))
+        }
+    };
+    let text = text.trim();
+    Tx::parse(text).map(Some).ok_or_else(|| {
+        mesh_text::format(
+            id::LAUNCHER_ERROR_INSTALL_STATE_INVALID,
+            &[&path.display(), &text],
+        )
+    })
+}
+
+fn write_tx(root: &Path, tx: Tx) -> Result<(), String> {
+    let path = tx_path(root);
+    mesh_install::atomic_replace(&path, tx.text().as_bytes(), 0o644)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_INSTALL_STATE_IO, &[&path.display(), &e]))
+}
+
+fn clear_tx(root: &Path) -> Result<(), String> {
+    let path = tx_path(root);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(mesh_text::format(
+            id::LAUNCHER_ERROR_INSTALL_STATE_IO,
+            &[&path.display(), &e],
+        )),
+    }
+}
+
+/// in_flight 说明 `bin/` 是不是一次装着、还没确认启动的新版本。
+#[cfg(unix)]
+pub(crate) fn in_flight(root: &Path) -> Result<bool, String> {
+    Ok(matches!(read_tx(root)?, Some(Tx::Installed)))
+}
+
+/// recover 在启动任何东西之前调用：把没走完的安装退回安装前的样子。
+///
+/// 每一步失败都保留状态文件，下一次启动接着做。
 pub(crate) fn recover(root: &Path) -> Result<(), String> {
+    match read_tx(root)? {
+        // 没有在途安装：bin/ 就是已确认的那一份，只剩可能没删干净的备份。
+        None => {
+            clear_backup(root);
+            Ok(())
+        }
+        Some(Tx::Committed) => {
+            clear_backup(root);
+            clear_tx(root)
+        }
+        // 装好了、等启动确认：这一轮的启动就是那次确认，bin/ 必须留着。
+        Some(Tx::Installed) => Ok(()),
+        Some(tx) => {
+            log::line(mesh_text::get(id::LAUNCHER_TEXT_RECOVER_STALE));
+            undo(root, tx)?;
+            clear_tx(root)
+        }
+    }
+}
+
+/// abort 放弃一次还没确认启动的安装：按事务状态退回安装前的样子。
+///
+/// 与 recover 的差别只有一处：`installed` 也退——调用方已经知道这次启动失败了，
+/// 或者正要拿一份新包替换它。
+pub(crate) fn abort(root: &Path) -> Result<(), String> {
+    match read_tx(root)? {
+        None | Some(Tx::Committed) => Ok(()),
+        Some(tx) => {
+            undo(root, tx)?;
+            clear_tx(root)
+        }
+    }
+}
+
+/// undo 把 `bin/` 退回安装前的样子，只做这次事务拥有的那部分改动。
+///
+/// 幂等：已经退过的那一步（`bin/` 删掉了、改名做完了）再来一次是空操作，
+/// 所以「退到一半失败、下次启动接着退」不会把旧版本删掉。
+fn undo(root: &Path, tx: Tx) -> Result<(), String> {
     let bin = root.join("bin");
     let old = root.join(BIN_OLD);
-    if !old.exists() {
-        return Ok(());
+    match tx {
+        // 已经确认启动：bin/ 不回滚。
+        Tx::Committed => Ok(()),
+        // 还没走到改名那一步：bin/ 还是原来那一份，什么都不用退。
+        Tx::Replaced if !old.exists() => Ok(()),
+        // 有备份就换回来；首次安装没有备份，删掉本次的产物就是「没装过」。
+        _ if old.exists() => {
+            remove_dir(&bin)?;
+            fs::rename(&old, &bin)
+                .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_ROLLBACK, &[&e]))
+        }
+        _ => remove_dir(&bin),
     }
-    log::line(mesh_text::get(id::LAUNCHER_TEXT_RECOVER_STALE));
-    let _ = fs::remove_dir_all(&bin);
-    fs::rename(&old, &bin).map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_ROLLBACK, &[&e]))?;
-    Ok(())
+}
+
+fn remove_dir(path: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(mesh_text::format(
+            id::LAUNCHER_ERROR_REMOVE_DIR,
+            &[&path.display(), &e],
+        )),
+    }
+}
+
+/// clear_backup 删掉上一版本与安装包。
+///
+/// 失败只记日志：这两样都是残留，下次启动会再试一次；它们是否还在不再影响
+/// `bin/` 的判定——那由事务状态决定。
+fn clear_backup(root: &Path) {
+    for target in [root.join(BIN_OLD), root.join(UPDATE_FILE)] {
+        let outcome = if target.is_dir() {
+            fs::remove_dir_all(&target)
+        } else {
+            fs::remove_file(&target)
+        };
+        if let Err(e) = outcome {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                log::line(&mesh_text::format(
+                    id::LAUNCHER_TEXT_CLEANUP_FAILED,
+                    &[&target.display(), &e],
+                ));
+            }
+        }
+    }
 }
 
 /// install_from_file 把包装进 bin/：先把现有 bin 改名到 bin.old，再解包校验。
 ///
-/// 失败时把 bin 删掉、把 bin.old 改回来——调用方看到的永远是「旧的」或「新的」，
-/// 不会是一半。成功时 bin.old 留着，等启动确认之后再删。
-pub(crate) fn install_from_file(
+/// 失败时把 bin 退回去——调用方看到的永远是「旧的」或「新的」，不会是一半。
+/// 成功时事务仍未提交：bin.old 留着，等启动确认之后再 [`commit`]。
+pub(crate) fn install_from_file(root: &Path, pkg: &Path, force: bool) -> Result<(), String> {
+    install_signed_by(root, pkg, force, signing::RELEASE_PUBLIC_KEY)
+}
+
+/// 用给定公钥装包。轮换公钥与测试走这一条，签名以外的行为与 [`install_from_file`] 相同。
+pub(crate) fn install_signed_by(
     root: &Path,
     pkg: &Path,
     force: bool,
-) -> Result<Option<String>, String> {
-    let bin = root.join("bin");
+    public_hex: &str,
+) -> Result<(), String> {
+    // 上一份还没确认启动的安装先退回去：它的备份要拿来当这一次的回滚材料。
+    abort(root)?;
+    let bin = root.join(layout::BIN);
     let old_version = installed_version(&bin);
 
     let manifest = read_manifest(pkg)?;
-    // 验签放在动 bin/ 之前：坏包不该换掉唯一的回滚材料，也不该走到「装完才发现
-    // 起不来」那一步。降级检查与失败计数都在后面，因为它们只读、给出的错误更具体。
-    check_manifest_signature(&manifest, signing::RELEASE_PUBLIC_KEY)?;
+    // 签名与本机适用性放在动 bin/ 之前：坏包不该换掉唯一的回滚材料，也不该走到
+    // 「装完才发现起不来」那一步。降级检查与失败计数都在后面，因为它们只读、
+    // 给出的错误更具体。
+    check_manifest(&manifest, public_hex)?;
     log::line(&mesh_text::format(
         id::LAUNCHER_TEXT_INSTALLING,
-        &[&manifest.version, &manifest.files.len()],
+        &[&manifest.version(), &manifest.files().len()],
     ));
 
     // 降级防护：服务端把发布记录指回旧包时，客户端会当成“有新版本”下载下来。
     // 2026-11-26 两个种子就是这么被降级到 -3 的。 --force 留给手动修机器。
     if !force {
         if let Some(old) = old_version.as_deref() {
-            if !version::is_newer(&manifest.version, old) {
+            if !version::is_newer(manifest.version(), old) {
                 return Err(mesh_text::format(
                     id::LAUNCHER_ERROR_NOT_NEWER,
-                    &[&manifest.version, &old],
+                    &[&manifest.version(), &old],
                 ));
             }
         }
         let failed = Failures::load(root);
-        if failed.exhausted(&manifest.version) {
+        if failed.exhausted(manifest.version()) {
             return Err(mesh_text::format(
                 id::LAUNCHER_ERROR_FAILURES_EXHAUSTED,
-                &[&manifest.version, &failed.count(&manifest.version)],
+                &[&manifest.version(), &failed.count(manifest.version())],
             ));
         }
     }
 
-    // recover() 已在入口把残留的 bin.old 回滚回 bin/：这里再看到它，说明有人跳过了
-    // 那一步。宁可失败，也不要删掉唯一的回滚材料。
-    let old = root.join(BIN_OLD);
-    if old.exists() {
-        return Err(mesh_text::format(
-            id::LAUNCHER_ERROR_BIN_OLD_REMAINS,
-            &[&old.display()],
-        ));
-    }
-    if bin.exists() {
-        fs::rename(&bin, &old)
-            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MOVE_OLD_BIN, &[&e]))?;
-    }
-    if let Err(e) = fs::create_dir_all(&bin) {
-        restore(root);
-        return Err(mesh_text::format(id::LAUNCHER_ERROR_CREATE_BIN, &[&e]));
-    }
-
-    if let Err(e) = unpack(pkg, &bin).and_then(|_| verify(&bin, &manifest)) {
-        restore(root);
+    let tx = if bin.exists() {
+        Tx::Replaced
+    } else {
+        Tx::Fresh
+    };
+    // 状态先落盘：从这里开始断电或被杀，下一次启动知道该退什么。
+    write_tx(root, tx)?;
+    let outcome =
+        swap_and_unpack(root, pkg, &manifest, tx).and_then(|()| write_tx(root, Tx::Installed));
+    if let Err(e) = outcome {
         // 装不上就是一次失败：不记下来的话客户端每轮都会重新下一遍、再试一遍。
-        Failures::load(root).record(&manifest.version);
-        return Err(e);
+        Failures::load(root).record(manifest.version());
+        return Err(match undo(root, tx).and_then(|()| clear_tx(root)) {
+            Ok(()) => e,
+            Err(r) => mesh_text::format(id::LAUNCHER_ERROR_INSTALL_AND_ROLLBACK, &[&e, &r]),
+        });
     }
     log::line(mesh_text::get(id::LAUNCHER_TEXT_VERIFIED));
-    Ok(old_version)
+    Ok(())
 }
 
-/// commit 在启动确认成功之后调用：这一版验过了，旧的那份可以扔了。
-pub(crate) fn commit(root: &Path) {
-    let _ = fs::remove_dir_all(root.join(BIN_OLD));
-    let _ = fs::remove_file(root.join(UPDATE_FILE));
+/// swap_and_unpack 是一次安装的实际动作：改掉旧 bin、解包、按最终落盘的目录校验。
+fn swap_and_unpack(root: &Path, pkg: &Path, manifest: &Manifest, tx: Tx) -> Result<(), String> {
+    let bin = root.join(layout::BIN);
+    if tx == Tx::Replaced {
+        fs::rename(&bin, root.join(BIN_OLD))
+            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MOVE_OLD_BIN, &[&e]))?;
+    }
+    fs::create_dir_all(&bin)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_CREATE_BIN, &[&e]))?;
+    unpack(pkg, &bin)?;
+    verify(&bin, manifest)
 }
 
-/// restore 把 bin 删掉、bin.old 改回来。没有 bin.old 时什么都不做（首次安装失败）。
-pub(crate) fn restore(root: &Path) {
-    let bin = root.join("bin");
-    let old = root.join(BIN_OLD);
-    if !old.exists() {
-        let _ = fs::remove_dir_all(&bin);
-        return;
-    }
-    let _ = fs::remove_dir_all(&bin);
-    if let Err(e) = fs::rename(&old, &bin) {
-        log::line(&mesh_text::format(id::LAUNCHER_ERROR_ROLLBACK, &[&e]));
-    }
+/// commit 在启动确认成功之后调用：先把「已提交」落到盘上，再清理旧版本与安装包。
+///
+/// 顺序有意义：写下 committed 之后 `bin/` 就不再回滚，后面清理失败只影响残留，
+/// 不会把已经跑起来的新版本重新解释成「没装完」。
+pub(crate) fn commit(root: &Path) -> Result<(), String> {
+    write_tx(root, Tx::Committed)?;
+    clear_backup(root);
+    clear_tx(root)
 }
 
 /// launch_and_check 拉起 bin/ 里的版本并等它确认启动，失败就回到 bin.old。
 /// 只有 Windows 用：Linux 的启动器是常驻的，等确认与回退都在 supervisor 里。
 #[cfg(windows)]
 fn launch_and_check(root: &Path) -> Result<(), String> {
-    let bin = root.join("bin");
+    let bin = root.join(layout::BIN);
     let version = installed_version(&bin).unwrap_or_default();
+    // 拉起之前按最终落盘的目录验一遍：与日常启动走同一道闸。
+    verify_current(root)?;
     let token = token();
     launch::start(&bin.join(launch::CLIENT_EXE), root, Some(&token))?;
     log::line(mesh_text::get(id::LAUNCHER_TEXT_STARTED_NEW));
@@ -226,13 +403,13 @@ fn launch_and_check(root: &Path) -> Result<(), String> {
     if wait_boot_ok(root, &token, WAIT_BOOT) {
         log::line(mesh_text::get(id::LAUNCHER_TEXT_BOOT_OK));
         Failures::load(root).clear(&version);
-        commit(root);
-        return Ok(());
+        return commit(root)
+            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_COMMIT_FAILED, &[&e]));
     }
 
     log::line(mesh_text::get(id::LAUNCHER_TEXT_BOOT_FAILED_ROLLBACK));
     Failures::load(root).record(&version);
-    restore(root);
+    abort(root)?;
     reload_current(root).map_err(|r| mesh_text::format(id::LAUNCHER_ERROR_RELOAD_OLD, &[&r]))
 }
 
@@ -261,7 +438,9 @@ fn reload_current(root: &Path) -> Result<(), String> {
 /// 那是给“当前版本”这个判据用的）。
 pub(crate) fn installed_version(bin: &Path) -> Option<String> {
     let text = fs::read_to_string(bin.join(layout::MANIFEST)).ok()?;
-    Manifest::parse(&text).ok().map(|manifest| manifest.version)
+    Manifest::parse(&text)
+        .ok()
+        .map(|manifest| manifest.version().to_string())
 }
 
 /// package_version 只读包里的版本号，给常驻启动器做“这包还该不该装”的预检查用。
@@ -323,41 +502,29 @@ pub fn verify_current(root: &Path) -> Result<(), String> {
 pub fn verify_current_signed_by(root: &Path, public_hex: &str) -> Result<(), String> {
     let manifest = mesh_install::manifest::read(&layout::manifest_path(root))
         .map_err(|err| err.to_string())?;
-    check_manifest_signature(&manifest, public_hex)?;
-    check_manifest_identity(&manifest)?;
+    check_manifest(&manifest, public_hex)?;
     verify(&root.join(layout::BIN), &manifest)
 }
 
-/// 清单是不是给这台机器准备的。
+/// 清单既要是发布方签的，也要是给这台机器的。
 ///
-/// 签名证明内容出自发布方，不证明它是**这一份**：别的平台、别的槽位的清单同样能
-/// 验签通过。这两项由验签方对着自己的环境判断，清单自己说了不算。
-fn check_manifest_identity(manifest: &Manifest) -> Result<(), String> {
-    if manifest.slot != signing::SLOT_CLIENT || manifest.platform != platform::id() {
+/// 签名证明内容出自发布私钥，不证明它是**这一份**：别的平台、别的槽位的清单同样
+/// 能验签通过，所以槽位与平台由验签方对着自己的环境判断，清单自己说了不算。
+/// 装包、日常启动、手动装后的拉起都走这一条：三处各自组合检查项，迟早有一处漏。
+fn check_manifest(manifest: &Manifest, public_hex: &str) -> Result<(), String> {
+    if !manifest.verify_with(public_hex) {
+        return Err(mesh_text::get(id::LAUNCHER_ERROR_MANIFEST_SIGNATURE_INVALID).to_string());
+    }
+    if manifest.slot() != signing::SLOT_CLIENT || manifest.platform() != platform::id() {
         return Err(mesh_text::format(
             id::LAUNCHER_ERROR_MANIFEST_IDENTITY,
             &[
-                &manifest.slot.as_str(),
-                &manifest.platform.as_str(),
+                &manifest.slot(),
+                &manifest.platform(),
                 &signing::SLOT_CLIENT,
                 &platform::id(),
             ],
         ));
-    }
-    Ok(())
-}
-
-/// 清单必须由发布私钥签出。
-///
-/// 文件摘要只证明「这份 bin 与清单一致」：清单自己也是可以写在 `bin/` 里的一个
-/// 文件，被换掉时那条判断就没有意义了。空签名单独报一条，因为它的成因不同
-/// （手工造的包，而不是被改过的包）。
-fn check_manifest_signature(manifest: &Manifest, public_hex: &str) -> Result<(), String> {
-    if manifest.signature.is_empty() {
-        return Err(mesh_text::get(id::LAUNCHER_ERROR_MANIFEST_UNSIGNED).to_string());
-    }
-    if !manifest.verify_with(public_hex) {
-        return Err(mesh_text::get(id::LAUNCHER_ERROR_MANIFEST_SIGNATURE_INVALID).to_string());
     }
     Ok(())
 }
@@ -372,38 +539,61 @@ fn verify(bin: &Path, manifest: &Manifest) -> Result<(), String> {
     // 主程序与内核必须出现在清单里：一份「格式合法、内容齐全」却不含这两者的
     // 清单，装上去的结果就是起不来。
     for required in [platform::client_exe(), platform::core_name()] {
-        if !manifest.files.contains_key(required) {
+        if !manifest.files().contains_key(required) {
             return Err(mesh_text::format(
                 id::LAUNCHER_ERROR_MISSING_FILE,
                 &[&required],
             ));
         }
     }
-    for (name, want) in &manifest.files {
-        let path = bin.join(name);
-        let got = sha256_file(&path)
-            .map_err(|_| mesh_text::format(id::LAUNCHER_ERROR_MISSING_FILE, &[&name]))?;
-        if !got.eq_ignore_ascii_case(want) {
+
+    // 先取实际目录：文件名 → 是不是普通文件。遍历里的错误不能吞掉——读不动的
+    // 目录不等于「与清单一致」。
+    let mut present: BTreeMap<String, bool> = BTreeMap::new();
+    let entries = fs::read_dir(bin)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_DIR, &[&bin.display(), &e]))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            mesh_text::format(id::LAUNCHER_ERROR_READ_DIR_ENTRY, &[&bin.display(), &e])
+        })?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let kind = entry
+            .file_type()
+            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_ENTRY_TYPE, &[&name, &e]))?;
+        present.insert(name, kind.is_file());
+    }
+
+    // 集合必须精确相等：签名授权的是一个文件集合，不是一份白名单。清单之外的文件
+    // 同样会被加载（Windows 的 DLL 搜索、Linux 的相邻目录），多一个也算「安装根被
+    // 人动过」，少一个就是装残了。`version.json` 是唯一例外——它写不进自己的摘要，
+    // 靠 `signature` 保护，但类型要跟其余文件一样是普通文件。
+    for (name, regular) in &present {
+        if name == layout::MANIFEST {
+            if !regular {
+                return Err(mesh_text::format(
+                    id::LAUNCHER_ERROR_UNEXPECTED_FILE,
+                    &[&name],
+                ));
+            }
+            continue;
+        }
+        if !regular || !manifest.files().contains_key(name) {
             return Err(mesh_text::format(
-                id::LAUNCHER_ERROR_FILE_DIGEST_MISMATCH,
+                id::LAUNCHER_ERROR_UNEXPECTED_FILE,
                 &[&name],
             ));
         }
     }
-    let entries = fs::read_dir(bin)
-        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_DIR, &[&bin.display(), &e]))?;
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name == layout::MANIFEST {
-            continue;
+
+    // 集合对上了才读摘要：读的是清单允许、且确实落在目录里的那几个文件。
+    for (name, want) in manifest.files() {
+        if !present.get(name).copied().unwrap_or(false) {
+            return Err(mesh_text::format(id::LAUNCHER_ERROR_MISSING_FILE, &[&name]));
         }
-        let regular = entry
-            .file_type()
-            .map(|kind| kind.is_file())
-            .unwrap_or(false);
-        if !regular || !manifest.files.contains_key(&name) {
+        let got = sha256_file(&bin.join(name))?;
+        if !got.eq_ignore_ascii_case(want) {
             return Err(mesh_text::format(
-                id::LAUNCHER_ERROR_UNEXPECTED_FILE,
+                id::LAUNCHER_ERROR_FILE_DIGEST_MISMATCH,
                 &[&name],
             ));
         }
@@ -565,12 +755,21 @@ mod tests {
         version: &str,
         entries: &[(&str, &[u8])],
     ) -> String {
+        signed_manifest_for(platform::id(), key, version, entries)
+    }
+
+    /// 同 [`signed_manifest`]，但清单声明的平台由调用方给：用来单独改这一个条件。
+    fn signed_manifest_for(
+        manifest_platform: &str,
+        key: &ed25519_dalek::SigningKey,
+        version: &str,
+        entries: &[(&str, &[u8])],
+    ) -> String {
         use ed25519_dalek::Signer;
         let files: BTreeMap<String, String> = entries
             .iter()
             .map(|(name, body)| (name.to_string(), sha256_bytes(body)))
             .collect();
-        let manifest_platform = platform::id();
         let message = signing::manifest_string(
             signing::SLOT_CLIENT,
             manifest_platform,
@@ -693,27 +892,53 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// 没有签名的包在动 bin/ 之前就被拒：否则会先换掉唯一的回滚材料，再发现装不了。
+    /// 造一个合法包：清单按内容算摘要、用测试密钥签名。
+    fn valid_package(dir: &Path, version: &str, entries: &[(&str, &[u8])]) -> PathBuf {
+        let key = test_key();
+        package(dir, &signed_manifest(&key, version, entries), entries)
+    }
+
+    fn required_entries() -> [(&'static str, &'static [u8]); 2] {
+        [
+            (platform::client_exe(), b"client"),
+            (platform::core_name(), b"core"),
+        ]
+    }
+
+    fn assert_no_install_in_flight(root: &Path) {
+        assert!(
+            read_tx(root).unwrap().is_none(),
+            "不该留下事务状态：{}",
+            tx_path(root).display()
+        );
+        assert!(!root.join(BIN_OLD).exists(), "不该留下 bin.old");
+    }
+
+    /// 只有「缺签名」这一个条件不同，其余字段全部合法：断言才能说明是签名拦下的。
     #[test]
     fn a_package_without_a_signature_is_refused_before_touching_bin() {
         let root = temp_root("unsigned-pkg");
         let src = temp_root("unsigned-pkg-src");
-        std::fs::create_dir_all(root.join(layout::BIN)).unwrap();
-        std::fs::write(root.join(layout::BIN).join("KEEP"), b"keep").unwrap();
-        let pkg = package(
-            &src,
-            r#"{"version":"2099.01.01-1","slot":"client","platform":"windows/amd64","files":{},"signature":""}"#,
-            &[],
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("KEEP"), b"keep").unwrap();
+        let entries = required_entries();
+        let manifest = format!(
+            r#"{{"version":"2026.11.27-1","slot":"client","platform":"{}","files":{{"{}":"{}","{}":"{}"}}}}"#,
+            platform::id(),
+            entries[0].0,
+            sha256_bytes(entries[0].1),
+            entries[1].0,
+            sha256_bytes(entries[1].1)
         );
+        let pkg = package(&src, &manifest, &entries);
 
         assert!(
             install_from_file(&root, &pkg, true).is_err(),
-            "空签名必须拒绝"
+            "缺签名必须拒绝"
         );
-        assert!(
-            root.join(layout::BIN).join("KEEP").is_file(),
-            "验签失败不该动 bin/"
-        );
+        assert!(bin.join("KEEP").is_file(), "验签失败不该动 bin/");
+        assert_no_install_in_flight(&root);
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }
@@ -742,27 +967,267 @@ mod tests {
         let _ = fs::remove_dir_all(&src);
     }
 
-    /// 上次安装没走完时，残留的 bin.old 是唯一的回滚材料：手动安装必须先回滚它，
-    /// 而不是把它删掉再拿坏 bin 顶上。
+    /// 手动安装前先把没确认的安装退回去：那份 bin.old 是回滚材料，
+    /// 不能拿一份坏包把它顶掉。
     #[test]
-    fn a_manual_install_rolls_a_stale_bin_old_back_first() {
+    fn a_manual_install_rolls_back_the_unconfirmed_install_first() {
         let root = temp_root("stale-bin-old");
         let src = temp_root("stale-bin-old-src");
-        fs::create_dir_all(root.join("bin.old")).unwrap();
-        fs::write(root.join("bin.old").join("GOOD"), b"good").unwrap();
-        fs::create_dir_all(root.join("bin")).unwrap();
-        fs::write(root.join("bin").join("BROKEN"), b"broken").unwrap();
+        fs::create_dir_all(root.join(BIN_OLD)).unwrap();
+        fs::write(root.join(BIN_OLD).join("GOOD"), b"good").unwrap();
+        fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        fs::write(root.join(layout::BIN).join("BROKEN"), b"broken").unwrap();
+        write_tx(&root, Tx::Installed).unwrap();
         let pkg = broken_package(&src);
 
         let _ = run(&root, Source::File(pkg), None, None, true);
 
         assert!(
-            root.join("bin").join("GOOD").is_file(),
-            "残留的 bin.old 没有先回滚：回滚材料被坏 bin 顶掉了"
+            root.join(layout::BIN).join("GOOD").is_file(),
+            "没确认的安装没有先退回：回滚材料被坏包顶掉了"
         );
-        assert!(!root.join("bin.old").exists(), "回滚之后不该再有 bin.old");
+        assert!(!root.join(BIN_OLD).exists(), "退回之后不该再有 bin.old");
+        assert_no_install_in_flight(&root);
 
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 清单是别的平台的：签名完全正确，只有 slot/platform 这一项不合本机。
+    #[test]
+    fn a_package_for_another_platform_is_refused_before_touching_bin() {
+        let root = temp_root("other-platform");
+        let src = temp_root("other-platform-src");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("KEEP"), b"keep").unwrap();
+        let key = test_key();
+        let entries = required_entries();
+        let other = if platform::id() == "linux/amd64" {
+            "windows/amd64"
+        } else {
+            "linux/amd64"
+        };
+        let manifest = signed_manifest_for(other, &key, "2026.11.27-1", &entries);
+        let pkg = package(&src, &manifest, &entries);
+
+        assert!(
+            install_signed_by(&root, &pkg, true, &public_hex(&key)).is_err(),
+            "别的平台的包必须拒绝"
+        );
+        assert!(bin.join("KEEP").is_file(), "本机不适用时不该动 bin/");
+        assert_no_install_in_flight(&root);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 装完不等于装上：事务停在 installed，回滚材料（bin.old）还在，等启动确认。
+    #[test]
+    fn an_install_is_not_confirmed_until_commit() {
+        let root = temp_root("tx-confirm");
+        let src = temp_root("tx-confirm-src");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("KEEP"), b"keep").unwrap();
+        let key = test_key();
+        let entries = required_entries();
+        let pkg = valid_package(&src, "2026.11.27-2", &entries);
+
+        install_signed_by(&root, &pkg, true, &public_hex(&key)).unwrap();
+
+        assert_eq!(read_tx(&root).unwrap(), Some(Tx::Installed));
+        assert!(
+            root.join(BIN_OLD).join("KEEP").is_file(),
+            "确认之前 bin.old 必须留着，它是唯一的回滚材料"
+        );
+        assert!(bin.join(platform::client_exe()).is_file());
+
+        commit(&root).unwrap();
+
+        assert_no_install_in_flight(&root);
+        assert!(
+            bin.join(platform::client_exe()).is_file(),
+            "提交之后新版本还在"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 放弃一次没确认的安装：回到安装前那一份，状态与备份都不留。
+    #[test]
+    fn aborting_an_unconfirmed_install_restores_the_backup() {
+        let root = temp_root("tx-abort");
+        let src = temp_root("tx-abort-src");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("KEEP"), b"keep").unwrap();
+        let key = test_key();
+        let entries = required_entries();
+        let pkg = valid_package(&src, "2026.11.27-4", &entries);
+        install_signed_by(&root, &pkg, true, &public_hex(&key)).unwrap();
+
+        abort(&root).unwrap();
+
+        assert!(bin.join("KEEP").is_file(), "放弃安装必须退回原来那一份");
+        assert!(
+            !bin.join(platform::client_exe()).exists(),
+            "新版本的文件不该留下"
+        );
+        assert_no_install_in_flight(&root);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 解包结果与清单不符：退回原样、记一次失败，状态与备份都不留。
+    #[test]
+    fn a_failed_install_restores_the_previous_bin() {
+        let root = temp_root("tx-failed");
+        let src = temp_root("tx-failed-src");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("KEEP"), b"keep").unwrap();
+        let key = test_key();
+        let declared: [(&str, &[u8]); 2] = [
+            (platform::client_exe(), b"declared client"),
+            (platform::core_name(), b"core"),
+        ];
+        let actual: [(&str, &[u8]); 2] = [
+            (platform::client_exe(), b"tampered client"),
+            (platform::core_name(), b"core"),
+        ];
+        let pkg = package(
+            &src,
+            &signed_manifest(&key, "2026.11.27-9", &declared),
+            &actual,
+        );
+
+        assert!(install_signed_by(&root, &pkg, true, &public_hex(&key)).is_err());
+
+        assert!(
+            bin.join("KEEP").is_file(),
+            "失败的安装必须把原来的 bin 退回来"
+        );
+        assert_no_install_in_flight(&root);
+        assert_eq!(Failures::load(&root).count("2026.11.27-9"), 1);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 没有在途安装时 `bin/` 是已确认能启动的那一份：普通启动失败不能删它。
+    #[test]
+    fn recover_leaves_an_installed_version_alone() {
+        let root = temp_root("recover-idle");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("mesh-client.exe"), b"client").unwrap();
+
+        recover(&root).unwrap();
+
+        assert!(
+            bin.join("mesh-client.exe").is_file(),
+            "没有在途安装时不该动 bin/"
+        );
+        assert_no_install_in_flight(&root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recover_rolls_back_an_install_that_never_confirmed() {
+        let root = temp_root("recover-replaced");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("HALF"), b"half").unwrap();
+        fs::create_dir_all(root.join(BIN_OLD)).unwrap();
+        fs::write(root.join(BIN_OLD).join("GOOD"), b"good").unwrap();
+        write_tx(&root, Tx::Replaced).unwrap();
+
+        recover(&root).unwrap();
+
+        assert!(bin.join("GOOD").is_file());
+        assert!(!bin.join("HALF").exists());
+        assert_no_install_in_flight(&root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn recover_cleans_a_first_install_that_never_confirmed() {
+        let root = temp_root("recover-fresh");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("HALF"), b"half").unwrap();
+        write_tx(&root, Tx::Fresh).unwrap();
+
+        recover(&root).unwrap();
+
+        assert!(!bin.exists(), "首次安装失败要把本次的产物删掉");
+        assert_no_install_in_flight(&root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 提交之后只剩清理：再起一次不能把已经跑起来的新版本退回去。
+    #[test]
+    fn recover_keeps_the_new_version_once_it_is_committed() {
+        let root = temp_root("recover-committed");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("NEW"), b"new").unwrap();
+        std::fs::create_dir_all(root.join(BIN_OLD)).unwrap();
+        fs::write(root.join(BIN_OLD).join("OLD"), b"old").unwrap();
+        write_tx(&root, Tx::Committed).unwrap();
+
+        recover(&root).unwrap();
+
+        assert!(bin.join("NEW").is_file(), "已提交的版本不能回滚");
+        assert!(!root.join(BIN_OLD).exists(), "清理残留的备份");
+        assert_no_install_in_flight(&root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 没有事务状态时 bin.old 只是上次没删干净的残留。
+    #[test]
+    fn a_stray_backup_is_discarded_when_no_install_is_in_flight() {
+        let root = temp_root("recover-stray");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        fs::write(bin.join("NEW"), b"new").unwrap();
+        std::fs::create_dir_all(root.join(BIN_OLD)).unwrap();
+
+        recover(&root).unwrap();
+
+        assert!(bin.join("NEW").is_file());
+        assert!(!root.join(BIN_OLD).exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unknown_install_state_refuses_to_guess() {
+        let root = temp_root("recover-garbage");
+        fs::write(tx_path(&root), b"half-way").unwrap();
+
+        assert!(
+            recover(&root).is_err(),
+            "认不出的状态不能猜：猜错就会拿错的前提删文件"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 清单文件本身也在集合里：它免摘要，但类型仍要是普通文件。
+    #[test]
+    fn a_manifest_that_is_a_directory_is_refused() {
+        let root = temp_root("verify-manifest-dir");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(bin.join(layout::MANIFEST)).unwrap();
+        let entries = required_entries();
+        for (name, body) in entries {
+            fs::write(bin.join(name), body).unwrap();
+        }
+        let key = test_key();
+        let manifest = Manifest::parse(&signed_manifest(&key, "2026.11.27-1", &entries)).unwrap();
+
+        assert!(
+            verify(&bin, &manifest).is_err(),
+            "version.json 是目录时必须拒绝启动"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
