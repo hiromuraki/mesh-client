@@ -1,3 +1,5 @@
 * text=auto eol=lf
 *.ico binary
 *.png binary
+# 协议用例：字节必须逐位不变，别让 text=auto 按内容猜。
+*.bin binary
