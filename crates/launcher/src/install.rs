@@ -382,7 +382,14 @@ fn swap_and_unpack(root: &Path, pkg: &Path, manifest: &Manifest, tx: Tx) -> Resu
 ///
 /// 顺序有意义：写下 committed 之后 `bin/` 就不再回滚，后面清理失败只影响残留，
 /// 不会把已经跑起来的新版本重新解释成「没装完」。
+///
+/// 没有在途安装时（普通启动确认成功）不写状态，只清理：状态文件描述的是**一次安装**，
+/// 不能因为一次普通的启动就凭空出现。
 pub(crate) fn commit(root: &Path) -> Result<(), String> {
+    if read_tx(root)?.is_none() {
+        clear_backup(root);
+        return Ok(());
+    }
     write_tx(root, Tx::Committed)?;
     clear_backup(root);
     clear_tx(root)
@@ -446,7 +453,7 @@ pub(crate) fn installed_version(bin: &Path) -> Option<String> {
 /// package_version 只读包里的版本号，给常驻启动器做“这包还该不该装”的预检查用。
 #[cfg(unix)]
 pub(crate) fn package_version(pkg: &Path) -> Result<String, String> {
-    Ok(read_manifest(pkg)?.version)
+    Ok(read_manifest(pkg)?.version().to_string())
 }
 
 fn read_manifest(pkg: &Path) -> Result<Manifest, String> {
@@ -1209,6 +1216,26 @@ mod tests {
             "认不出的状态不能猜：猜错就会拿错的前提删文件"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 普通启动确认成功（没有在途安装）不能凭空写出事务状态。
+    #[test]
+    fn commit_without_an_install_leaves_no_state_behind() {
+        let root = temp_root("commit-idle");
+        let bin = root.join(layout::BIN);
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(root.join(BIN_OLD)).unwrap();
+
+        commit(&root).unwrap();
+
+        assert!(
+            read_tx(&root).unwrap().is_none(),
+            "没有在途安装时不该写状态：{}",
+            tx_path(&root).display()
+        );
+        assert!(!root.join(BIN_OLD).exists(), "残留的备份照旧清掉");
+        assert!(bin.exists(), "普通启动确认不能动 bin/");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 清单文件本身也在集合里：它免摘要，但类型仍要是普通文件。
