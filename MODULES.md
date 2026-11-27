@@ -206,7 +206,7 @@ pub struct Route { peer_id, ipv4, hostname, cost, next_hop, path_latency, nat_ty
 
 ### 3.5 `mesh-core`
 
-**职责**：`easytier-core` 子进程。定位（安装根的 `bin/` → 安装根 → PATH，结果固定为绝对路径）、启动（参数 + 环境变量）、逐行输出转交、软停/强杀、Windows Job 对象、就绪探测（`ShowNodeInfo` 轮询 500ms、上限 25s）、代次计数。
+**职责**：`easytier-core` 子进程。定位（只认与主程序同目录的 `easytier-core`，结果固定为绝对路径）、启动（参数 + 环境变量）、逐行输出转交、软停/强杀、Windows Job 对象、就绪探测（`ShowNodeInfo` 轮询 500ms、上限 25s）、代次计数。
 
 **对外 API**（只暴露一个线程的入口和一条命令通道）：
 
