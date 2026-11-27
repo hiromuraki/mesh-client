@@ -23,7 +23,7 @@ fn main() {
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
-            "-c" => {
+            "-c" | "--config" | "--config-file" => {
                 config = args.get(index + 1).cloned().unwrap_or_default();
                 index += 2;
             }

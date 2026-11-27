@@ -21,7 +21,7 @@ index 73e517b..b5e9d32 100644
  ] }
  tokio = { workspace = true, features = ["macros", "rt", "signal"] }
 diff --git a/easytier-contrib/easytier-mini/src/main.rs b/easytier-contrib/easytier-mini/src/main.rs
-index add3120..2936ade 100644
+index add3120..5e8df08 100644
 --- a/easytier-contrib/easytier-mini/src/main.rs
 +++ b/easytier-contrib/easytier-mini/src/main.rs
 @@ -1,12 +1,13 @@
@@ -56,7 +56,7 @@ index add3120..2936ade 100644
  
 -const USAGE: &str = "usage: easytier-mini [--config <FILE>] [--config-server <URL>] \
 -                     [--machine-id <ID>] [--hostname <NAME>] [--secure-mode]";
-+const USAGE: &str = "usage: easytier-mini --config <FILE> [--hostname <NAME>] \
++const USAGE: &str = "usage: easytier-mini --config-file <FILE> [--hostname <NAME>] \
 +                     [--secure-mode] [--rpc-portal <ADDR>]";
 +const DEFAULT_RPC_PORTAL: &str = "127.0.0.1:15888";
  
@@ -82,14 +82,24 @@ index add3120..2936ade 100644
      while let Some(arg) = args.next() {
          if arg == "-h" || arg == "--help" {
              println!(
-@@ -55,25 +68,6 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
-             options.config = Some(PathBuf::from(required_value(&mut args, "--config")?));
-             continue;
+@@ -48,30 +61,12 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
+             println!("easytier-mini {}", env!("CARGO_PKG_VERSION"));
+             return Ok(Command::Exit);
          }
+-        if arg == "-c" || arg == "--config" {
++        // --config-file 是 easytier-core 的长名；-c 与 --config 保留旧调用方。
++        if arg == "-c" || arg == "--config" || arg == "--config-file" {
+             if options.config.is_some() {
+-                anyhow::bail!("--config may only be specified once");
+-            }
+-            options.config = Some(PathBuf::from(required_value(&mut args, "--config")?));
+-            continue;
+-        }
 -        if arg == "-w" || arg == "--config-server" {
 -            if options.config_server.is_some() {
 -                anyhow::bail!("--config-server may only be specified once");
--            }
++                anyhow::bail!("--config-file may only be specified once");
+             }
 -            options.config_server = Some(
 -                required_value(&mut args, "--config-server")?
 -                    .into_string()
@@ -103,12 +113,11 @@ index add3120..2936ade 100644
 -                    .into_string()
 -                    .map_err(|_| anyhow::anyhow!("--machine-id must be valid UTF-8"))?,
 -            );
--            continue;
--        }
++            options.config = Some(PathBuf::from(required_value(&mut args, "--config-file")?));
+             continue;
+         }
          if arg == "--hostname" {
-             options.hostname = Some(
-                 required_value(&mut args, "--hostname")?
-@@ -86,34 +80,113 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
+@@ -86,34 +81,113 @@ fn parse_args(mut args: impl Iterator<Item = OsString>) -> anyhow::Result<Comman
              options.secure_mode = true;
              continue;
          }
@@ -128,7 +137,7 @@ index add3120..2936ade 100644
 -    if options.config.is_none() && options.config_server.is_none() {
 -        anyhow::bail!("either --config or --config-server is required; {USAGE}");
 +    if options.config.is_none() {
-+        anyhow::bail!("--config is required; {USAGE}");
++        anyhow::bail!("--config-file is required; {USAGE}");
      }
      Ok(Command::Run(options))
  }
@@ -155,7 +164,7 @@ index add3120..2936ade 100644
 +    }
 +    if !options.secure_mode {
 +        return None;
-     }
++    }
 +    let from_env = options.local_private_key.clone().filter(|key| !key.is_empty());
 +    let from_file = config.get_secure_mode();
 +    let local_public_key = if from_env.is_some() {
@@ -175,11 +184,8 @@ index add3120..2936ade 100644
 +        local_private_key,
 +        local_public_key,
 +    })
- }
- 
--fn validate_config_server(config_server: &str) -> anyhow::Result<()> {
--    let endpoint = parse_config_server_endpoint(config_server)?;
--    require_tcp_or_udp(endpoint.connect_url().scheme(), "config server")
++}
++
 +fn with_secure_mode(text: &str, mode: &SecureModeConfig) -> String {
 +    let mut out = drop_secure_mode_table(text);
 +    out.push_str("\n[secure_mode]\nenabled = true\n");
@@ -188,11 +194,13 @@ index add3120..2936ade 100644
 +    }
 +    if let Some(key) = mode.local_public_key.as_ref() {
 +        out.push_str(&format!("local_public_key = \"{}\"\n", toml_string(key)));
-+    }
+     }
 +    out
  }
  
--struct MiniWebClientHooks;
+-fn validate_config_server(config_server: &str) -> anyhow::Result<()> {
+-    let endpoint = parse_config_server_endpoint(config_server)?;
+-    require_tcp_or_udp(endpoint.connect_url().scheme(), "config server")
 +// 配置里原本的 [secure_mode] 整段丢掉：身份入口只有命令行与环境变量，配置文件里那份
 +// 只可能是过期的副本。
 +fn drop_secure_mode_table(text: &str) -> String {
@@ -210,8 +218,9 @@ index add3120..2936ade 100644
 +        out.push('\n');
 +    }
 +    out
-+}
-+
+ }
+ 
+-struct MiniWebClientHooks;
 +fn toml_string(value: &str) -> String {
 +    value.replace('\\', "\\\\").replace('"', "\\\"")
 +}
@@ -229,15 +238,15 @@ index add3120..2936ade 100644
 +    let mut config = load_toml_config_from_str_with_source(&source, &text)?;
 +    if let Some(mode) = secure_mode_for(&config, options) {
 +        config = load_toml_config_from_str_with_source(&source, &with_secure_mode(&text, &mode))?;
-     }
++    }
 +    if let Some(hostname) = options.hostname.clone().filter(|name| !name.is_empty()) {
 +        config.set_hostname(Some(hostname));
-+    }
+     }
 +    Ok(config)
  }
  
  #[tokio::main(flavor = "current_thread")]
-@@ -125,47 +198,22 @@ async fn main() -> anyhow::Result<()> {
+@@ -125,47 +199,22 @@ async fn main() -> anyhow::Result<()> {
      let local_config = options
          .config
          .as_ref()
@@ -291,9 +300,30 @@ index add3120..2936ade 100644
  
      let stopped_unexpectedly = tokio::select! {
          signal = tokio::signal::ctrl_c() => {
-@@ -201,30 +249,6 @@ mod tests {
-         assert_eq!(options.config, Some(PathBuf::from("mini.toml")));
-     }
+@@ -189,40 +238,19 @@ mod tests {
+     use super::*;
+     use easytier::common::config::{ConfigLoader as _, TomlConfigLoader};
+ 
++    // 三个拼写都指向同一个参数：--config-file 与 easytier-core 一致，另外两个是旧名。
+     #[test]
+-    fn parses_minimal_config_argument() {
+-        let Command::Run(options) =
+-            parse_args([OsString::from("--config"), OsString::from("mini.toml")].into_iter())
+-                .unwrap()
+-        else {
+-            panic!("expected run command");
+-        };
+-
+-        assert_eq!(options.config, Some(PathBuf::from("mini.toml")));
+-    }
++    fn accepts_every_config_flag_spelling() {
++        for flag in ["-c", "--config", "--config-file"] {
++            let Command::Run(options) =
++                parse_args([OsString::from(flag), OsString::from("mini.toml")].into_iter())
++                    .unwrap()
++            else {
++                panic!("expected run command for {flag}");
++            };
  
 -    #[test]
 -    fn parses_web_client_arguments_without_a_local_config() {
@@ -317,12 +347,12 @@ index add3120..2936ade 100644
 -        assert_eq!(options.machine_id.as_deref(), Some("machine"));
 -        assert_eq!(options.hostname.as_deref(), Some("mini"));
 -        assert!(options.secure_mode);
--    }
--
++            assert_eq!(options.config, Some(PathBuf::from("mini.toml")), "{flag}");
++        }
+     }
+ 
      #[test]
-     fn rejects_unknown_arguments() {
-         let result = parse_args([OsString::from("extra")].into_iter());
-@@ -232,12 +256,6 @@ mod tests {
+@@ -232,12 +260,6 @@ mod tests {
          assert!(result.is_err());
      }
  

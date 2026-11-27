@@ -249,7 +249,8 @@ impl CoreThread {
 
     fn launch(&self, spec: &StartSpec) -> Result<Running, String> {
         let mut cmd = Command::new(&spec.core_path);
-        cmd.arg("-c")
+        // 长名与 easytier-core 一致，两个内核都认；-c 只是它的缩写。
+        cmd.arg("--config-file")
             .arg(&spec.config_path)
             .arg("--rpc-portal")
             .arg(spec.rpc_addr.to_string())
