@@ -2,7 +2,7 @@
 
 依据 `client/`（Rust）的当前实现绘制：启动器在 `crates/launcher`，客户端在 `crates/client`。图中常量均取自代码：心跳 30s、请求超时 20s、core 就绪 25s、停止 core 5s、core 重拉退避 1s→30s、连接退避 10s→60s、面板端口 11020（最多顺延 20 个）、更新包下载 20 分钟、更新包上限 200MB、启动确认 60s、启动器等旧进程退出 60s。
 
-安装目录布局与回滚规则见 [contract/updates.md](../../docs/contract/updates.md)。
+安装目录布局、槽位与提交规则见 [contract/updates.md](../../docs/contract/updates.md)。
 
 ## 1. 心跳（heartbeat）
 
@@ -72,16 +72,17 @@ flowchart TD
 
 是否更新只看心跳里的 `appVersion` 与发布记录 `version` 的版本序（`YYYY.MM.DD-N`，按日期与当日序号数值比较）。`autoUpdate` 为 true 时客户端自己装，false 时只提示；同一版本连续失败 2 次后不再自动装。
 
-客户端只负责下载与交接，解包、校验、切换、回滚都由启动器做。两个平台的差别只在交接方式：
+客户端只负责下载与交接；解包进候选槽、校验、拉起、等确认由启动器做；提交 `bin/current` 由客户端在启动成功时做。两个平台的差别只在交接方式：
 
-- **Linux**：包装到 `<root>/update.tar.zst` 后正常退出。常驻启动器（systemd 的 `ExecStart`）看到子进程退出就回到循环开头，`apply_pending()` 读包里的 `version.json`，不比当前新就丢弃，否则装进 `bin/` 再拉起。
-- **Windows**：包已经在本地，客户端拉起 `mesh.exe --file <包> --wait-for <pid> --sha256 <摘要>` 后退出。启动器等旧进程退出（≤60s）、装进 `bin/`、拉起新版本、等启动确认，失败就回到 `bin.old/`。
+- **Linux**：包装到 `<安装根>/update.tar.zst` 后正常退出。常驻启动器（systemd 的 `ExecStart`）看到子进程退出就回到循环开头，读包里的 `version.json`，不比当前槽新就丢弃，否则清空候选槽、解包、校验、拉起。确认以 `current` 变成该槽为准；旧槽不在确认那一瞬删，留到下一次启动、选槽之前清理。失败则停掉候选、`current` 不动。
+- **Windows**：包已经在本地，客户端拉起 `mesh.exe --file <包> --wait-for <pid> --sha256 <摘要>` 后退出。启动器等旧进程退出（≤60s）、清空候选槽、解包、校验、拉起，等 `current` 变化；失败就停掉候选并把当前槽拉回来；旧槽同样留到下一次启动、选槽之前清理。
 
 ```mermaid
 sequenceDiagram
   participant E as 客户端引擎
   participant S as 控制面
   participant L as 启动器 mesh（.exe）
+  participant N as 候选槽
 
   S-->>E: 心跳 200 appUpdate（version、url、notes、sha256、autoUpdate）
   Note over E: 置 downloading；已在下载或已就绪则忽略<br/>autoUpdate=false 时只提示，等用户点
@@ -91,21 +92,22 @@ sequenceDiagram
     Note over E: 删除包，状态 error，记一次失败
   else 校验通过
     alt Linux
-      Note over E: 写到 <root>/update.tar.zst，停资源后正常退出
-      Note over L: 子进程退出 → recover() → apply_pending()<br/>包版本不比当前新则丢弃
-      Note over L: 现有 bin/ 改名 bin.old/ → 解包到 bin/ → 校验清单
-      L->>L: 拉起 bin/mesh-client，等启动确认（≤60s）
-      alt 确认成功
-        Note over L: 删除 bin.old/，清零失败计数
-      else 确认失败或超时
-        Note over L: 删除 bin/，把 bin.old/ 改回来<br/>记一次失败（同一版本 2 次后不再自动装）
+      Note over E: 写到 <安装根>/update.tar.zst，停资源后正常退出
+      Note over L: 子进程退出 → 读包内 version.json<br/>不比当前槽新则丢弃
+      Note over L: 清空候选槽 → 解包 → 校验清单
+      L->>N: 拉起候选槽的 mesh-client，等启动确认（≤60s）
+      Note over E,L: 启动成功后客户端原子写 bin/current = 该槽名
+      alt current 变成该槽
+        Note over L: 旧槽留到下一次启动、选槽之前清理
+      else 子进程退出或超时
+        Note over L: 停掉候选槽；current 不动、候选槽保留<br/>记一次失败（同一版本 2 次后不再自动装）
       end
     else Windows
       Note over E: 包已在本地
       E->>L: --file 包 --wait-for 进程号 --sha256 摘要
       Note over E: 回调 quit，客户端退出
-      Note over L: 等旧进程退出（≤60s）→ 装进 bin/ → 拉起新版本
-      Note over L: 确认失败就回到 bin.old/，并按失败次数决定是否再试
+      Note over L: 等旧进程退出（≤60s）→ 清空候选槽 → 解包 → 校验 → 拉起
+      Note over L: 确认失败则停候选、拉回当前槽，current 不动
     end
   end
 ```
@@ -114,9 +116,9 @@ sequenceDiagram
 
 ## 4. 应用启动（startup）
 
-启动器只拉起同目录 `bin/` 里的 `mesh-client`；换版本就是换 `bin/` 的内容，启动器路径永远不变，防火墙规则与服务配置只认一条。启动前先自愈：`bin.old/` 还在就说明上次安装没走完，无条件回到那一套。
+启动器只拉起 `bin/current` 选中的槽。槽名固定为 `alice`、`bob`，启动器与程序路径集合都不随版本变化，防火墙规则与服务配置只认这两条。选槽顺序：`current` 有效就用它；否则在有效槽里取目录名字典序最大的（`bob` 优先）；两个都无效即没有可启动版本。启动器从不提交，只在 `current` 缺失、非法或指向无效槽时补写一次（修复）。
 
-客户端进程先取单实例锁，再读本地身份；没有身份时起本地面板等用户填地址与 token，有身份时打一次心跳取配置与凭据、起 core、等就绪后进入心跳循环。界面是浏览器里的面板（`127.0.0.1:11020`，被占用就顺延），启动时**不再自动打开浏览器**，托盘菜单里的「打开面板」才开。起 core 需要身份：正式节点用 `--secure-mode` 加 `ET_LOCAL_PRIVATE_KEY`，其余节点等控制面签发凭据、私钥走 `ET_CREDENTIAL`；两把私钥都不进命令行。没有凭据就先停在 `error` 并让心跳继续跑。
+客户端进程先取单实例锁，再读本地身份；没有身份时起本地面板等用户填地址与 token，有身份时打一次心跳取配置与凭据、起 core、等就绪后进入心跳循环。界面是浏览器里的面板（`127.0.0.1:11020`，被占用就顺延），启动时**不再自动打开浏览器**，托盘菜单里的「打开面板」才开。起 core 需要身份：正式节点用 `--secure-mode` 加 `ET_LOCAL_PRIVATE_KEY`，其余节点等控制面签发凭据、私钥走 `ET_CREDENTIAL`；两把私钥都不进命令行。没有凭据就先停在 `error` 并让心跳继续跑。启动成功（引擎与面板就位；桌面版还要求托盘起来）后，客户端若发现自身可执行文件的父目录是槽名，就原子写 `bin/current` = 该槽名；启动器在 60 秒内看到它即确认成功。
 
 ```mermaid
 sequenceDiagram
@@ -126,13 +128,14 @@ sequenceDiagram
   participant S as 控制面
   participant C as easytier-core
 
-  L->>L: recover()：bin.old/ 还在就删 bin/ 并改回来
-  L->>L: apply_pending()：有 update.tar.zst 且版本更新则装
-  L->>M: 启动 bin/mesh-client --root 安装目录
+  L->>L: 拿到 install.lock；current 与另一个槽都有效时先删另一个槽，并清旧布局残留
+  L->>L: 读 bin/current；缺失、非法或槽无效 → 按选槽顺序选一个并补写（修复）
+  L->>L: 有 update.tar.zst 且比当前槽新 → 清空候选槽、解包、校验
+  L->>M: 启动选中槽的 mesh-client --root 安装根
   M->>M: lockfile.Acquire(instance.lock)：已有实例则唤起面板后退出
   M->>P: 监听 127.0.0.1:11020（占用则顺延，最多 20 个端口）
-  M->>L: 写启动确认标记（.boot-ok-<token>）
-  Note over L: 60s 内看到标记 → 删除 bin.old/，清零失败计数
+  M->>L: 启动成功，原子写 bin/current = 所在槽名
+  Note over L: 60s 内 current 变成该槽 → 确认成功；子进程退出或超时 → 失败
   M->>M: 读 config/client.json
   alt 无身份（没有 client.json 或 deviceId 为空）
     M->>P: 停在设置页，等用户填服务端地址与 token
@@ -180,7 +183,7 @@ sequenceDiagram
   else 更新交接（Windows）
     E->>L: 启动器已带 --file --wait-for 拉起
     Note over E: 回调 quit()，客户端退出
-    Note over L: 等旧进程退出后解包、切换、拉起新版本
+    Note over L: 等旧进程退出后清空候选槽、解包、拉起新版本
   end
   Note over M: 释放 instance.lock
 ```

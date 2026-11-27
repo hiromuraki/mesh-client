@@ -1,61 +1,65 @@
 # 客户端状态模型
 
-本文只写客户端的**状态空间**：有哪些状态、谁能进入、允许的迁移、跨状态必须成立的不变量。线格式与磁盘文件形状不在这里重复，见 [契约/updates.md](../../docs/contract/updates.md)（安装布局、回滚、槽位）与 [契约/client.md](../../docs/contract/client.md)（本地状态、启动、凭据上报、401）。
+本文只写客户端的**状态空间**：有哪些状态、谁能进入、允许的迁移、跨状态必须成立的不变量。线格式与磁盘文件形状不在这里重复，见 [契约/updates.md](../../docs/contract/updates.md)（安装布局、槽位与提交）与 [契约/client.md](../../docs/contract/client.md)（本地状态、启动、凭据上报、401）。
 
-本文覆盖六个模型：安装事务、凭据身份、启动器监督与启动确认、连接失败与 401、引擎的期限模型与状态推导、更新（offer / 下载任务 / 工件 / 意图）与启动器替换。不覆盖：线格式与磁盘文件字段（见上述契约），以及面板与托盘的呈现细节。流程图与时序见 [flows.md](flows.md)。
+本文覆盖六个模型：安装布局与当前槽、凭据身份、启动器监督与启动确认、连接失败与 401、引擎的期限模型与状态推导、更新（offer / 下载任务 / 工件 / 意图）与启动器替换。不覆盖：线格式与磁盘文件字段（见上述契约），以及面板与托盘的呈现细节。流程图与时序见 [flows.md](flows.md)。
 
-## 1. 安装事务
+## 1. 安装布局与当前槽
 
-一次安装是一个事务，事务状态记在 `<安装根>/install.state`，取值是 `fresh`、`replaced`、`installed`、`restoring`、`committed`；**没有这个文件就等于没有在途的安装**。这个文件只由启动器读写，客户端与它的交接走 `update.tar.zst` 与 `.update-failures.json`。
+安装根的持久状态只剩 `bin/current` 一行：它指向 `alice` 或 `bob`，或者不存在。「不存在」是合法状态，只表示还没有提交过；安装是否完整由槽自己的 `version.json` 回答。
 
 ```mermaid
 stateDiagram-v2
-    state "无 install.state" as Idle
-    [*] --> Idle
-    Idle --> Fresh: 开始安装，安装前没有 bin/
-    Idle --> Replaced: 开始安装，bin/ 已改名到 bin.old/
-    Fresh --> Installed: 解包与清单校验通过
-    Replaced --> Installed: 解包与清单校验通过
-    Fresh --> Idle: 失败，删掉本次的 bin/ 并清状态
-    Replaced --> Restoring: 回滚开始，先落盘 restoring
-    Installed --> Restoring: 启动确认失败或超时，有备份
-    Installed --> Idle: 启动确认失败，首次安装，删 bin/
-    Restoring --> Idle: 目录换回后清状态
-    Installed --> Committed: 启动确认成功
-    Committed --> Idle: 清 bin.old/、bin.stale/ 与待装包后清状态
+    state "没有 bin/current" as Missing
+    state "current = alice" as Alice
+    state "current = bob" as Bob
+    [*] --> Missing: 首次安装之前
+    Missing --> Alice: 首次安装解包进 alice，客户端提交
+    Missing --> Bob: 启动器修复：bob 有效而 current 缺失
+    Alice --> Bob: 解包候选槽 bob → 拉起 → 客户端提交
+    Bob --> Alice: 解包候选槽 alice → 拉起 → 客户端提交
+    Alice --> Alice: 失败不提交：current 不动，候选槽保留
+    Bob --> Bob: 失败不提交：current 不动，候选槽保留
 ```
 
-| 状态 | 谁写它 | `bin/` 是什么 | 恢复到这一状态时做什么 |
-| --- | --- | --- | --- |
-| 无该文件 | `commit`、回滚收尾 | 已确认能启动的那一份 | 清掉 `bin.old/`、`bin.stale/` 残留，不碰 `bin/` 与待装包 |
-| `fresh` | 安装开始（安装前无 `bin/`） | 本次解出来的，可能只解了一半 | 删掉 `bin/`，回到「没装过」 |
-| `replaced` | 安装开始（有 `bin/`，已改名到 `bin.old/`） | 本次解出来的，可能只解了一半 | 删掉 `bin/`，把 `bin.old/` 改回来 |
-| `installed` | 解包与校验通过 | 完整的新版本，未确认启动 | 保留，由这一轮启动去确认；确认失败再退 |
-| `restoring` | 换回旧版本之前 | 正在被换出 | 接着换回，每一步可重复 |
-| `committed` | 启动确认成功 | 已确认启动的新版本 | 不回滚，只清残留与状态文件 |
+| 状态 | 什么使它成立 | 谁写 |
+| --- | --- | --- |
+| 没有该文件 | 还没有提交过；手工删掉也不视为损坏 | — |
+| `alice` | `alice` 是有效槽，且被提交 | 客户端（启动成功且父目录是槽名）；启动器只在修复时 |
+| `bob` | 同上 | 同上 |
 
-`bin.old/` 是上一个版本，只在一个安装窗口里存在：装之前把 `bin/` 改名到这里，确认成功就删掉，失败就改名回 `bin/`。`bin.stale/` 是回滚时被丢下的**新**版本：换回旧版本要先把新版本挪开，「改名」与「删除」不是一次操作，中间断掉时旧版本必须还在。两个目录都不承担判据——判据只有 `install.state`。
+规则：
+
+1. `bin/current` 是唯一的持久安装状态。一行文本，值只能是两个槽名之一，首尾空白忽略。
+2. 槽名固定为 `alice`、`bob`，永不含版本号：Windows 的防火墙与杀软规则按程序路径建立，路径集合必须恒定；历史教训是用日期命名槽位，规则只增不减。
+3. 槽有效：`version.json` 验签通过（`MESH4`、`slot = client`、本机平台、文件集合与逐文件摘要），且目录里没有清单之外的文件。没有有效清单即半包。
+4. 候选槽 = 非当前槽，不需要任何记录。手动安装先按「修复」判出当前槽（若可能），目标取当前槽之外的另一个；两个槽都无效、连当前槽都判不出来时，目标固定为 `alice`，与首次安装一致。
+5. 提交权归客户端。提交时点就是启动就绪的时点：引擎与面板就位后调用 `ready`，桌面版还要求托盘真的立起来（更新已提交而进程随即退出时，下一轮登录同样失败），headless 在面板起来之后调用。`current_exe()` 的父目录名按 ASCII 小写比较，只认 `alice` / `bob` 两个值；原子写（临时文件 + 改名），幂等。父目录不是槽名（例如从别处手工运行）就什么都不做。
+6. 启动器从不提交，只在 `current` 缺失、值非法、或指向的槽无效时补写一次；那是修复，不是提交。
+7. 选槽顺序：`current` 有效就用它；否则在有效槽里取目录名字典序最大的（`bob` 优先于 `alice`）；若那个槽无效则取另一个；两个都无效即没有可启动版本（首次安装或需要人工）。依据是名字的字典序，不是目录时间，也不是清单里的版本号——这一刻的诉求是确定性、不需要解包；选错也能从日志看出选了谁。
+8. 启动确认：拉起之后等 `current` 变成正在跑的那个槽即为成功；60 秒内没变或子进程退出即为失败。
+9. 失败时不改 `current`、不删候选槽。失败按版本计次（沿用 `Failures` 的 `LIMIT`），同一版本连续失败到上限就跳过它：「起不来」不一定是版本的问题（网络、凭据过期、TUN 冲突、UAC 没点同意），计数必须按版本记，不能按槽记。候选槽的 `version.json` 读不出或验不过时另走一条：丢弃候选槽、删除 `update.tar.zst`、记一条日志，不计次。
+10. 清理时机：只有一处触发——启动器拿到 `install.lock`、选槽之前，若 `current` 有效且另一个槽也有效，就删另一个槽，并清掉旧布局残留（`bin.old/`、`bin.stale/`、`install.state` 若存在）。不在确认成功那一瞬删：那一刻客户端刚写完 `current`，删东西只会制造竞态。客户端可能晚于 60 秒才写 `current`，启动器若在确认过程中先删候选，就会出现 `current` 指向一个不存在的槽；Windows 上运行中的 exe 删不掉、Linux 上能 unlink，这种平台差异会把竞态变成只在 Linux 上出现的砖。
 
 两把锁回答两个问题，互不替代：
 
 | 锁文件 | 回答的问题 | 谁持有 |
 | --- | --- | --- |
-| `install.lock` | 谁在改安装根（`install.state`、`bin/`、`bin.old/`、`bin.stale/`、待装包） | 启动器覆盖整个事务；客户端只在提交更新包、替换启动器的那一段 |
+| `install.lock` | 谁在改安装根（槽目录、修复 `current`、待装包） | 启动器覆盖「解包到候选槽 → 拉起 → 等确认」；客户端只在提交更新包、替换启动器的那一段 |
 | `instance.lock` | 这份 `config/` 是不是正被一个客户端使用 | 客户端进程从启动到退出 |
 
-两者都是操作系统的文件锁，进程退出（含被杀）即释放，不留下需要人工删除的文件。冲突不靠 `install.lock` 预防：客户端在跑时手工安装由 `client_running` 判据拒绝。
+两者都是操作系统的文件锁，进程退出（含被杀）即释放，不留下需要人工删除的文件。`bin/current` 的提交不取 `install.lock`：启动器等确认时正持有它，提交若也要拿锁就永远提交不了。两个写者也不会并发——启动器的修复写在「拿到 `install.lock`、拉起客户端之前」，客户端的提交写在自己启动成功之后，前者结束时后者才可能开始。冲突不靠 `install.lock` 预防：客户端在跑时手工安装由 `client_running` 判据拒绝。
 
 不变量：
 
-1. 判据唯一：`install.state` 决定「这次安装走到哪一步」，`bin.old/` 是否存在只说明有备份。
-2. 先落盘再动手：`fresh`/`replaced` 写在改动 `bin/` 之前，`restoring` 写在换回目录之前，`committed` 写在清理之前。
-3. 旧版本在任何一刻都不被删除：回滚顺序是 `bin/` → `bin.stale/`、`bin.old/` → `bin/`、最后删 `bin.stale/`。
-4. 认不出的状态值按错误停机，不猜：猜一个状态只会拿错的前提去删文件。
-5. 安装包只由安装事务删除：它是「请安装」的信号，普通启动确认只清 `bin.old/` 与 `bin.stale/`。
-6. 每次安装先 `abort` 上一份没确认启动的事务：唯一的回滚材料不能被一次新安装覆盖。
-7. 提交之后不回滚：清理失败只影响残留，`bin/` 的含义不再改变。
+1. 判据分两层：`bin/current` 指向哪个槽，槽是否可用由该槽的 `version.json` 回答；没有 `current` 不是错误。
+2. 半包不靠状态表达：候选槽没有有效 `version.json` 就是没装好。
+3. 提交与修复分离：只有客户端提交；启动器只在缺失、非法或无效时修复一次。
+4. 启动确认只认 `current` 变成正在跑的槽，不认别的信号。
+5. 失败不改 `current`、不删候选槽；计数按版本，不按槽。
+6. 清理只在选槽之前发生：`current` 与另一个槽都有效时删另一个槽；确认过程不删任何槽。
 
-依据：`client/crates/launcher/src/install.rs` 的 `Tx`、`Owner::recover`、`Owner::abort`、`Owner::commit`、`Owner::undo`、`Owner::install_signed_by`、`client_running`；`client/crates/install/src/layout.rs` 的 `INSTALL_STATE`、`BIN_OLD`、`BIN_STALE`、`UPDATE_FILE`、`LOCK`、`INSTALL_LOCK`；`client/crates/install/src/lock.rs` 的 `Lock::path`、`Lock::owner_path`。
+依据（当前实现里对应的符号）：`client/crates/launcher/src/install.rs` 的 `Owner`（`own`、`recover`、`abort`、`commit`、`undo`、`install`、`boot_and_settle`、`client_running`）与 `Tx`；`client/crates/install/src/layout.rs` 的 `BIN`、`BIN_OLD`、`BIN_STALE`、`INSTALL_STATE`、`MANIFEST`、`UPDATE_FILE`、`LOCK`、`INSTALL_LOCK`；`client/crates/install/src/lock.rs` 的 `Lock::path`、`Lock::owner_path`；启动确认对应 `client/crates/client/src/boot_check.rs` 的 `write_marker` 与 `client/crates/client/src/main.rs` 的 `boot_ready`。
 
 ## 2. 凭据身份四态
 
@@ -95,36 +99,38 @@ stateDiagram-v2
 
 ## 3. 启动器监督与启动确认
 
-启动器只做一件事：把 `bin/` 里这一份拉到确定的结局，即验证、拉起、等确认、提交或回滚。四个入口（安装之后、普通启动、确认被打断后的下一次启动、Linux 常驻监督）走同一条 `boot_and_settle`，两个平台只差进程怎么托管。
+启动器只做一件事：把选中的槽拉到确定的结局，即校验、拉起、等 `current` 变成该槽。清理旧槽发生在选槽之前，不在确认过程里。四个入口（安装之后、普通启动、确认被打断后的下一次启动、Linux 常驻监督）走同一条 `boot_and_settle`，两个平台只差进程怎么托管。
 
 ```mermaid
 flowchart TD
   A["入口：普通启动 / --file / --url / 常驻监督"] --> B["own：取 install.lock，拿不到即失败"]
-  B --> C["clean_stale_markers + recover：按 install.state 退回没走完的安装"]
+  B --> B2["选槽之前：current 与另一个槽都有效则删另一个槽，并清旧布局残留"]
+  B2 --> C["读 bin/current；缺失、非法或指向的槽无效时按选槽顺序选一个并补写（修复）"]
   C --> D{"有待装的包？"}
-  D -- 是 --> E["--file / --url 由参数给，常驻监督看 update.tar.zst；不比当前版本新就丢弃"]
-  D -- 否 --> F["verify：验 bin/version.json 签名，再逐文件比对摘要"]
-  E --> F
-  F -- 不通过 --> G["记一次失败，abort"]
-  F -- 通过 --> H["拉起 bin/mesh-client，带 --root 与 --boot-check 标记"]
-  H -- 创建失败 --> G
-  H --> I["等 .boot-ok-标记，上限 60s"]
-  I -- 看到标记 --> J["清掉该版本的失败计数，commit"]
-  I -- 进程提前退出或超时 --> K["先停掉新版并确认它退出"]
-  K -- 停不下来 --> L["不回滚，保留 installed，下一轮接着确认"]
-  K -- 已退出 --> G
-  G --> M["有在途安装则回滚，普通启动不动文件"]
+  D -- 是 --> E["--file / --url 由参数给，常驻监督看 update.tar.zst；不比当前槽新就丢弃"]
+  D -- 否 --> F["verify：验选中槽 version.json 签名，再逐文件比对摘要"]
+  E --> G["清空候选槽、解包、校验；目标槽换成候选槽"]
+  G --> F
+  F -- 不通过 --> H["记一次失败：current 不动，候选槽保留"]
+  F -- 通过 --> I["拉起槽内 mesh-client，带 --root"]
+  I -- 创建失败 --> H
+  I --> J["等 bin/current 变成该槽名，上限 60s"]
+  J -- 看到变化 --> K["清掉该版本的失败计数；旧槽留到下一次选槽前清理"]
+  J -- 进程提前退出或超时 --> L["先停掉候选槽并确认它退出"]
+  L -- 停不下来 --> M["不动 current，保留候选槽，下一轮接着判"]
+  L -- 已退出 --> H
+  H --> N["普通启动不动文件；安装失败只保留候选槽"]
 ```
 
-| 结局 | 状态文件 | `bin/` 的去向 |
+| 结局 | 处理 | `bin/current` 与槽 |
 | --- | --- | --- |
-| 校验不通过 | 记一次失败后 `abort` | 有在途安装才回滚；普通启动保持原样 |
+| 校验不通过 | 记一次失败 | `current` 不动；候选槽保留 |
 | 进程创建失败 | 同上 | 同上 |
-| 确认超时或提前退出 | 停掉新版、记一次失败、`abort` | 回到安装前的那一套 |
-| 停不掉新版 | 保留 `installed` | 不改目录，下一次启动接着确认 |
-| 确认成功 | 清失败计数、`commit` | 新版本定稿，清理备份与待装包 |
+| 确认超时或提前退出 | 停掉候选槽、记一次失败 | 同上 |
+| 停不掉候选槽 | 不动文件 | `current` 不动，候选槽保留，下一轮接着判 |
+| 确认成功 | 清失败计数；旧槽留到下一次选槽前清理 | `current` 已由客户端写成该槽 |
 
-启动确认标记是 `<安装根>/.boot-ok-<token>`，token 由启动器每次生成；客户端在引擎、面板（桌面形态还含托盘）就位时写一次，不等网络。旧标记在每次事务入口统一清掉，上一次启动的标记不会被这一次误认。
+启动确认没有独立标记：客户端在引擎、面板（桌面形态还含托盘）就位时原子写 `bin/current`，启动器只观察这个文件。写失败只影响这一次提交，`current` 保持旧值，下一轮按选槽判据重试。
 
 | 项 | 常量 | 值 |
 | --- | --- | --- |
@@ -142,15 +148,15 @@ flowchart TD
 
 不变量：
 
-1. 安装根只有一个写者：拿不到 `install.lock` 就一行都不写，第二个启动器当场失败而不是并行改目录。
-2. 确认只认本次的标记：token 每次不同，旧的标记不会被认领。
-3. 确认成功之后 `bin/` 不再回滚；确认失败必须先把新版停掉并确认它退出，才允许改目录。
-4. 普通启动失败不删任何文件；只有本次安装还没确认启动时才有东西可退。
-5. `recover` 在拉起任何进程之前执行，每一轮都做（常驻启动器把它放在循环内）。
-6. 等待客户端的那段时间不持安装根写权：客户端提交更新包要拿同一把锁。
+1. 安装根只有一个写者：拿不到 `install.lock` 就一行都不写（`current` 的提交除外），第二个启动器当场失败而不是并行改目录。
+2. 确认只认 `bin/current` 变成正在跑的槽：60 秒内没变或子进程退出即为失败。
+3. 确认成功之后 `current` 不再回退；确认失败必须先把正在跑的那一份停掉并确认它退出。
+4. 普通启动失败不删任何文件；失败路径不删候选槽。
+5. 选槽在拉起任何进程之前执行，每一轮都做（常驻启动器把它放在循环内）。
+6. 等待客户端运行的那段时间不持安装根写权：客户端提交更新包要拿同一把锁。
 7. 待装包只有消耗它的安装事务能删：删早一次，Linux 上的自动更新就永远装不上。
 
-依据：`client/crates/launcher/src/install.rs` 的 `Owner::boot_and_settle`、`Owner::recover`、`Owner::abort`、`Owner::commit`、`wait_boot`、`clean_stale_markers`、`Budget`、`boot_or_restore`、`launch_installed`、`client_running`；`client/crates/launcher/src/launch.rs` 的 `Client::stop`、`STOP_TIMEOUT`；`client/crates/launcher/src/supervisor.rs` 的 `run`、`apply_pending`；`client/crates/install/src/failures.rs` 的 `Failures`、`LIMIT`、`KEEP_VERSIONS`；`client/crates/client/src/boot_check.rs` 的 `write_marker`；`client/crates/client/src/main.rs` 的 `boot_ready`。
+依据：`client/crates/launcher/src/install.rs` 的 `Owner::boot_and_settle`、`Owner::recover`、`Owner::abort`、`Owner::commit`、`wait_boot`、`Budget`、`boot_or_restore`、`launch_installed`、`client_running`；`client/crates/launcher/src/launch.rs` 的 `Client::stop`、`STOP_TIMEOUT`；`client/crates/launcher/src/supervisor.rs` 的 `run`、`apply_pending`；`client/crates/install/src/failures.rs` 的 `Failures`、`LIMIT`、`KEEP_VERSIONS`。
 
 ## 4. 连接失败与 401
 

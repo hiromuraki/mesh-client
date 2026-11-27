@@ -19,7 +19,7 @@ client/
     engine/             # mesh-engine    状态机（唯一可变状态的拥有者）
     panel/              # mesh-panel     本地面板 HTTP + 嵌入前端
     client/             # mesh-client    bin mesh-client(.exe)：进程形态、托盘、headless
-    launcher/           # mesh-launcher  bin mesh(.exe)：安装事务、回滚、常驻监督
+    launcher/           # mesh-launcher  bin mesh(.exe)：槽位安装、启动确认、常驻监督
 ```
 
 ```mermaid
@@ -305,7 +305,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 **职责**：进程形态。参数解析、根目录、单实例锁、线程装配、退出顺序、桌面/headless 分支、托盘、浏览器与资源管理器、消息框、`--boot-check` 标记、headless 的日志跟随与控制台附着。
 
-**模块**：`main`、`cli`（手写，风格同启动器 `args.rs`）、`instance`（锁与「唤起已有实例」）、`shutdown`（唯一的退出路径）、`desktop`（托盘 + 主线程消息泵）、`tray`（Win32）、`headless`、`browser`（COM）、`opendir`、`notify`、`boot_check`、`follow_log`。
+**模块**：`main`、`cli`（手写，风格同启动器 `args.rs`）、`instance`（锁与「唤起已有实例」）、`shutdown`（唯一的退出路径）、`desktop`（托盘 + 主线程消息泵）、`tray`（Win32）、`headless`、`browser`（COM）、`opendir`、`notify`、`follow_log`。
 
 **拥有的状态**：`Shutdown`（`Once`，幂等：停面板 → 停 core → 关日志 → `process::exit`）、托盘模型（`Arc<Mutex<TrayModel>>`，只有地址/自启勾选/更新行三项）、启动参数。
 
@@ -313,7 +313,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.9 `mesh-launcher`（bin `mesh`）
 
-**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（起 `bin/` 里已确认的那一份），带 `--file`/`--url` 是 `Install`（装一份新包）。改动安装根的动作全部在 `Owner` 之内：安装、恢复、提交、回滚，以及拉起到确认启动。
+**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽），带 `--file`/`--url` 是 `Install`（装进候选槽）。改动安装根的动作全部在 `Owner` 之内：选槽之前清理有效旧槽、解包、校验、拉起、等 `current` 确认。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
 
 **对外 API**：
 
@@ -322,15 +322,15 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 pub enum Command { Launch, Install { source: Source, sha256: Option<String>,
                                      wait_for: Option<u32>, force: bool } }
 
-// install.rs：安装根写权与一次事务
+// install.rs：安装根写权与一次安装
 pub(crate) fn own(root: &Path) -> Result<Owner, String>;            // install.lock，非阻塞
 impl Owner {
-    pub(crate) fn recover(&self) -> Result<(), String>;             // 拉起任何东西之前：退回没走完的安装
-    pub(crate) fn abort(&self) -> Result<(), String>;               // 同上，但 installed 也退
-    pub(crate) fn commit(&self) -> Result<(), String>;              // 先写 committed，再清 bin.old/ 与包
-    pub(crate) fn install(&self, pkg: &Path, force: bool) -> Result<(), String>;
-    pub(crate) fn verify_current(&self) -> Result<(), String>;
-    pub(crate) fn boot_and_settle(&self) -> Result<launch::Client, String>;
+    pub(crate) fn recover(&self) -> Result<(), String>;             // 按 current 与槽的有效性决定启动哪一份
+    pub(crate) fn abort(&self) -> Result<(), String>;               // 放弃未确认的安装：停候选槽，保留 current 与候选槽
+    pub(crate) fn commit(&self) -> Result<(), String>;              // 收尾：删本次待装包；旧槽留到下一次选槽前清理
+    pub(crate) fn install(&self, pkg: &Path, force: bool) -> Result<(), String>;  // 清空候选槽、解包、校验
+    pub(crate) fn verify_current(&self) -> Result<(), String>;      // 校验某槽与清单同一集合
+    pub(crate) fn boot_and_settle(&self) -> Result<launch::Client, String>;  // 拉起选中的槽，等 current 变成它
 }
 pub fn run(root: &Path, source: Source, want_sha: Option<String>,
            wait_for: Option<u32>, force: bool) -> Result<(), String>;  // 手动安装入口
@@ -342,7 +342,7 @@ impl Client {
     pub fn stop(&mut self) -> Result<(), String>;                   // 返回前确认它已退出
     #[cfg(unix)] pub fn wait(&mut self) -> Result<i32, String>;
 }
-pub fn start(exe: &Path, root: &Path, boot_check: Option<&str>) -> Result<Client, String>;
+pub fn start(exe: &Path, root: &Path) -> Result<Client, String>;   // 拉起槽内主程序，确认由观察 current 完成
 pub fn wait_exit(pid: u32, timeout: Duration) -> Result<(), String>;  // 只给 --wait-for
 
 #[cfg(windows)] pub(crate) fn launch_installed(root: &Path) -> Result<(), String>;
@@ -353,67 +353,41 @@ pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>
 
 | 产物 | 是什么 | 判据作用 |
 | --- | --- | --- |
-| `install.state` | 一次安装走到哪一步（五种取值见下） | **唯一判据**；文件不在 == 没有在途安装，`bin/` 就是已确认能启动的那一份 |
-| `bin.old/` | 安装前的 `bin/`，确认启动成功前是唯一的回滚材料 | 不是判据：只说明还有一份备份，**不**说明有在途事务 |
-| `bin.stale/` | 回滚时被丢下的新版本，换回旧版本的那一瞬存在 | 不是判据：收尾残骸，`undo` 与 `recover` 每次重试删除 |
+| `bin/current` | 一行槽名 | **唯一持久安装状态**；文件不在 == 还没提交过 |
+| `bin/<槽>/version.json` | 该槽的版本清单 | 槽是否有效只看它：验签、槽位、平台、文件集合 |
+| `bin/<槽>/` | 一个槽 | 当前槽或候选槽；候选槽没有有效清单就是半包 |
 | `update.tar.zst` | 客户端交接的「请安装」信号（`.part` 是下载中） | 不是判据：只由消耗它的安装事务删掉 |
 
-`bin.old/` 当判据会同时被要求回答两件事——「上次安装没走完」与「旧版本还没删掉」。启动确认成功后删备份失败，就会让下一次启动把刚跑起来的新版本当成没装完退回去；状态写进文件之后，提交与清理才是两件可以各自失败的事。
+一次安装按下列顺序推进：
 
-事务状态记在 `<root>/install.state`，对应 `install.rs` 里的 `Tx`：
+1. 验包根 `version.json` 的签名，确认它是客户端槽位、本机平台的。
+2. 候选槽 = 非当前槽；清空候选槽。
+3. 解包到候选槽，按最终落盘的内容校验该槽的 `version.json` 与文件集合。
+4. 拉起候选槽的 `mesh-client`，等 `bin/current` 变成该槽名（60 秒）；没变或子进程退出即失败。
+5. 成功：客户端已提交 `current`；旧槽留到下一次启动、选槽之前清理。
+6. 失败：停掉候选槽；`current` 不动、候选槽保留；按版本记一次失败。
 
-| 值 | 此刻 `bin/` 是什么 | 下一次 `recover` |
-| --- | --- | --- |
-| 文件不在 | 已确认能启动的那一份 | 不动；只清 `bin.old/`、`bin.stale/` 残留 |
-| `fresh` | 本次新建的，可能只解了一半；安装前没有 `bin/` | 删掉 `bin/`，回到「没装过」 |
-| `replaced` | 本次新建的，可能只解了一半；旧版本在 `bin.old/` | 删掉 `bin/`，把 `bin.old/` 改回来 |
-| `installed` | 完整的新版本，还没确认启动 | 保留：这一轮启动就是那次确认，失败再退 |
-| `restoring` | 正在换回旧版本；旧版本在 `bin.old/` 或已回到 `bin/` | 接着换回；每一步都可重复 |
-| `committed` | 已确认启动的新版本 | 不回滚：清掉 `bin.old/` 与状态文件 |
-
-```mermaid
-stateDiagram-v2
-    [*] --> Idle
-    Idle --> Fresh: 安装前没有 bin/，先落状态
-    Idle --> Replaced: 先落状态，再把 bin/ 改名成 bin.old/
-    Fresh --> Installed: 解包、逐文件校验
-    Replaced --> Installed: 同上
-    Fresh --> Idle: 任一步失败，删 bin/
-    Replaced --> Idle: 失败但还没改名（bin.old/ 不在）
-    Replaced --> Restoring: 失败且已有 bin.old/（先记 restoring）
-    Installed --> Committed: 启动确认成功
-    Installed --> Restoring: 确认失败或超时（先停掉新版）
-    Restoring --> Idle: bin/→bin.stale/、bin.old/→bin/、删 bin.stale/
-    Committed --> Idle: 删 bin.old/ 与安装包，清状态
-```
-
-`restoring` 先于目录改动落盘，所以「`bin.old/` 不在了」只可能是换回已经做完，不会被当成首次安装没有备份而去删 `bin/`。
-
-`replaced` 而 `bin.old/` 不在，说明进程死在改名之前：`bin/` 还是原来那一份，`recover` 只清 `bin.stale/` 残骸。
-
-**四个入口、一个出口**：`boot_and_settle` 是 `installed` 唯一的出口——Windows 的安装后与普通启动（`run`、`launch_installed` → `boot_or_restore`）、确认被打断后的下一次启动（`recover` 之后状态仍是 `installed`）、Linux 常驻监督（`supervisor::run`）。Linux 的手动安装只把包装进 `bin/` 就返回，确认留给 systemd 拉起的常驻启动器。
+**四个入口、一个出口**：`boot_and_settle` 负责选槽、校验、拉起与等待 `current`——Windows 的安装后与普通启动（`run`、`launch_installed` → `boot_or_restore`）、确认被打断后的下一次启动、Linux 常驻监督（`supervisor::run`）。Linux 的手动安装同样拉起候选槽并等 `current`；确认失败就保留候选、不改 `current`。
 
 | 结局 | 处理 |
 | --- | --- |
-| 验证不过、进程创建失败 | 记一次失败，`abort`（没有在途安装时是空操作，`bin/` 保持原样） |
-| 确认超时或进程提前退出 | 先 `Client::stop` 并确认退出，再记一次失败、`abort` |
-| `stop` 失败（停不下来） | 不回滚，保留 `installed`，下一次启动接着确认 |
-| 确认成功 | 记 `committed`，删 `bin.old/` 与安装包 |
+| 验证不过、进程创建失败 | 记一次失败；`current` 不动，候选槽保留 |
+| 确认超时或进程提前退出 | 先 `Client::stop` 并确认退出，再记一次失败；`current` 不动，候选槽保留 |
+| `stop` 失败（停不下来） | 不动 `current`，保留候选槽，下一轮接着判 |
+| 确认成功 | 清失败计数；旧槽留到下一次选槽前清理 |
 
-`installed` 且客户端已经在跑时（上一个启动器在等确认时被打断），Windows 的普通启动直接记 `committed`：再起一个只会撞上单实例锁，回滚一个正在运行的版本更糟。
+**谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——读包里的版本，不比当前槽新、或清单读不出来都当场删掉，否则装它再删。Windows 上没有人按固定名去读：客户端把同一个路径作为 `--file` 交给启动器，由这次安装按 `downloaded` 判据处理——提交成功时 `commit` 删，安装失败时 `run` 删。客户端自己从不删固定路径上的这个文件。
 
-**谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——读包里的版本，不比当前新、或清单读不出来都当场删掉，否则装它再删。Windows 上没有人按固定名去读：客户端把同一个路径作为 `--file` 交给启动器，由这次事务按 `downloaded` 判据处理——提交成功时 `commit` 删，安装失败时 `run` 删。客户端自己从不删固定路径上的这个文件。
-
-**拥有的状态**：`Owner`（安装根路径 + `install.lock` 的锁句柄；事务状态每次从 `install.state` 现读，不留内存副本）；`launch::Client`（客户端子进程句柄：Windows 是自己 `spawn` 的 `Child` 或 `runas` 交回的 `HANDLE`，Unix 是 `Child`）。除这些之外没有跨调用的内存状态：`Budget` 与命令参数都是值。
+**拥有的状态**：`Owner`（安装根路径 + `install.lock` 的锁句柄；当前槽每次从 `bin/current` 现读，不留内存副本）；`launch::Client`（客户端子进程句柄：Windows 是自己 `spawn` 的 `Child` 或 `runas` 交回的 `HANDLE`，Unix 是 `Child`）。除这些之外没有跨调用的内存状态：`Budget` 与命令参数都是值。
 
 **依赖**：`mesh-install`（布局、清单、签名、失败计数、锁、版本比较）、`mesh-text`（文案）、`zstd`、`tar`、`sha2`；Windows 另加 `ureq`（`tls`+`native-certs`，`--url` 下载）与 `windows-sys`（`ShellExecuteExW` 的 runas、`TerminateProcess`、`WaitForSingleObject`）；Unix 的 `--url` 调系统 `curl`。
 
 **注**：
 
-1. Windows 拉起客户端要过 UAC：`CreateProcess` 返回 `ERROR_ELEVATION_REQUIRED(740)` 时改用 `ShellExecuteExW` 的 `runas`，并必须保留 `hProcess`——没有句柄就无从确认新版退没退，确认超时后不能安全换 `bin/`。
-2. Windows 上安装事务失败后要自己把旧版本拉回来（`boot_or_restore` → `start_current`）：启动器装完就退，没有别人替它拉起。Linux 的常驻启动器回到循环开头重走一遍。
-3. `verify_current` 要求 `bin/` 与清单是同一个集合（`version.json` 除外）；装包、普通启动、手动安装后的拉起共用这一个判据。
-4. 预算收在 `Budget::package`：1024 条目、64 KiB 清单、256 MiB 解压后、120 s；`--url` 另加 200 MiB 包与 300 s 下载。条目数与声明字节在读清单时判完（此时 `bin/` 还没动），解包时同一组数字是兜底，触发即回滚。
+1. Windows 拉起客户端要过 UAC：`CreateProcess` 返回 `ERROR_ELEVATION_REQUIRED(740)` 时改用 `ShellExecuteExW` 的 `runas`，并必须保留 `hProcess`——没有句柄就无从确认新版退没退，确认超时后不能安全换槽目录。
+2. Windows 上安装失败后要自己把当前槽拉回来（`boot_or_restore` → `start_current`）：启动器装完就退，没有别人替它拉起。Linux 的常驻启动器回到循环开头重走一遍。
+3. `verify_current` 要求槽目录与清单是同一个集合（`version.json` 除外）；装包、普通启动、手动安装后的拉起共用这一个判据。
+4. 预算收在 `Budget::package`：1024 条目、64 KiB 清单、256 MiB 解压后、120 s；`--url` 另加 200 MiB 包与 300 s 下载。条目数与声明字节在读清单时判完（此时候选槽还没动），解包时同一组数字是兜底，触发即让候选槽停在无效状态。
 5. 每次启动先把自身版本写进 `launcher.json`（编进二进制的 `MESH_LAUNCHER_BUILD_VERSION`；不是合法版本号的开发构建不写，客户端按「没有记录」放行一次）。日志写 `<root>/log/launcher.log` 并同时进 stderr；`Launch` 在 Linux 上把客户端的退出码透传给 systemd。
 
 ## 4. Go ↔ Rust 对应与状态归属
