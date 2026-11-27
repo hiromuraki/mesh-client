@@ -77,6 +77,7 @@ fn harness(tag: &str) -> Harness {
     let engine = Engine {
         config: Config {
             root: dir.clone(),
+            program_dir: dir.join("bin"),
             self_version: "2026.11.26-1".to_string(),
             hostname: "test-host".to_string(),
             auto_update_disabled: false,
@@ -539,6 +540,7 @@ fn the_engine_thread_starts_publishes_and_exits() {
     let (tx, handle) = crate::spawn(
         Config {
             root: dir.clone(),
+            program_dir: dir.join("bin"),
             self_version: "2026.11.26-9".to_string(),
             hostname: "test-host".to_string(),
             auto_update_disabled: false,

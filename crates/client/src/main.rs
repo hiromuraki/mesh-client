@@ -86,8 +86,14 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
     let shutdown = Shutdown::new();
     let cell = Arc::new(StateCell::new(Published::default()));
     let (notice_tx, notice_rx) = channel::<Notice>();
+    // core 与主程序同层：拿不到自身路径时退回安装布局的 bin/。
+    let program_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| root.join(layout::BIN));
     let config = Config {
         root: root.clone(),
+        program_dir,
         self_version: version.clone(),
         hostname: platform::hostname(),
         auto_update_disabled: options.disable_auto_update,

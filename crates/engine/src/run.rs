@@ -86,6 +86,9 @@ pub enum Notice {
 /// 引擎配置。版本号由 `build.rs` 注入后传进来，不从磁盘读。
 pub struct Config {
     pub root: PathBuf,
+    /// 主程序所在目录。`easytier-core` 必须与它同层，所以这里给的是「同层」的
+    /// 具体路径，而不是让引擎去拼 `bin`：测试与直接运行主程序的场景各有各的布局。
+    pub program_dir: PathBuf,
     pub self_version: String,
     /// 本机主机名：配置里没写设备名时用它。
     pub hostname: String,
@@ -934,7 +937,7 @@ impl Engine {
         // 提示字段现读现算（Go 的 hints() 也是每次读文件）：配置刚被写盘时，
         // 就绪判据与身份选择都必须基于新内容。
         self.refresh_identity();
-        let core_path = mesh_core::locate(&self.config.root.join("bin"))?;
+        let core_path = mesh_core::locate(&self.config.program_dir)?;
         let rpc_addr = sync::rpc_listen_addr()?;
         let hostname = self.effective_hostname(&config);
         let hints = self.hints.clone();
