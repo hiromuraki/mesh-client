@@ -2,7 +2,7 @@
 
 本文只写客户端的**状态空间**：有哪些状态、谁能进入、允许的迁移、跨状态必须成立的不变量。线格式与磁盘文件形状不在这里重复，见 [契约/updates.md](../../docs/contract/updates.md)（安装布局、回滚、槽位）与 [契约/client.md](../../docs/contract/client.md)（本地状态、启动、凭据上报、401）。
 
-不覆盖：引擎事件循环的期限模型、更新模型（offer / 下载任务 / 工件状态 / 安装意图）。第 4 节的 `Status` 只写推导顺序，不写它在事件循环里于何处被写。流程图与时序见 [flows.md](flows.md)。
+本文覆盖六个模型：安装事务、凭据身份、启动器监督与启动确认、连接失败与 401、引擎的期限模型与状态推导、更新（offer / 下载任务 / 工件 / 意图）与启动器替换。不覆盖：线格式与磁盘文件字段（见上述契约），以及面板与托盘的呈现细节。流程图与时序见 [flows.md](flows.md)。
 
 ## 1. 安装事务
 
@@ -152,36 +152,18 @@ flowchart TD
 
 依据：`client/crates/launcher/src/install.rs` 的 `Owner::boot_and_settle`、`Owner::recover`、`Owner::abort`、`Owner::commit`、`wait_boot`、`clean_stale_markers`、`Budget`、`boot_or_restore`、`launch_installed`、`client_running`；`client/crates/launcher/src/launch.rs` 的 `Client::stop`、`STOP_TIMEOUT`；`client/crates/launcher/src/supervisor.rs` 的 `run`、`apply_pending`；`client/crates/install/src/failures.rs` 的 `Failures`、`LIMIT`、`KEEP_VERSIONS`；`client/crates/client/src/boot_check.rs` 的 `write_marker`；`client/crates/client/src/main.rs` 的 `boot_ready`。
 
-## 4. 连接与降级
+## 4. 连接失败与 401
 
-`Status` 是面向界面的连接状态，只由 `Engine::status` 从故障、身份、失败计数与 core 是否就绪推导，处理器不直接写它。控制面不可达只降级，不牵连数据面；core 不在跑也不中止心跳。
+心跳的结果只有三类：成功、非 401 失败、401。每一类只改两件事——失败计数与下一次期限；身份是否保留由 401 的分支单独决定。控制面不可达只降级，不牵连数据面；core 不在跑也不中止心跳。
 
-```mermaid
-stateDiagram-v2
-    [*] --> Unconfigured
-    Unconfigured --> Connecting: 存下身份，发出第一次心跳
-    Connecting --> Online: 心跳成功且 core 已就绪
-    Connecting --> Degraded: 心跳失败，或心跳成功但 core 未就绪
-    Online --> Degraded: 心跳失败，或 core 退出
-    Degraded --> Online: 心跳成功、core 就绪，失败原因不再成立
-    Online --> Error: 本地状态、配置或 core 启动确定失败
-    Degraded --> Error: 同上
-    Error --> Online: 两个平面都恢复
-    Online --> Unconfigured: 401 revoked，清身份
-    Degraded --> Unconfigured: 同上
-    Connecting --> Unconfigured: 同上
-```
-
-| 顺序 | 判据 | 结果 |
-| --- | --- | --- |
-| 1 | `fault` 非空（本地状态读不出、配置写不进、core 起不来） | `error` |
-| 2 | 身份为空 | `unconfigured` |
-| 3 | 连续失败计数大于 0 | `degraded` |
-| 4 | 还没有过成功心跳 | `connecting` |
-| 5 | core 已就绪 | `online` |
-| 6 | 其余（心跳通过但 core 未就绪） | `degraded` |
-
-心跳失败的处理分两支。非 401 失败按连接退避排下一次；401 按身份是否还可信决定降级还是清身份。
+| 结果 | 失败计数 | 下一次期限 | 身份 |
+| --- | --- | --- | --- |
+| 成功 | 失败计数与 401 计数清零，记下最近心跳时刻 | 30s 后例行 | 保留 |
+| 非 401 失败（网络、超时、5xx、取样失败） | 加一 | 连接退避 | 保留 |
+| 401 `revoked` | 加一 | 不再排期 | 清掉 `device_id` 与本地凭据、停 core、回设置页 |
+| 401 其它，时钟偏差超过 300s | 加一 | 连接退避 | 保留，只降级 |
+| 401 其它，连续不足 3 次 | 加一，401 计数加一 | 连接退避 | 保留 |
+| 401 其它，连续达到 3 次 | 同上 | 不再排期 | 清 |
 
 ```mermaid
 flowchart TD
@@ -199,23 +181,188 @@ flowchart TD
 
 | 项 | 常量 | 值 |
 | --- | --- | --- |
-| 心跳间隔 | `HEARTBEAT_INTERVAL` | 30s |
 | 单次心跳超时 | `HEARTBEAT_TIMEOUT` | 20s |
-| 连接退避 | `connect_backoff`、`CONNECT_BACKOFF_MAX` | 10s 起，每次 ×1.5，上限 60s |
-| core 重拉退避 | `revive_backoff`、`REVIVE_BACKOFF_MAX` | 1s 起，每次 ×2，上限 30s |
-| core 短命判定 | `CORE_MIN_LIFETIME` | 5s；活够这么久才把重拉档位放回第一档 |
-| 停 core 等回复 | `STOP_REPLY_TIMEOUT` | 15s |
 | 时钟偏差窗 | `CLOCK_SKEW_LIMIT_SECONDS` | 300s |
 | 连续 401 上限 | `AUTH_FAIL_LIMIT` | 3 次 |
-| 本地状态读失败的重试间隔 | `LOCAL_STATE_RETRY` | 5s |
 
 不变量：
 
-1. 心跳在途时没有下一次期限：`due` 为空，因此不会出现两条并发心跳。
-2. 旧代次的结果一律丢弃：重连或换身份之后的迟到响应不许改状态、不许落盘配置与凭据、不许按旧连接的 401 清身份。
-3. 一次成功心跳同时清零连续失败计数与 401 计数，并记下最近心跳时刻。
-4. 401 只有三种结局：清身份（`revoked`，或时间无明显偏差且连续 3 次）、只降级（偏差超窗）、继续重试。
-5. 时钟偏差从不清身份：一次对时错误不该换来一次换机重注册。
-6. core 未就绪不影响心跳继续；心跳通了而 core 没跑，按当前规格补启动。
+1. 401 不区分原因：服务端只在删身份时回 `revoked`，其余一律 `unauthorized`，客户端因此先看时间偏差、再看连续次数。
+2. 时钟偏差从不清身份：一次对时错误不该换来一次换机重注册。
+3. 连续 401 计数只在成功心跳时清零；`revoked` 直接清身份，不等次数。
+4. 清身份之后没有下一次期限（`unbind` 把 `due` 置空），界面回到 `unconfigured`。
+5. core 未就绪不影响心跳继续：心跳通了而 core 没跑，按当前规格补启动。
 
-依据：`client/crates/engine/src/run.rs` 的 `Status`、`Engine::status`、`Control`、`Engine::beat`、`Engine::on_heartbeat`、`connect_backoff`、`revive_backoff`、`CORE_MIN_LIFETIME`、`STOP_REPLY_TIMEOUT`、`Engine::settle`；`client/crates/engine/src/sync.rs` 的 `Engine::handle_auth_rejected`、`CLOCK_SKEW_LIMIT_SECONDS`、`AUTH_FAIL_LIMIT`。
+依据：`client/crates/engine/src/run.rs` 的 `Engine::on_heartbeat`、`note_control_failure`、`Engine::unbind`；`client/crates/engine/src/sync.rs` 的 `Engine::handle_auth_rejected`、`Engine::reset_auth_fails`、`CLOCK_SKEW_LIMIT_SECONDS`、`AUTH_FAIL_LIMIT`。
+
+## 5. 期限模型与状态推导
+
+引擎只有一个线程读写状态，一条循环等两件到期的事：下一次联系控制面（`Control.due`）与下一次重拉 core（`Revive.due`）。两者独立推进，每次唤醒取最早的一个；没有期限时阻塞等命令。
+
+```mermaid
+flowchart TD
+  A["pump：取 min(control.due, revive.due)"] --> B{"有期限？"}
+  B -- 没有 --> C["阻塞等命令"]
+  C --> E
+  B -- 有 --> D{"到点前收到命令？"}
+  D -- 是 --> E["handle 命令，publish，重算期限"]
+  E --> A
+  D -- 否 --> F["on_deadline：revive.due 到点则 revive_core，control.due 到点则 beat"]
+  F --> G["publish"]
+  G --> A
+```
+
+| 期限 | 字段 | 何时设置 | 值 |
+| --- | --- | --- | --- |
+| 下一次心跳 | `Control.due` | 心跳成功 | `HEARTBEAT_INTERVAL`，30s |
+| | | 非 401 失败、401 未清身份 | `connect_backoff`：10s 起每次 ×1.5，`CONNECT_BACKOFF_MAX` 60s 封顶 |
+| | | 本地身份读失败 | `LOCAL_STATE_RETRY`，5s |
+| | | 存下身份、手动重连 | 立即 |
+| | | 请求在途 | `None`：不排下一次 |
+| | | 没有身份（`unbind`） | `None` |
+| 下一次重拉 core | `Revive.due` | core 启动失败 | `revive_backoff`：1s 起每次 ×2，`REVIVE_BACKOFF_MAX` 30s 封顶 |
+| | | core 自行退出 | 同上；上一代活够 `CORE_MIN_LIFETIME`（5s）才回到第一档 |
+| | | core 报告就绪 | 清空 |
+
+代次把「结果属于哪一次」钉死，三种代次都只增不减：
+
+- 心跳代次 `Control.gen`：每发一次加一，`on_heartbeat` 只接受当前代次；重连与换身份也加一，让在途结果作废。
+- core 代次 `CoreRun.gen`：`start_core` 每次分配一个新值（`next_gen`），core 事件与 STUN 结果按它匹配，迟到事件丢弃。
+- 任务代次 `DownloadTask.gen`：`next_task` 只增不减，换 offer 不重置；下载与启动器替换的完成消息按「任务相等」与「当前 offer 版本与摘要相等」两条判据决定还算不算数。
+
+`Status` 没有写入点：`Engine::status` 从 `fault`、是否有身份、最近心跳结果、core 是否就绪一次算出。
+
+```mermaid
+stateDiagram-v2
+    [*] --> Unconfigured
+    Unconfigured --> Connecting: 存下身份，期限立即到期
+    Connecting --> Online: 心跳成功且 core 就绪
+    Connecting --> Degraded: 心跳失败，或 core 在首轮心跳前退出（排了重拉）
+    Connecting --> Error: core 启动失败等确定失败
+    Online --> Degraded: 心跳失败，或 core 退出
+    Degraded --> Online: 心跳成功、core 就绪，失败原因不再成立
+    Online --> Error: 本地状态、配置或 core 启动确定失败
+    Degraded --> Error: 同上
+    Error --> Online: 两个平面都恢复
+    Online --> Unconfigured: 401 revoked，清身份
+    Degraded --> Unconfigured: 同上
+```
+
+| 顺序 | 判据 | 结果 |
+| --- | --- | --- |
+| 1 | `fault` 非空：本地状态读不出、配置写不进、core 起不来 | `error` |
+| 2 | 没有客户端配置：未注册，或身份已被吊销 | `unconfigured` |
+| 3 | 没有心跳结果、失败计数为 0、没有排定的重拉 | `connecting` |
+| 4 | 失败计数为 0、有过心跳结果、core 已就绪 | `online` |
+| 5 | 其余：两个平面有一个没就绪 | `degraded` |
+
+不变量：
+
+1. 期限只在引擎线程写；心跳、下载、面板、STUN 线程只投递结果。
+2. 两边期限独立：控制面不可达只让心跳退避，不会取消 core 的重拉期限。
+3. 请求在途时 `Control.due` 为空，因此同一时刻最多一条心跳。
+4. 到点才推进：`on_deadline` 对两边都再查一次 `due` 是否已过。
+5. 旧代次的结果一律丢弃，且不许落盘配置或凭据、不许按旧连接的 401 清身份。
+6. 没有身份时控制面没有期限；若也没有排定的重拉，循环退化为纯等命令。
+7. `Status` 是推导值，任何处理器都不写它；`settle` 只清掉失败原因，状态随下一次推导改变。
+
+依据：`client/crates/engine/src/run.rs` 的 `Control`、`CoreRun`、`Revive`、`CoreSpec`、`AuthMode`、`Engine::pump`、`Engine::next_deadline`、`Engine::on_deadline`、`Engine::beat`、`Engine::on_heartbeat`、`Engine::on_core_event`、`Engine::schedule_revive`、`Engine::next_revive_attempt`、`Engine::revive_core`、`Engine::rebind`、`Engine::unbind`、`Engine::status`、`Engine::settle`、`connect_backoff`、`revive_backoff`、`HEARTBEAT_INTERVAL`、`HEARTBEAT_TIMEOUT`、`CONNECT_BACKOFF_MAX`、`REVIVE_BACKOFF_MAX`、`CORE_MIN_LIFETIME`、`STOP_REPLY_TIMEOUT`、`LOCAL_STATE_RETRY`、`STUN_REFRESH_INTERVAL`。
+
+## 6. 更新模型
+
+自更新把四个事实分开表达，每个只有一个落点；界面上的 `Phase`（`Idle` / `Downloading` / `Ready` / `Failed`）是它们的投影，不是另一份状态。服务端每轮心跳都带完整的一份 `appUpdate`；「是不是同一份」由客户端按版本与摘要判断，与响应形状、下载进度都无关。线格式见 [契约/updates.md](../../docs/contract/updates.md)，交接约定见 [契约/client.md](../../docs/contract/client.md)「客户端如何装」。
+
+| 轴 | 类型 | 取值 | 谁改它 |
+| --- | --- | --- | --- |
+| offer | `Option<Offer>` | 没有；有（`version`、`sha256`、`auto`、`auto_tried`） | 心跳的 `Engine::offer_update`、`start_offer`、`withdraw` |
+| task | `Option<DownloadTask>` | 没有；在跑（`gen`、`version`、`sha256`） | `prepare` 起任务，`on_download` 落任务 |
+| artifact | `Artifact` | `None`；`Staged(.part 路径)`；`Failed{error, attempts, retry_at}` | `on_download`、`try_apply`、`prepare` |
+| intent | `Option<Intent>` | 没有；`Manual`；`Auto` | 用户点安装、自动策略；offer 变化或交接完成时清空 |
+
+```mermaid
+stateDiagram-v2
+    state "无 offer" as NoOffer
+    state "有 offer，无工件" as Offered
+    state "下载中（task 非空）" as Downloading
+    state "已暂存（artifact = Staged）" as Staged
+    state "准备失败（artifact = Failed）" as Failed
+    state "已交接（改名成 update.tar.zst）" as Handed
+    [*] --> NoOffer
+    NoOffer --> Offered: 心跳带来完整 appUpdate，版本与签名都过
+    Offered --> Downloading: prepare 起一个任务（Windows 预取，或已有授权）
+    Downloading --> Staged: 下载完成，摘要与签名都过
+    Downloading --> Failed: 下载或校验失败
+    Failed --> Downloading: 退避到点自动重试；用户点安装则立即重下
+    Staged --> Handed: 有意图且拿到安装根写权
+    Staged --> Staged: 拿不到写权，延期（不重下）
+    Staged --> Offered: 换 offer，旧暂存件删除
+    Staged --> NoOffer: 撤回，旧暂存件删除
+    Downloading --> Offered: 换 offer，在跑任务作废
+    Downloading --> NoOffer: 撤回，在跑任务作废
+    Handed --> [*]: 进程退出，安装交给启动器
+```
+
+| 当前 | 事件 | 迁移 | 落地动作 |
+| --- | --- | --- | --- |
+| 无 offer | 心跳带完整 `appUpdate`，版本与签名都过 | → 有 offer，`intent` 与 `artifact` 清空 | 删上一份暂存件（内容不再被授权）；Windows 立即预取，Linux 等授权 |
+| 有 offer | 心跳带来同一份（版本与摘要都相同） | 不变 | 只更新 `auto`，不重下、不动进度 |
+| 有 offer | 心跳撤回（响应里没有 `appUpdate`） | → 无 offer | 删暂存件、清意图；在跑任务留着，回来时自弃 |
+| 有 offer | 再次完整下发（换版本或同版本重发） | 旧 offer → 新 offer | 删旧暂存件、清意图；在跑任务留着 |
+| 有 offer、无工件 | 策略允许且这一份没试过 | 记 `intent = Auto` | 无（自动意图每份只记一次） |
+| 有 offer、无工件 | 没有意图，且平台是 Windows | 起任务 | 预取到 `.part`：只暂存，不算授权 |
+| 有 offer、有意图 | 需要字节 | 起任务 | 写 `<root>/update.tar.zst.part`，同一时刻最多一个任务 |
+| 下载中 | 任务完成、仍是当前 offer | → `Staged` | 只暂存，不提交 |
+| 下载中 | 完成时 offer 已换或已撤回 | → 新 offer，或 → 无 offer | 删掉这条任务自己的 `.part` |
+| 下载中 | 失败、仍是当前 offer | → `Failed` | `attempts` 加一，`retry_at` 按退避推后 |
+| `Failed` | 退避到点，下一轮心跳 | → 下载中 | 重下；累计 5 次后停手等人 |
+| `Staged` + 有意图 | 拿到安装根写权 | → 交接 | 改名成 `<root>/update.tar.zst`，`intent` 与 `artifact` 清空，进程退出 |
+| `Staged` + 有意图 | 拿不到写权 | 不变 | 只记日志，下一轮心跳再试，已校验的字节不重下 |
+| 无 offer | 用户点安装 | 拒绝 | 无 |
+| `Failed` | 用户点安装 | → 下载中 | 清掉失败记录与退避，立即重下 |
+
+启动器槽位单独维护，因为它不随客户端包 offer 重建：
+
+| 字段 | 含义 | 何时变 |
+| --- | --- | --- |
+| `installed_sum` | 盘上那份启动器的摘要 | 启动时读一次；替换成功后改成任务的摘要 |
+| `installed_version` | 盘上那份自报的版本号 | 同上；读不到时不判降级 |
+| `tried` | 已经有结论的那一份 offer 摘要 | 开始替换或判定「不比现在新」时写入；`Deferred` 时放回空 |
+| `task` | 在跑的替换任务 | 单飞判据：非空时不起第二个 |
+
+摘要与盘上那份相同时直接返回，不记 `tried`：每轮最多多算一次摘要。盘上版本号读不到时不判降级，放行这一次；`Deferred` 是唯一会把 `tried` 放回的结论，因此它不阻止下一轮重试。
+
+```mermaid
+stateDiagram-v2
+    state "空闲（没有在跑的任务）" as Idle
+    state "替换中" as Replacing
+    state "已有结论（tried = 这一份）" as Concluded
+    [*] --> Idle
+    Idle --> Replacing: 签名通过、摘要不同、版本可证明更新、这一份没试过
+    Idle --> Concluded: 版本不比盘上新，记下 tried
+    Replacing --> Concluded: Replaced 或 Failed，tried 保留
+    Replacing --> Idle: Deferred，tried 放回空
+    Concluded --> Idle: 换到另一份 offer
+```
+
+不变量：
+
+1. 四个轴互不代理：任何「可以交接」都由 `artifact == Staged` 与 `intent` 同时成立表达。
+2. 任务单飞：`task` 非空时不新起下载——`.part` 只有一个，两个线程写只会互相截断。
+3. 暂存不是信号：固定名 `update.tar.zst` 只在持安装根写权提交的那一刻出现，此前工件一直叫 `.part`。
+4. 只有被授权的交接才提交：`Auto` 在交接前重新校验当前策略，策略已关就放弃；`Manual` 只看 offer 还在不在。
+5. 锁争用只延期：拿不到写权时暂存件原样留着，下一轮心跳重试，已校验的字节不重下。
+6. 结果按代次与 offer 双重判定：任务代次不等，或当前 offer 的版本与摘要变了，这条结果连文件都不留。
+7. 意图随 offer 变化一起清空，因此意图天然只指向当前 offer，不需要另存一份身份副本。
+8. 失败退避按次数翻倍、上限 10 分钟，累计 `MAX_DOWNLOAD_ATTEMPTS` 次后停手等人处理。
+9. 启动器替换同一份只试一次：`Deferred` 是唯一会把 `tried` 放回的结论。
+
+| 项 | 常量 | 值 |
+| --- | --- | --- |
+| 包字节上限 | `MAX_UPDATE_BYTES` | 200 MiB |
+| 下载总时限 | `DOWNLOAD_TIMEOUT` | 20 分钟 |
+| 启动器下载总时限 | `LAUNCHER_TIMEOUT` | 10 分钟 |
+| 自动重试次数上限 | `MAX_DOWNLOAD_ATTEMPTS` | 5 次 |
+| 失败退避 | `retry_delay` | 30s 起每次 ×2，上限 10 分钟 |
+| 启动器替换的临时目录 | `UPDATE_DIR` | `update/` |
+
+依据：`client/crates/engine/src/update.rs` 的 `UpdateState`、`Offer`、`Artifact`、`Intent`、`DownloadTask`、`Phase`、`Engine::offer_update`、`start_offer`、`withdraw`、`Engine::apply_update`、`Engine::auto_apply`、`Engine::advance_update`、`Engine::try_apply`、`Engine::prepare`、`Engine::on_download`、`Engine::handoff`、`download_package`、`commit_package`、`retry_delay`、`MAX_DOWNLOAD_ATTEMPTS`、`MAX_UPDATE_BYTES`、`DOWNLOAD_TIMEOUT`、`LauncherState`、`Engine::apply_launcher`、`Engine::on_launcher_result`、`LauncherResult`、`LAUNCHER_TIMEOUT`、`UPDATE_DIR`、`Engine::clean_update_dir`；`client/crates/install/src/artifact.rs` 的 `is_full_digest`、`digest_file`；`client/crates/install/src/lock.rs` 的 `Lock::owner_path`。
