@@ -190,12 +190,6 @@ pub enum LauncherResult {
 }
 
 impl Engine {
-    /// 下一轮心跳要上报的「我手上是哪一份发布包」。来源就是 offer 的摘要：
-    /// 进度（下载中、失败、已暂存）都不改变「我手上是哪一份」。
-    pub(crate) fn known_app_update(&self) -> Option<String> {
-        self.update.offer.as_ref().map(|offer| offer.sha256.clone())
-    }
-
     /// 记下服务端报告的发布。安装动作交给启动器。
     ///
     /// 服务端不再提供（`None`）就是撤回：显式迁移状态，不让旧任务的结果续命。
@@ -205,13 +199,6 @@ impl Engine {
             return;
         };
         let auto = info.auto_update && !self.config.auto_update_disabled;
-        // 精简响应：服务端确认“你手上就是这份发布包”，只更新策略，别的什么都不动。
-        if info.unchanged {
-            if let Some(offer) = self.update.offer.as_mut() {
-                offer.auto = auto;
-            }
-            return;
-        }
         // 版本号会被拼进安装目录里的路径，先按 layout 的规则挡掉非法值。
         if !version::valid(&info.version) {
             let shown = format!("{:?}", info.version);
@@ -280,6 +267,8 @@ impl Engine {
             );
             return;
         }
+        // 判重只有这里：服务端每轮心跳都带完整的一份，「这份我已经验过」由版本与
+        // 摘要决定——与下载进度无关，下载中、失败、已暂存都还是同一份，不重复下载。
         let same = self.update.offer.as_ref().is_some_and(|offer| {
             offer.version == info.version && offer.sha256.eq_ignore_ascii_case(&info.sha256)
         });

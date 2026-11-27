@@ -107,16 +107,13 @@ impl Client {
 
     /// `POST /api/v1/heartbeat`：`Ok(None)` 表示服务端回了 204（两边都没变）。
     ///
-    /// `app_update_known` 是客户端内存里最近一次收到的 `appUpdate.sha256`：服务端据此把
-    /// `appUpdate` 换成精简形状（只有 version/autoUpdate/unchanged），省掉每 30 秒重复一遍
-    /// 的 url/notes/sha256。**不进签名串**——它只影响下发多少内容，不影响授权；
-    /// `None`（还没收到过任何更新信息）时整个字段省略。
+    /// 请求里只有「我是谁、我现在的状态」：服务端据此决定要不要给配置与完整的最新
+    /// 发布信息。「这份我已经有了」由调用方按版本与摘要自己判，不往请求里塞摘要。
     pub fn heartbeat(
         &self,
         config_hash: &str,
         app_version: &str,
         credential_id: &str,
-        app_update_known: Option<&str>,
         timeout: Duration,
     ) -> Result<Option<Heartbeat>, Error> {
         let timestamp = unix_now().to_string();
@@ -133,7 +130,7 @@ impl Client {
             app_version,
         );
         let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
-        let mut body = serde_json::json!({
+        let body = serde_json::json!({
             "deviceId": self.device_id,
             "appVersion": app_version,
             "configHash": config_hash,
@@ -143,10 +140,6 @@ impl Client {
             "signature": signature,
             "platform": platform_id,
         });
-        // 没收到过更新信息就不带这个字段：带空串等于向服务端声明“我手上是一份空的发布”。
-        if let Some(known) = app_update_known.filter(|known| !known.is_empty()) {
-            body["appUpdateKnown"] = serde_json::Value::String(known.to_string());
-        }
         let body = body.to_string();
         let response = post(&self.url("/api/v1/heartbeat"), &body, timeout)?;
         if response.status() == 204 {
@@ -231,11 +224,8 @@ pub struct LauncherInfo {
 
 /// 服务端下发的客户端更新信息，只在设备版本更旧时出现。
 ///
-/// 有两种形状：
-///
-/// - 完整（默认）：version/url/notes/sha256/autoUpdate；
-/// - 精简（`unchanged: true`）：客户端上一轮已经把这份发布包的摘要报回来了，所以只带
-///   version/autoUpdate —— 服务端确认“你手上就是这份包”，内容不必再发一遍。
+/// 只有一种形状：version/url/notes/sha256/signature/autoUpdate 每次都在（notes 为空
+/// 时省略）。服务端不比较客户端手上有什么，「这份我有了」由引擎按版本与摘要自己判。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct UpdateInfo {
@@ -243,18 +233,15 @@ pub struct UpdateInfo {
     pub url: String,
     /// 为空时省略（`appNotes` 没填）。
     pub notes: String,
-    /// 发布包的完整摘要，空串表示服务端没有登记（早期记录）。
-    /// 精简形状里**没有**这个字段：客户端手上的那份就是它，不必再发。
+    /// 发布包的完整摘要，空串表示服务端没有登记（早期记录）。没有它就证明不了
+    /// 下载到的字节是发布的那一份，引擎会拒收这份 offer。
     pub sha256: String,
     /// 离线发布私钥对「{client, 平台, 版本, 摘要}」的签名（hex）。摘要只说明
-    /// 内容没被换过，签名才说明这份内容出自发布方；精简形状里没有它，也不需要
-    /// ——那份 offer 当初就是验过签才记住的。
+    /// 内容没被换过，签名才说明这份内容出自发布方。
     pub signature: String,
     /// 包级开关：这个版本该不该自己装，由发布方决定；本地
     /// `--disable-auto-update` 可以一票否决。缺失按手动处理。
     pub auto_update: bool,
-    /// 精简形状的标记：为真时 url/notes/sha256 都不可用，客户端应当沿用内存里的那份。
-    pub unchanged: bool,
 }
 
 /// 心跳响应。服务端没变化的字段不出现，所以每个字段都要能缺省。
@@ -530,7 +517,7 @@ mod tests {
     fn heartbeat_is_signed_and_204_is_none() {
         let stub = Stub::new(vec![response(204, &[], b"")]);
         let reply = client(&stub.base_url)
-            .heartbeat("hash", "2026.11.26-13", "cred-1", None, timeout())
+            .heartbeat("hash", "2026.11.26-13", "cred-1", timeout())
             .unwrap();
         assert!(reply.is_none());
         let captured = stub.captured.lock().unwrap();
@@ -569,63 +556,17 @@ mod tests {
     }
 
     #[test]
-    fn app_update_known_is_omitted_when_empty() {
+    fn the_heartbeat_body_carries_no_update_digest() {
         let stub = Stub::new(vec![response(204, &[], b"")]);
-        // 两种“没有”：None（从没收到过更新）与空串（收到过但没有摘要）。
         client(&stub.base_url)
-            .heartbeat("hash", "v", "none", None, timeout())
+            .heartbeat("hash", "v", "none", timeout())
             .unwrap();
         let body = stub.last_body();
+        // 请求里只有「我是谁、我现在的状态」：手上那份发布包不进请求，判重在客户端。
         assert!(
             body.get("appUpdateKnown").is_none(),
-            "没收到过更新时不该带这个字段: {body}"
+            "心跳请求不该带发布摘要: {body}"
         );
-    }
-
-    #[test]
-    fn app_update_known_is_sent_but_not_signed() {
-        let stub = Stub::new(vec![response(204, &[], b"")]);
-        let known = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        client(&stub.base_url)
-            .heartbeat("hash", "2026.11.26-13", "cred-1", Some(known), timeout())
-            .unwrap();
-        let body = stub.last_body();
-        assert_eq!(body["appUpdateKnown"], known);
-        // 关键：签名原文里没有它。按契约的八行拼回去必须验签通过，否则控制面会把
-        // 每一轮心跳都判成 401。
-        let message = signing_string(
-            "POST",
-            "/api/v1/heartbeat",
-            body["deviceId"].as_str().unwrap(),
-            body["timestamp"].as_str().unwrap(),
-            body["nonce"].as_str().unwrap(),
-            body["platform"].as_str().unwrap(),
-            body["configHash"].as_str().unwrap(),
-            body["appVersion"].as_str().unwrap(),
-        );
-        assert!(!message.contains(known), "appUpdateKnown 进了签名串");
-        let signature = BASE64.decode(body["signature"].as_str().unwrap()).unwrap();
-        let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
-        let verifying = SigningKey::from_bytes(&[7u8; 32]).verifying_key();
-        verifying.verify(message.as_bytes(), &signature).unwrap();
-    }
-
-    #[test]
-    fn a_slim_update_is_parsed() {
-        // 精简形状：只有 version + autoUpdate + unchanged，没有 url/notes/sha256。
-        let body =
-            r#"{"appUpdate":{"version":"2026.11.26-18","autoUpdate":true,"unchanged":true}}"#;
-        let stub = Stub::new(vec![response(200, &[], body.as_bytes())]);
-        let reply = client(&stub.base_url)
-            .heartbeat("hash", "2026.11.26-13", "none", Some("abc"), timeout())
-            .unwrap()
-            .unwrap();
-        let update = reply.app_update.expect("应当带 appUpdate");
-        assert!(update.unchanged);
-        assert!(update.auto_update);
-        assert_eq!(update.version, "2026.11.26-18");
-        assert_eq!(update.url, "");
-        assert_eq!(update.sha256, "");
     }
 
     #[test]
@@ -636,7 +577,7 @@ mod tests {
         );
         let stub = Stub::new(vec![response(200, &[], body.as_bytes())]);
         let reply = client(&stub.base_url)
-            .heartbeat("hash", "2026.11.26-13", "none", None, timeout())
+            .heartbeat("hash", "2026.11.26-13", "none", timeout())
             .unwrap()
             .unwrap();
         assert_eq!(reply.config_hash, "h2");
@@ -655,7 +596,7 @@ mod tests {
     fn a_204_with_no_fields_leaves_everything_empty() {
         let stub = Stub::new(vec![response(200, &[], b"{}")]);
         let reply = client(&stub.base_url)
-            .heartbeat("hash", "v", "none", None, timeout())
+            .heartbeat("hash", "v", "none", timeout())
             .unwrap()
             .unwrap();
         assert_eq!(reply.config_hash, "");
@@ -672,7 +613,7 @@ mod tests {
             br#"{"code":"revoked"}"#,
         )]);
         let error = client(&stub.base_url)
-            .heartbeat("hash", "v", "none", None, timeout())
+            .heartbeat("hash", "v", "none", timeout())
             .unwrap_err();
         match error {
             Error::Unauthorized { code, server_time } => {

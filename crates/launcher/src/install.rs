@@ -1,6 +1,7 @@
 use crate::args::Source;
 use crate::launch;
 use crate::log;
+use mesh_install::artifact;
 use mesh_install::failures::Failures;
 use mesh_install::layout;
 use mesh_install::lock::{acquire as acquire_lock, Lock};
@@ -9,7 +10,6 @@ use mesh_install::platform;
 use mesh_install::signing;
 use mesh_install::version;
 use mesh_text::id;
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -965,29 +965,11 @@ pub(crate) fn package_version(pkg: &Path) -> Result<String, String> {
     Ok(read_manifest(pkg)?.version().to_string())
 }
 
+/// 包、或 `bin/` 里某个文件的完整摘要。读不动时带上路径与系统错误：两条调用
+/// 路径都要说清是哪个文件、为什么读不了。
 fn sha256_file(path: &Path) -> Result<String, String> {
-    let mut file = File::open(path)
-        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_OPEN_PACKAGE, &[&path.display(), &e]))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 256 * 1024];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_FILE, &[&path.display(), &e]))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        out.push_str(&format!("{b:02x}"));
-    }
-    out
+    artifact::digest(path)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_READ_FILE, &[&path.display(), &e]))
 }
 
 /// boot_marker 是客户端确认启动后写的文件。token 由启动器生成，保证“上一次启动
@@ -1161,8 +1143,18 @@ fn copy_bounded_inner<R: Read>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+
+    /// 小写十六进制。造摘要与签名只发生在测试里，生产代码不再需要它。
+    fn hex(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            out.push_str(&format!("{b:02x}"));
+        }
+        out
+    }
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

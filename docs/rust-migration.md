@@ -132,7 +132,8 @@ registry = "sparse+https://rsproxy.cn/index/"
   后恢复状态；401 严格照 `sync.go` 三支（`revoked` 立即清身份、时钟偏差 >300s 只降级、其余
   连续 3 次才清）。
 - 身份与凭据：上报 core **实际加载**的那张凭据（F1）；正式节点报空串；换凭据才重启 core。
-- 更新：`offer_update` 校验版本号/不比当前新/失败计数；Windows 先预取到 `update.tar.zst.part`
+- 更新：`offer_update` 校验版本号/不比当前新/失败计数；版本与摘要都与手上那份相同即同一份
+  offer，只更新 `autoUpdate`，不重下；Windows 先预取到 `update.tar.zst.part`
   → 校验摘要 → 改名成 `update.tar.zst`；Unix 在用户点安装时下载再交接；**服务端没给摘要一律
   拒绝**。启动器另走一路（比摘要、只试一次）。
 - 面板点「立即更新」会先让进程退出，请求在回复之前就断了：前端把「连不上」当成安装信号，
@@ -142,28 +143,9 @@ registry = "sparse+https://rsproxy.cn/index/"
   错误行留在界面上。面板上失败态的「重试」走 `apply_update`：本地没有包时它重新下一份、
   下完直接交接，所以“重试”在“包没下完”和“包已下好但安装失败”两种失败上都成立。
 
-### 心跳里的更新载荷瘦身（`appUpdateKnown` / `unchanged`）
-
-心跳响应里的 `appUpdate` 以前每轮都带 version/url/notes/sha256/autoUpdate，设备不升级时这份
-数据每 30 秒重复一次。现在照 `configHash` 的老办法给它加了个指纹：
-
-- **请求**：心跳体可选带 `"appUpdateKnown": "<64 位 sha256>"`，值是**内存里**最近一份
-  `appUpdate.sha256`（不是版本号：同版本重新发布时内容会变，只有摘要能表达“我手上是哪一份”）。
-  没收到过就整个字段省略。**不进签名串**——它只影响下发多少内容，不影响授权。
-- **响应**：指纹与发布记录一致时服务端回精简形状 `{version, autoUpdate, unchanged: true}`；
-  否则回完整形状（不带 `unchanged`）。`appUpdate` 仍然只在“设备版本更低”时出现。
-
-客户端的落点：
-
-- 记忆就是 `UpdateState.sha256`，**没有**单开一个字段：它本来就是“内存里这份 offer 的摘要”，
-  与进度（`phase`）无关。`Published.beat.app_update_known` 在每次发布快照时从它派生，心跳线程
-  只读。`clear_stale_update()` 清掉 offer 时它自然变成 `None`——不存在“清了 offer 忘了清 known”
-  的分叉。重启后内存为空 → 不带该字段 → 服务端回完整内容。
-- `offer_update` 收到 `unchanged`：只更新 `auto_update`（管理员可能刚改过设备级覆盖），**不校验
-  url、不下载、不写日志、不动 phase/version/notes/path**。精简形状里本来就没有 url，走完整
-  分支的任何一步都会被当成“新下发”，把已经就绪的包重置成待下载。
-- 摘要也参与去重：同一版本号、不同摘要 = 重新发布过的新包，要换掉手里的 offer；同版本同摘要
-  才按“手上就是它”跳过。
+- 心跳不报「我手上有哪一份发布」：服务端每轮都带完整的一份，判重在客户端——
+  「这份我已经验过」只看版本与摘要，与进度（`phase`）无关；同版本号不同摘要 = 重新发布过的
+  新包，要换掉手里的 offer。
 - `autoUpdate` 照单全收（它已经是控制面覆盖后的值），本地 `--disable-auto-update` 仍是唯一的
   一票否决。
 - 退出：`Shutdown` 注册“停 core”一步，`run_and_exit` 幂等；引擎在收尾开始后不再处理命令。

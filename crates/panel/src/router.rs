@@ -5,9 +5,8 @@
 
 use crate::assets;
 use crate::guard;
-use mesh_engine::{
-    build_nodes, Cmd, LocalNode, NodeRow, Published, SettingsInput, Snapshot, StateCell,
-};
+use crate::topology::{self, build_nodes, LocalNode, NodeRow};
+use mesh_engine::{Cmd, Published, SettingsInput, Snapshot, StateCell};
 use mesh_etrpc::{Peer, Route};
 use mesh_text::id;
 use serde::{Deserialize, Serialize};
@@ -95,12 +94,13 @@ impl Response {
         }
     }
 
-    fn method_not_allowed(allow: &'static str) -> Response {
+    /// 405：`Allow` 头由这个方法集合拼出来，因此不可能与实际接受的方法不一致。
+    fn method_not_allowed(allowed: &[&str]) -> Response {
         Response {
             status: 405,
             content_type: "text/plain; charset=utf-8",
             cache_control: None,
-            extra_headers: vec![("Allow", allow.to_string())],
+            extra_headers: vec![("Allow", allowed.join(", "))],
             body: b"Method Not Allowed\n".to_vec(),
             after_send: None,
         }
@@ -119,6 +119,10 @@ impl Response {
         }
     }
 }
+
+/// 表示 GET 的方法集合。Go 1.22 的 ServeMux 里注册 `GET` 的路径同时接受 `HEAD`，
+/// 静态资源与四条查询路由都按这一条走，所以这对方法名只在这里写一遍。
+const GET_METHODS: &[&str] = &["GET", "HEAD"];
 
 /// 十个 /api 路由。表格（Go 方法、Rust 路径、处理函数）见 README 的「面板路由」。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -152,27 +156,20 @@ impl ApiRoute {
         })
     }
 
-    /// GET 的注册同时接受 HEAD（Go 1.22 的 ServeMux 语义），其余方法严格匹配。
-    fn accepts(self, method: &str) -> bool {
+    /// 这条路由接受哪些方法。方法集合的唯一出处：接受判据与 405 的 `Allow` 头都
+    /// 从它推导。
+    fn methods(self) -> &'static [&'static str] {
         match self {
             ApiRoute::Snapshot | ApiRoute::Dashboard | ApiRoute::Logs | ApiRoute::Events => {
-                method == "GET" || method == "HEAD"
+                GET_METHODS
             }
-            ApiRoute::Settings | ApiRoute::Autostart => method == "PUT",
-            ApiRoute::Reset | ApiRoute::Update | ApiRoute::Reconnect | ApiRoute::Quit => {
-                method == "POST"
-            }
+            ApiRoute::Settings | ApiRoute::Autostart => &["PUT"],
+            ApiRoute::Reset | ApiRoute::Update | ApiRoute::Reconnect | ApiRoute::Quit => &["POST"],
         }
     }
 
-    fn allow(self) -> &'static str {
-        match self {
-            ApiRoute::Snapshot | ApiRoute::Dashboard | ApiRoute::Logs | ApiRoute::Events => {
-                "GET, HEAD"
-            }
-            ApiRoute::Settings | ApiRoute::Autostart => "PUT",
-            _ => "POST",
-        }
+    fn accepts(self, method: &str) -> bool {
+        self.methods().contains(&method)
     }
 }
 
@@ -258,7 +255,7 @@ impl Router {
     pub(crate) fn handle(&self, request: Request) -> Response {
         if let Some(route) = ApiRoute::from_path(&request.path) {
             if !route.accepts(&request.method) {
-                return Response::method_not_allowed(route.allow());
+                return Response::method_not_allowed(route.methods());
             }
             // guard 只罩 /api：静态页面本身没有副作用，Go 也没给它加 guard。
             if !guard::loopback_host(&request.host) {
@@ -269,8 +266,8 @@ impl Router {
             }
             return self.dispatch(route, request);
         }
-        if request.method != "GET" && request.method != "HEAD" {
-            return Response::method_not_allowed("GET, HEAD");
+        if !GET_METHODS.contains(&request.method.as_str()) {
+            return Response::method_not_allowed(GET_METHODS);
         }
         assets::serve(&request.path)
     }
@@ -309,7 +306,7 @@ impl Router {
                     &peers,
                     &routes,
                     LocalNode {
-                        ip: strip_cidr(&snapshot.local_ip).to_string(),
+                        ip: topology::strip_cidr(&snapshot.local_ip).to_string(),
                         hostname: snapshot.hostname.clone(),
                         version: snapshot.core_version.clone(),
                         nat: snapshot.nat_type_udp.clone(),
@@ -503,13 +500,6 @@ fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
-}
-
-fn strip_cidr(ip: &str) -> &str {
-    match ip.find('/') {
-        Some(index) => &ip[..index],
-        None => ip,
-    }
 }
 
 /// 查询缓存的判据只在这里测：`Cache` 是 router 的私有类型，`tests.rs` 里的路由

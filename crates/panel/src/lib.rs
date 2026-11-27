@@ -10,6 +10,7 @@ mod assets;
 mod guard;
 mod http;
 mod router;
+mod topology;
 mod ui;
 
 #[cfg(test)]

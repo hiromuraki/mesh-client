@@ -933,19 +933,6 @@ fn update_info(version: &str) -> remote::UpdateInfo {
         signature: sign_release(remote::signing::SLOT_CLIENT, version, &sha256),
         sha256,
         auto_update: false,
-        unchanged: false,
-    }
-}
-
-fn slim_update_info(version: &str, auto_update: bool) -> remote::UpdateInfo {
-    remote::UpdateInfo {
-        version: version.to_string(),
-        url: String::new(),
-        notes: String::new(),
-        sha256: String::new(),
-        signature: String::new(),
-        auto_update,
-        unchanged: true,
     }
 }
 
@@ -981,11 +968,6 @@ fn failed_artifact(attempts: u32, retry_in: i64) -> Artifact {
     }
 }
 
-fn beat_known(harness: &mut Harness) -> Option<String> {
-    harness.engine.publish();
-    harness.engine.cell.get().beat.app_update_known.clone()
-}
-
 #[test]
 fn an_invalid_version_is_ignored_before_downloading() {
     let mut harness = harness("update-invalid");
@@ -1011,6 +993,8 @@ fn a_failure_is_kept_until_the_backoff_expires() {
     harness
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
+    // 有意图才在两种平台上都走「准备工件」这条路：Unix 无意图时不预取。
+    harness.engine.update.intent = Some(Intent::Manual);
     harness.engine.update.task = None;
     harness.engine.update.artifact = failed_artifact(1, 30);
     // 退避还没到：心跳既不能把失败态抹掉，也不能抢着重下。
@@ -1032,6 +1016,9 @@ fn a_failed_download_is_retried_once_the_backoff_expires() {
         .offer_update(Some(&update_info("2026.11.26-2")));
     harness.engine.update.task = None;
     harness.engine.update.artifact = failed_artifact(1, -1);
+    // 走「有意图 → try_apply → 工件失败 → prepare 重下」这条两种平台都有的路径：
+    // 没有意图时 Unix 不预取（见 prepare 的平台判据），只靠心跳推不动重下。
+    harness.engine.update.intent = Some(Intent::Manual);
     harness.engine.advance_update();
     assert_eq!(
         harness.engine.update.phase(),
@@ -1040,6 +1027,24 @@ fn a_failed_download_is_retried_once_the_backoff_expires() {
     assert!(
         harness.engine.update.error().is_empty(),
         "重试时错误行要清掉"
+    );
+}
+
+/// Windows 收到 offer 就自己预取，不需要安装意图；Unix 等用户点安装才下载。
+/// 这条差异只能由平台专属的断言表达。
+#[cfg(windows)]
+#[test]
+fn a_windows_engine_prefetches_without_an_intent() {
+    let mut harness = harness("update-prefetch");
+    api(&mut harness);
+    harness
+        .engine
+        .offer_update(Some(&update_info("2026.11.26-2")));
+    assert!(harness.engine.update.intent.is_none());
+    harness.engine.advance_update();
+    assert_eq!(
+        harness.engine.update.phase(),
+        crate::update::Phase::Downloading
     );
 }
 
@@ -1052,6 +1057,8 @@ fn downloading_gives_up_after_the_attempt_limit() {
         .offer_update(Some(&update_info("2026.11.26-2")));
     harness.engine.update.task = None;
     harness.engine.update.artifact = failed_artifact(5, -1);
+    // 意图摆上，判的才是次数上限本身，而不是「Unix 无意图不预取」。
+    harness.engine.update.intent = Some(Intent::Manual);
     harness.engine.advance_update();
     assert_eq!(
         harness.engine.update.phase(),
@@ -1114,35 +1121,17 @@ fn a_new_version_resets_the_failure() {
     );
 }
 
+/// 服务端每轮心跳都带完整的一份，「这份我已经验过」由版本与摘要判：同一份不再
+/// 下载，策略字段照样跟着最新下发值走。
 #[test]
-fn nothing_is_reported_before_the_first_offer() {
-    let mut harness = harness("known-none");
-    assert!(beat_known(&mut harness).is_none());
-    assert!(harness.engine.known_app_update().is_none());
-}
-
-#[test]
-fn a_full_offer_is_reported_in_the_next_heartbeat() {
-    let mut harness = harness("known-full");
-    api(&mut harness);
-    harness
-        .engine
-        .offer_update(Some(&update_info("2026.11.26-2")));
-    assert_eq!(
-        beat_known(&mut harness).as_deref(),
-        Some(digest(0xab).as_str())
-    );
-}
-
-#[test]
-fn a_slim_offer_keeps_the_offer_and_does_not_download() {
-    let mut harness = harness("known-slim");
+fn the_same_offer_is_not_downloaded_again() {
+    let mut harness = harness("same-offer");
     api(&mut harness);
     let (state, _) = staged_offer(&harness, "2026.11.26-2", &digest(0xab));
     harness.engine.update = state;
     harness
         .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", false)));
+        .offer_update(Some(&update_info("2026.11.26-2")));
     harness.engine.advance_update();
 
     let update = &harness.engine.update;
@@ -1152,40 +1141,23 @@ fn a_slim_offer_keeps_the_offer_and_does_not_download() {
     assert!(!update.offer.as_ref().unwrap().auto);
     assert!(matches!(update.artifact, Artifact::Staged(_)));
     assert!(update.task.is_none());
-    assert_eq!(
-        beat_known(&mut harness).as_deref(),
-        Some(digest(0xab).as_str())
-    );
-    // 策略字段本身随精简响应更新，但不会因此重下或重置进度。
-    harness
-        .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", true)));
+    // 策略字段随下发值更新，但不会因此重下或重置进度。
+    let mut allowed = update_info("2026.11.26-2");
+    allowed.auto_update = true;
+    harness.engine.offer_update(Some(&allowed));
     assert!(harness.engine.update.offer.as_ref().unwrap().auto);
 }
 
 #[test]
-fn a_slim_offer_with_nothing_known_is_a_no_op() {
-    let mut harness = harness("known-slim-empty");
-    api(&mut harness);
-    harness
-        .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", true)));
-    harness.engine.advance_update();
-    assert!(harness.engine.update.offer.is_none());
-    assert!(beat_known(&mut harness).is_none());
-}
-
-#[test]
-fn clearing_the_offer_stops_reporting_it() {
+fn clearing_the_offer_withdraws_it() {
     let mut harness = harness("known-clear");
     api(&mut harness);
     harness
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
-    assert!(beat_known(&mut harness).is_some());
+    assert!(harness.engine.update.offer.is_some());
     harness.engine.clear_stale_update();
     assert!(harness.engine.update.offer.is_none());
-    assert!(beat_known(&mut harness).is_none());
 }
 
 #[test]
@@ -1506,9 +1478,10 @@ fn a_failed_launcher_replacement_keeps_the_facts() {
     assert_eq!(harness.engine.launcher.installed_sum, digest(0xdd));
 }
 
+/// 同一份 offer 重来一遍不会掐死下载重试：判重只更新策略，重试仍归状态机。
 #[test]
-fn a_failed_download_is_retried_on_a_slim_offer() {
-    let mut harness = harness("slim-retry");
+fn a_failed_download_is_retried_when_the_same_offer_comes_back() {
+    let mut harness = harness("same-retry");
     api(&mut harness);
     harness
         .engine
@@ -1516,29 +1489,14 @@ fn a_failed_download_is_retried_on_a_slim_offer() {
     harness.engine.update.artifact = failed_artifact(1, -1);
     harness
         .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", false)));
+        .offer_update(Some(&update_info("2026.11.26-2")));
+    // 判重不动意图：把意图摆上，才走两种平台都有的「有意图 → prepare 重下」路径。
+    harness.engine.update.intent = Some(Intent::Manual);
     harness.engine.advance_update();
     assert_eq!(
         harness.engine.update.phase(),
         crate::update::Phase::Downloading
     );
-}
-
-#[test]
-fn a_ready_offer_is_left_alone_by_a_slim_offer() {
-    let mut harness = harness("slim-ready");
-    api(&mut harness);
-    let (state, _) = staged_offer(&harness, "2026.11.26-2", &digest(0xab));
-    harness.engine.update = state;
-    harness
-        .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", false)));
-    harness.engine.advance_update();
-    assert_eq!(harness.engine.update.phase(), crate::update::Phase::Ready);
-    assert!(matches!(
-        harness.engine.update.artifact,
-        Artifact::Staged(_)
-    ));
 }
 
 #[test]
@@ -1578,9 +1536,7 @@ fn the_switch_is_taken_as_given_with_a_local_veto() {
     harness.engine.offer_update(Some(&info));
     assert!(harness.engine.update.offer.as_ref().unwrap().auto);
     harness.engine.config.auto_update_disabled = true;
-    harness
-        .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", true)));
+    harness.engine.offer_update(Some(&info));
     assert!(!harness.engine.update.offer.as_ref().unwrap().auto);
 }
 
@@ -1730,7 +1686,7 @@ fn an_auto_intent_is_dropped_when_the_policy_turns_off() {
     harness.engine.update = state;
     harness
         .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", false)));
+        .offer_update(Some(&update_info("2026.11.26-2")));
     harness.engine.advance_update();
     assert!(harness.engine.update.intent.is_none());
     assert!(matches!(
@@ -1749,7 +1705,7 @@ fn a_manual_intent_survives_a_policy_change() {
     // 手动安装与自动策略无关：关掉开关也不该取消。
     harness
         .engine
-        .offer_update(Some(&slim_update_info("2026.11.26-2", false)));
+        .offer_update(Some(&update_info("2026.11.26-2")));
     let owner =
         mesh_install::lock::acquire(&mesh_install::lock::Lock::owner_path(&harness.dir)).unwrap();
     harness.engine.advance_update();

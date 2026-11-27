@@ -26,7 +26,7 @@ mod tests;
 
 pub use log::{events, logs, Line, Log};
 pub use run::{spawn, Cmd, Config, Notice, SettingsInput, Status};
-pub use views::{build_nodes, BeatInput, Hop, LocalNode, NodeRow, Published, Snapshot, StateCell};
+pub use views::{BeatInput, Published, Snapshot, StateCell};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;

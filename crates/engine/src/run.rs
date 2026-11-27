@@ -523,7 +523,6 @@ impl Engine {
                     &request.hash,
                     &request.app_version,
                     &request.credential_id,
-                    request.known.as_deref(),
                     HEARTBEAT_TIMEOUT,
                 );
                 let _ = tx.send(Cmd::Heartbeat { gen, result });
@@ -560,7 +559,6 @@ impl Engine {
             hash: self.hash(),
             app_version: self.config.self_version.clone(),
             credential_id: self.credential_id(),
-            known: self.known_app_update(),
         })
     }
 
@@ -1165,7 +1163,6 @@ impl Engine {
             &request.hash,
             &request.app_version,
             &request.credential_id,
-            request.known.as_deref(),
             HEARTBEAT_TIMEOUT,
         );
         self.on_heartbeat(gen, result);
@@ -1178,7 +1175,6 @@ struct BeatRequest {
     hash: String,
     app_version: String,
     credential_id: String,
-    known: Option<String>,
 }
 
 /// 身份代次：控制面地址 + 设备 id。

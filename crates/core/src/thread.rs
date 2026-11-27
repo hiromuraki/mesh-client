@@ -39,8 +39,7 @@ pub(crate) fn spawn(
             events,
             sink,
             options,
-            running: None,
-            pending: None,
+            lifecycle: Lifecycle::Idle,
         }
         .run();
     });
@@ -67,13 +66,26 @@ struct Pending {
     last: Option<String>,
 }
 
+/// core 线程手里的那一个进程。四种状态互斥，句柄只出现在后三种里：用两个
+/// `Option` 时「同时有就绪的和探测中的」只是一条调用顺序上的约定，这里它写不出来。
+enum Lifecycle {
+    /// 没有 core 进程。
+    Idle,
+    /// 已拉起、还没确认就绪（引擎还没收到 `Started`）。
+    Probing(Pending),
+    /// 已确认就绪，引擎知道它在跑。
+    Ready(Running),
+    /// 上一步没能停下来：句柄还在（它是唯一能证明「它还在」的东西），下一次
+    /// Stop 或 Start 仍先要收拾它，所以不能退回空闲。
+    Stuck(Running),
+}
+
 struct CoreThread {
     cmds: Receiver<Cmd>,
     events: EventSink,
     sink: LineSink,
     options: Options,
-    running: Option<Running>,
-    pending: Option<Pending>,
+    lifecycle: Lifecycle,
 }
 
 impl CoreThread {
@@ -101,18 +113,41 @@ impl CoreThread {
         (self.events)(event);
     }
 
-    /// 子进程自己退出时在这里收尸。
+    /// 把状态换成空闲并交还旧值：调用方随后放回新的那一态。
+    fn take(&mut self) -> Lifecycle {
+        std::mem::replace(&mut self.lifecycle, Lifecycle::Idle)
+    }
+
+    /// 取走探测中的那一代；别的状态原样留着。
+    fn take_probing(&mut self) -> Option<Pending> {
+        match self.take() {
+            Lifecycle::Probing(pending) => Some(pending),
+            other => {
+                self.lifecycle = other;
+                None
+            }
+        }
+    }
+
+    /// 子进程自己退出时在这里收尸。只收持句柄的那两态：探测中的退出由
+    /// `poll_ready` 的探测发现，那条路径要报 `StartFailed`，不是 `Exited`。
     fn reap(&mut self) {
-        let exited = match self.running.as_mut() {
-            None => return,
-            Some(running) => match running.child.try_wait() {
+        let exited = match &mut self.lifecycle {
+            Lifecycle::Ready(running) | Lifecycle::Stuck(running) => match running.child.try_wait()
+            {
                 Ok(Some(status)) => Ok(Some(status)),
                 Ok(None) => return,
                 Err(err) => Err(err),
             },
+            Lifecycle::Idle | Lifecycle::Probing(_) => return,
         };
-        let Some(running) = self.running.take() else {
-            return;
+        // 确认它已经退出，句柄才可以收走。
+        let running = match self.take() {
+            Lifecycle::Ready(running) | Lifecycle::Stuck(running) => running,
+            other => {
+                self.lifecycle = other;
+                return;
+            }
         };
         for pump in running.pumps {
             let _ = pump.join();
@@ -133,14 +168,13 @@ impl CoreThread {
     }
 
     fn start(&mut self, spec: StartSpec) {
-        if self.running.is_some() || self.pending.is_some() {
-            if let Err(reason) = self.stop(false) {
-                self.emit(Event::StartFailed {
-                    gen: spec.gen,
-                    reason,
-                });
-                return;
-            }
+        // 一次 Start 就是一次替换：还在跑、或上一次停不掉的那一代先停掉。
+        if let Err(reason) = self.stop(false) {
+            self.emit(Event::StartFailed {
+                gen: spec.gen,
+                reason,
+            });
+            return;
         }
         let running = match self.launch(&spec) {
             Ok(running) => running,
@@ -154,7 +188,7 @@ impl CoreThread {
         };
         // 探测交给命令循环逐拍推进：拉起与确认就绪之间不再挡住 Stop。
         let now = Instant::now();
-        self.pending = Some(Pending {
+        self.lifecycle = Lifecycle::Probing(Pending {
             running,
             rpc: spec.rpc_addr,
             expect: spec.expect,
@@ -167,49 +201,37 @@ impl CoreThread {
     /// 推进一次就绪探测。每个 TICK 调用一次，到点才真的查一次；查询本身最多
     /// `probe_timeout`，所以 Stop 的等待有上界。
     fn poll_ready(&mut self) {
-        let now = Instant::now();
-        let (rpc, expired, due) = match self.pending.as_ref() {
-            None => return,
-            Some(pending) => (
-                pending.rpc,
-                now >= pending.deadline,
-                now >= pending.next_probe,
-            ),
+        let Some(mut pending) = self.take_probing() else {
+            return;
         };
-        if expired {
-            let pending = self.pending.take().expect("pending if present");
+        let now = Instant::now();
+        if now >= pending.deadline {
+            // 到时限还没确认就绪：停掉那个进程，报启动失败。
             self.fail_ready(pending);
             return;
         }
-        if !due {
+        if now < pending.next_probe {
+            self.lifecycle = Lifecycle::Probing(pending);
             return;
         }
-        let outcome = {
-            let Some(pending) = self.pending.as_mut() else {
-                return;
-            };
-            pending.next_probe = now + self.options.ready_interval;
-            probe::attempt(
-                &mut pending.running.child,
-                rpc,
-                &pending.expect,
-                &self.options,
-            )
-        };
+        pending.next_probe = now + self.options.ready_interval;
+        let outcome = probe::attempt(
+            &mut pending.running.child,
+            pending.rpc,
+            &pending.expect,
+            &self.options,
+        );
         match outcome {
             Attempt::NotYet(why) => {
-                if let Some(pending) = self.pending.as_mut() {
-                    pending.last = Some(why);
-                }
+                pending.last = Some(why);
+                self.lifecycle = Lifecycle::Probing(pending);
             }
             Attempt::Ready(node) => {
-                let pending = self.pending.take().expect("pending if present");
                 let (gen, pid) = (pending.running.gen, pending.running.pid);
-                self.running = Some(pending.running);
+                self.lifecycle = Lifecycle::Ready(pending.running);
                 self.emit(Event::Started { gen, pid, node });
             }
             Attempt::Exited(status) => {
-                let pending = self.pending.take().expect("pending if present");
                 let running = pending.running;
                 for pump in running.pumps {
                     let _ = pump.join();
@@ -231,8 +253,9 @@ impl CoreThread {
         let reason = pending
             .last
             .unwrap_or_else(|| mesh_text::get(mesh_text::id::CORE_TEXT_TIMEOUT).to_string());
-        // 探测期间进程可能已经半起来：先当成“在跑”交给 stop 处理，停不掉就报出来。
-        self.running = Some(pending.running);
+        // 探测期间进程可能已经半起来：先当成“就绪”交给 stop 处理，停不掉就记成
+        // 「未能停止」。
+        self.lifecycle = Lifecycle::Ready(pending.running);
         let stop_note = match self.stop(false) {
             Ok(()) => String::new(),
             Err(err) => mesh_text::format(mesh_text::id::CORE_ERROR_STOP_FAILED, &[&err]),
@@ -334,17 +357,16 @@ impl CoreThread {
     /// 停止 core。`report_exit` 为真时发 `Exited`（对应 Go 里关闭 Done）：
     /// 引擎按代号忽略自己主动停掉的那一代，所以这里照发不误。
     fn stop(&mut self, report_exit: bool) -> Result<(), String> {
-        // 探测中的那一代引擎还没收到 Started：停掉它，但不补 Exited。
-        if let Some(pending) = self.pending.take() {
-            return self.stop_process(pending.running, false);
-        }
-        let Some(running) = self.running.take() else {
-            return Ok(());
+        let (running, report_exit) = match self.take() {
+            Lifecycle::Idle => return Ok(()),
+            // 探测中的那一代引擎还没收到 Started：停掉它，但不补 Exited。
+            Lifecycle::Probing(pending) => (pending.running, false),
+            Lifecycle::Ready(running) | Lifecycle::Stuck(running) => (running, report_exit),
         };
         self.stop_process(running, report_exit)
     }
 
-    /// 停一个 core 进程并等输出泵收尾。停不掉时把句柄放回 running：句柄是唯一
+    /// 停一个 core 进程并等输出泵收尾。停不掉时把句柄放回「未能停止」：句柄是唯一
     /// 能证明「它还在」的东西，丢掉它就等于以为它停了，下一次 Start 会再起一个
     /// 抢同一个虚拟 IP。
     fn stop_process(&mut self, running: Running, report_exit: bool) -> Result<(), String> {
@@ -360,7 +382,7 @@ impl CoreThread {
                 Ok(())
             }
             Err((running, err)) => {
-                self.running = Some(running);
+                self.lifecycle = Lifecycle::Stuck(running);
                 Err(err)
             }
         }

@@ -175,7 +175,7 @@ impl Client {
     pub fn register(&self, token: &str, hostname: &str, pubkey_b64: &str, timeout: Duration)
         -> Result<RegisterReply, Error>;
     pub fn heartbeat(&self, config_hash: &str, app_version: &str, credential_id: &str,
-                     app_update_known: Option<&str>, timeout: Duration)
+                     timeout: Duration)
         -> Result<Option<Heartbeat>, Error>;  // None == 204
     pub fn download(&self, url: &str, dst: &Path, limit: u64, timeout: Duration)
         -> Result<u64, Error>;
@@ -246,7 +246,7 @@ pub fn spawn(events: Sender<Event>, on_line: impl Fn(&str) + Send + 'static) -> 
 
 ### 3.6 `mesh-engine`
 
-**职责**：状态机，也是唯一可变状态的拥有者。内部按 Go 的拆法分模块：`state`（Status/identity/update/计数器）、`lifecycle`（连接循环、代次、退避）、`heartbeat`、`sync`、`core`（与 core 线程的协议）、`settings`、`update`、`views`（快照、仪表盘、日志视图、路径还原）、`autostart`（`cfg(windows)`）、`log`（logbook）。
+**职责**：状态机，也是唯一可变状态的拥有者。内部按 Go 的拆法分模块：`state`（Status/identity/update/计数器）、`lifecycle`（连接循环、代次、退避）、`heartbeat`、`sync`、`core`（与 core 线程的协议）、`settings`、`update`、`views`（快照、日志视图）、`autostart`（`cfg(windows)`）、`log`（logbook）。
 
 **对外 API**：
 
@@ -271,23 +271,21 @@ pub enum Notice { ActionFailed(String) }  // 用户动作失败 → client 弹�
 // 发布给其它线程的只读视图。除快照外还带两样别的线程要用、但不该回问引擎的东西：
 // 心跳线程组请求要的三个参数，以及面板自己查 core 时需要的 rpc 地址。
 pub struct Published { snapshot: Snapshot, beat: BeatInput, rpc: Option<SocketAddr>, core_gen: u64 }
-pub struct BeatInput { config_hash: String, credential_id: String, app_version: String,
-                        app_update_known: Option<String> }
+pub struct BeatInput { config_hash: String, credential_id: String, app_version: String }
 pub struct StateCell(RwLock<Arc<Published>>);   // 面板与托盘同步只读它
 pub fn logs(path: &Path, n: usize) -> Vec<Line>;      // 纯函数，读文件
 pub fn events(path: &Path, n: usize) -> Vec<Line>;
-pub fn build_nodes(peers: &[Peer], routes: &[Route], local: LocalNode) -> Vec<NodeRow>;
 ```
 
 **拥有的状态**：全部。`status`、`last_error`、`cfg`、`core_running`/`core_pid`/`core_cred_id`、`local_ip`、`stun`、`core_version`、`identity`、`update{phase,version,notes,url,sha256,path,sum,err}`、`auth_fails`、`revive_attempt`/`core_started_at`、`autostart_on`、`launcher_sum`/`launcher_tried`/`auto_tried`。**没有一个被 `Mutex` 保护**，因为只有引擎线程读写；对外只发布只读副本（`Published`）。
 
-`beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定、`app_update_known` 取内存里那份 offer 的摘要（`None` 时整个字段省略）。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。`core_gen` 是引擎给每代 core 分配、只增的代次（`0` 表示还没有 core 进过），与 `rpc` 一起标识「哪个 core 实例」：重启后即使复用同一个回环端口，代次也不同。
+`beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。`core_gen` 是引擎给每代 core 分配、只增的代次（`0` 表示还没有 core 进过），与 `rpc` 一起标识「哪个 core 实例」：重启后即使复用同一个回环端口，代次也不同。
 
 **依赖**：`mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`。
 
 ### 3.7 `mesh-panel`
 
-**职责**：本地面板。回环监听（11020 起顺延 20 个）、`Host` 与同源 guard、静态资源与 SPA 兜底、11 个路由（10 个 `/api` + `GET /`）、把会改状态的方法转成 `Cmd` 并等回复、仪表盘的 core 查询（2s 缓存）、日志尾部读取。
+**职责**：本地面板。回环监听（11020 起顺延 20 个）、`Host` 与同源 guard、静态资源与 SPA 兜底、11 个路由（10 个 `/api` + `GET /`）、把会改状态的方法转成 `Cmd` 并等回复、仪表盘的 core 查询（2s 缓存）与节点行拼装（`topology.rs`）、日志尾部读取。
 
 **对外 API**：
 
@@ -299,7 +297,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 **拥有的状态**：监听 socket、仪表盘查询缓存（`Mutex<Cache>`，条目是 `(Instance, Instant, Vec<Peer>, Vec<Route>)`，`Instance` 是 `(rpc 地址, core 代次)`）。除此之外什么都没有——面板不缓存快照，每次从 `StateCell` 取一个 `Arc`。查询结果只在仍属当前实例时写回：查询期间 core 换了代，这份数据既不写回也不覆盖新实例的缓存。
 
-**依赖**：`mesh-engine`（DTO 与纯函数 `build_nodes`/`logs`/`events`）、`mesh-etrpc`（自己发起仪表盘查询）。
+**依赖**：`mesh-engine`（DTO 与纯函数 `logs`/`events`）、`mesh-etrpc`（自己发起仪表盘查询与协议结构）。
 
 **注**：JSON 的形状是前端契约的一部分，逐字段对照 `client/frontend/src/api/types.ts`。`publicIps` 必须是 `[]` 不是 `null`；`nodes` 是 `[]`（core 未运行）或 `null`（core 在跑但查询失败）或行数组，三态都要出现在类型里。`count` 为 1 时必须省略（Go 的 `omitempty`）。
 
