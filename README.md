@@ -8,7 +8,7 @@ Mesh 客户端的 Rust 实现。两个平台同一套安装布局：
 安装根里的启动器 `mesh` / `mesh.exe` 也在这个仓库（`crates/launcher`）。
 
 旧的 Go 实现在 `../client-prototype/`，只作参考、不再构建。重写过程、每个 crate 与 Go 侧的对应、
-与设计文档的偏差、真机验收记录都在 [../docs/client-rust-migration.md](../docs/client-rust-migration.md)。
+与设计文档的偏差、真机验收记录都在 [docs/rust-migration.md](docs/rust-migration.md)。
 
 ## 目录
 
