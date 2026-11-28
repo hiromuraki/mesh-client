@@ -154,7 +154,7 @@ fn serve(
     // 启动确认就是这一次提交：启动器在等 `bin/current` 变成正在跑的这个槽。
     // 时机不能只看「引擎与面板已就位」——进程形态本身（托盘）也得立起来，否则
     // 更新已提交、客户端随即退出，下一次登录同样失败，而新版本已经被当成能跑的了。
-    let ready = boot_ready(root, program_dir);
+    let ready = boot_ready(root, program_dir, options.boot_check.as_deref());
 
     if desktop {
         return desktop_main(&panel, root, version, cell, tx, shutdown, ready);
@@ -168,13 +168,26 @@ fn serve(
 
 /// boot_ready 返回「这一版算成功启动」的回调：把正在跑的这个槽提交为 `bin/current`。
 /// 它只生效一次，可以重复调用。
-fn boot_ready(root: &Path, program_dir: &Path) -> Box<dyn Fn() + Send + Sync> {
+fn boot_ready(
+    root: &Path,
+    program_dir: &Path,
+    marker: Option<&str>,
+) -> Box<dyn Fn() + Send + Sync> {
     let root = root.to_path_buf();
     let program_dir = program_dir.to_path_buf();
+    // 一次性兼容：旧启动器（还没有 `bin/current` 的那一版）靠 `.boot-ok-<标记>` 判断
+    // 新版本能不能跑起来，看不到就回滚。**下一版删除。**
+    let marker = marker.map(str::to_string);
     let done = AtomicBool::new(false);
     Box::new(move || {
         if done.swap(true, Ordering::SeqCst) {
             return;
+        }
+        if let Some(token) = marker.as_deref() {
+            let path = root.join(format!(".boot-ok-{token}"));
+            if let Err(err) = std::fs::write(&path, b"") {
+                platform::say_err(&format!("{APP_TITLE}: {}: {err}", path.display()));
+            }
         }
         if let Err(message) = commit::commit_current(&root, &program_dir) {
             platform::say_err(&format!("{APP_TITLE}: {message}"));
