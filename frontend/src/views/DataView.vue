@@ -425,7 +425,6 @@ async function runApplyUpdate(): Promise<void> {
           <h3 class="grp">身份</h3>
           <dl class="kv">
             <div><dt>设备名</dt><dd :title="snapshot?.hostname || ''">{{ snapshot?.hostname || "—" }}</dd></div>
-            <div><dt>设备 ID</dt><dd :title="snapshot?.deviceId || ''">{{ snapshot?.deviceId || "—" }}</dd></div>
             <div><dt>认证方式</dt><dd :title="authHint">{{ authText }}</dd></div>
             <div v-if="credential">
               <dt>凭证过期</dt>

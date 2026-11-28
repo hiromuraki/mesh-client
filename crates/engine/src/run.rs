@@ -40,9 +40,9 @@ pub(crate) const CORE_HEALTHY_LIFETIME: Duration = Duration::from_secs(60);
 ///
 /// 不做指数退避：这类故障（网卡建不出来、旧实例停不掉）能不能好取决于下一次尝试，
 /// 退避只把两次尝试越拉越开，反而错过自愈的那一次。
-pub(crate) const REVIVE_INTERVAL: Duration = Duration::from_secs(10);
-/// 一轮自动重拉的次数上限。8 次配 10 秒间隔、每次 core 大约跑 15 秒，一轮约三分钟。
-pub(crate) const MAX_REVIVE_ATTEMPTS: u32 = 8;
+pub(crate) const REVIVE_INTERVAL: Duration = Duration::from_secs(30);
+/// 一轮自动重拉的次数上限。10 次配 30 秒间隔，一轮约五分钟。
+pub(crate) const MAX_REVIVE_ATTEMPTS: u32 = 10;
 /// 一轮用完挂起多久再开始下一轮。
 ///
 /// 实测 Windows 的 wintun 设备从 PnP 的 Error 态恢复要七分钟以上，比一轮长得多；
@@ -83,6 +83,8 @@ pub enum Cmd {
     Heartbeat {
         /// 发这条结果的心跳代次。重连/换身份之后的旧结果由引擎丢掉。
         gen: u64,
+        /// 这条结果最终用的是哪条协议：成功就锁住它，免得每轮都先撞一次 401。
+        protocol: Protocol,
         result: Result<Option<remote::Heartbeat>, remote::Error>,
     },
     Core(mesh_core::Event),
@@ -116,7 +118,10 @@ pub enum Notice {
 
 /// 引擎配置。版本号由 `build.rs` 注入后传进来，不从磁盘读。
 pub struct Config {
+    /// 安装根：可执行文件与槽目录。可以只读。
     pub root: PathBuf,
+    /// 数据根：`config/`、`log/`、待装包与安装记录。必须可写。
+    pub data: PathBuf,
     /// 主程序所在目录。`easytier-core` 必须与它同层，所以这里给的是「同层」的
     /// 具体路径，而不是让引擎去拼 `bin`：测试与直接运行主程序的场景各有各的布局。
     pub program_dir: PathBuf,
@@ -143,10 +148,27 @@ pub(crate) struct Control {
 ///
 /// 期望规格与运行实例实际应用的规格相等就不换进程，不等就换：配置同步、改名、
 /// 凭据轮换与重新绑定都走这一条判据，不再各写一套“要不要重启”。
+/// 过渡期：与还没换掉的控制面说话的两条协议。公钥协议是目标，`DeviceId` 只是切换
+/// 期间的退路：控制面一旦换掉，那次 401 会让心跳翻转回来。删掉它时连
+/// `ClientConfig::device_id` 与 `remote::Client::heartbeat_legacy` 一起删。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    Pubkey,
+    DeviceId,
+}
+
+impl Protocol {
+    fn flip(self) -> Protocol {
+        match self {
+            Protocol::Pubkey => Protocol::DeviceId,
+            Protocol::DeviceId => Protocol::Pubkey,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoreSpec {
-    /// 身份代次：控制面地址 + 设备 id。两者一起才是一代——设备 id 是客户端生成的，
-    /// 两个控制面上可以是同一个。
+    /// 身份代次：控制面地址。换了地址就是另一个控制面下发的配置。
     pub generation: String,
     /// 磁盘上 `config.toml` 的摘要（16 位十六进制）。
     pub config_hash: String,
@@ -211,6 +233,8 @@ pub(crate) struct Engine {
     /// 下载与启动器替换用的连接；不参与任何“是否在线”的判断。
     pub(crate) api: Option<Arc<remote::Client>>,
     pub(crate) control: Control,
+    /// 过渡期：这一代用哪条协议说话。控制面换掉之后由一次 401 翻转过来并锁住。
+    pub(crate) protocol: Protocol,
     pub(crate) last_hb: i64,
     /// 最近一次失败的说明（界面上的错误行）。
     pub(crate) last_error: String,
@@ -236,7 +260,6 @@ pub(crate) struct Engine {
     /// core 输出的最后一行（错误行优先），停手时的 fault 文案用它说清真正的原因。
     pub(crate) core_tail: Arc<coreline::CoreTail>,
 
-    pub(crate) auth_fails: u32,
     pub(crate) update: update::UpdateState,
     /// 下载任务的代次，只增不减：换 offer 会重置其状态，代次不能跟着重置，
     /// 否则旧任务的完成消息会认领新任务。
@@ -278,11 +301,11 @@ pub fn spawn(
     let (tx, inbox) = channel();
     // 打不开 `config/` 就没法做任何事，也不该假装能跑：这里直接让进程死掉，
     // 由启动器按「启动确认失败」回滚（桌面端还会弹一次错误框）。
-    let store = match Store::open(&config.root) {
+    let store = match Store::open(&config.data) {
         Ok(store) => store,
         Err(err) => panic!("打开状态目录失败: {err}"),
     };
-    let log_path = config.root.join(layout::LOG).join("client.log");
+    let log_path = config.data.join(layout::LOG).join("client.log");
     let (log, log_error) = match Log::open(&log_path) {
         Ok(log) => (log, String::new()),
         Err(err) => (
@@ -295,6 +318,7 @@ pub fn spawn(
     // 收紧或校验不通过时闸门已经写过 ERROR 日志，这里直接终止启动，不拉起 core。
     startup::check(
         &config.root,
+        &config.data,
         &config.program_dir,
         store.harden_error(),
         &log,
@@ -336,7 +360,7 @@ pub fn spawn(
     // 这里读到的 `launcher.json` 描述的是「上一次被拉起的那个启动器」，本进程
     // 不重置也不重读：替换成功之后盘上那份已经是新的，事实由替换结果更新
     // （见 `Engine::on_launcher_result`），只有下一次启动才是新的在跑。
-    let launcher = update::LauncherState::read(&config.root);
+    let launcher = update::LauncherState::read(&config.data);
     let engine = Engine {
         store,
         cell,
@@ -350,6 +374,7 @@ pub fn spawn(
         client: None,
         api: None,
         control: Control::default(),
+        protocol: Protocol::Pubkey,
         last_hb: 0,
         last_error: String::new(),
         fault: String::new(),
@@ -361,7 +386,6 @@ pub fn spawn(
         core_halted: false,
         halted_until: None,
         core_tail,
-        auth_fails: 0,
         update: update::UpdateState::default(),
         next_task: 0,
         launcher,
@@ -492,7 +516,11 @@ impl Engine {
     /// 处理一条命令。
     pub(crate) fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Heartbeat { gen, result } => self.on_heartbeat(gen, result),
+            Cmd::Heartbeat {
+                gen,
+                protocol,
+                result,
+            } => self.on_heartbeat(gen, protocol, result),
             Cmd::Core(event) => self.on_core_event(event),
             Cmd::Stun { gen, info } => {
                 // 只有仍在跑的那一代 core 的探测结果才算数。
@@ -560,13 +588,12 @@ impl Engine {
         let spawned = thread::Builder::new()
             .name("mesh-heartbeat".to_string())
             .spawn(move || {
-                let result = request.api.heartbeat(
-                    &request.hash,
-                    &request.app_version,
-                    &request.credential_id,
-                    HEARTBEAT_TIMEOUT,
-                );
-                let _ = tx.send(Cmd::Heartbeat { gen, result });
+                let (protocol, result) = request.send(request.protocol);
+                let _ = tx.send(Cmd::Heartbeat {
+                    gen,
+                    protocol,
+                    result,
+                });
             });
         if let Err(err) = spawned {
             self.note_control_failure(&mesh_text::format(
@@ -589,14 +616,13 @@ impl Engine {
                 return None;
             }
         };
-        let api = Arc::new(remote::Client::new(
-            &config.server_url,
-            &config.device_id,
-            key,
-        ));
+        let api = Arc::new(remote::Client::new(&config.server_url, key));
         self.api = Some(Arc::clone(&api));
         Some(BeatRequest {
             api,
+            device_id: config.device_id.clone(),
+            protocol: self.protocol,
+            hostname: self.effective_hostname(&config),
             hash: self.hash(),
             app_version: self.config.self_version.clone(),
             credential_id: self.credential_id(),
@@ -611,6 +637,7 @@ impl Engine {
     pub(crate) fn on_heartbeat(
         &mut self,
         gen: u64,
+        protocol: Protocol,
         result: Result<Option<remote::Heartbeat>, remote::Error>,
     ) {
         if gen != self.control.gen {
@@ -622,23 +649,20 @@ impl Engine {
         };
         match result {
             Ok(heartbeat) => {
+                // 这条协议说得通就锁住它：下一轮不再先撞一次 401。
+                self.protocol = protocol;
                 self.control.failures = 0;
                 self.last_hb = clock::unix_now();
-                self.reset_auth_fails();
                 self.control.due = Some(Instant::now() + HEARTBEAT_INTERVAL);
                 self.on_beat(api, heartbeat.unwrap_or_default());
             }
             Err(err) => {
-                // 只有 401 可能是身份问题：服务端明确回 revoked，或连续校验失败。
-                // 5xx（包括服务端 nonce 缓存饱和）是服务端自己的临时状况，走下面的
-                // 控制面失败退避——既不计身份失败次数，也不清本地身份。
+                // 只有 401 说明这把钥匙不被接受；5xx（包括服务端 nonce 缓存饱和）是
+                // 服务端自己的临时状况。两者都走控制面失败退避，都不动本地状态：
+                // 身份就是本机那把钥匙，本地没有任何东西可以「清掉」。
                 if matches!(err, remote::Error::Unauthorized { .. }) {
                     self.control.failures = self.control.failures.saturating_add(1);
-                    if self.handle_auth_rejected(&err) {
-                        // 身份已被服务端判定无效：回设置页，不再有心跳期限。
-                        self.unbind();
-                        return;
-                    }
+                    self.report_auth_rejected(&err);
                     self.control.due =
                         Some(Instant::now() + connect_backoff(self.control.failures));
                     return;
@@ -912,19 +936,6 @@ impl Engine {
         });
     }
 
-    /// 没有身份可用：控制面不再有期限，等设置页或下一次注册。
-    ///
-    /// 认证失败计数属于刚被丢掉的那一代身份，跟着一起清：下一份身份从零开始记。
-    pub(crate) fn unbind(&mut self) {
-        self.client = None;
-        self.reset_auth_fails();
-        self.fault.clear();
-        self.control.gen = self.control.gen.wrapping_add(1);
-        self.control.failures = 0;
-        self.control.due = None;
-        self.last_hb = 0;
-    }
-
     /// 从磁盘重读身份。首次启动、设置页与吊销都走这里，不另设状态。
     pub(crate) fn reload_identity(&mut self) {
         match self.load_client() {
@@ -998,7 +1009,7 @@ impl Engine {
     /// | 事实 | 状态 |
     /// | --- | --- |
     /// | 有确定失败（本地状态、配置、core 启动） | `error` |
-    /// | 没有身份 | `unconfigured` |
+    /// | 没有本地配置（没有 client.json） | `unconfigured` |
     /// | 还没有任何输赢（没心跳结果、没失败、没排重拉） | `connecting` |
     /// | 心跳通且 core 就绪 | `online` |
     /// | 其余（控制面或 core 有一边没就绪） | `degraded` |
@@ -1218,7 +1229,7 @@ impl Engine {
     pub(crate) fn start_core(&mut self, spec: CoreSpec) -> Result<(), String> {
         self.refresh_identity();
         if self.client.is_none() {
-            return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED).to_string());
+            return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_CONFIGURED).to_string());
         }
         let core_path = mesh_core::locate(&self.config.program_dir)?;
         let rpc_addr = sync::rpc_listen_addr()?;
@@ -1323,27 +1334,64 @@ impl Engine {
         self.control.gen = self.control.gen.wrapping_add(1);
         let gen = self.control.gen;
         self.control.due = None;
-        let result = request.api.heartbeat(
-            &request.hash,
-            &request.app_version,
-            &request.credential_id,
-            HEARTBEAT_TIMEOUT,
-        );
-        self.on_heartbeat(gen, result);
+        let (protocol, result) = request.send(request.protocol);
+        self.on_heartbeat(gen, protocol, result);
     }
 }
 
 /// 一次心跳请求的取样结果。
 struct BeatRequest {
     api: Arc<remote::Client>,
+    /// 过渡期：旧协议要的句柄。空串表示这台设备从没走过旧协议，只能试公钥那条。
+    device_id: String,
+    protocol: Protocol,
+    hostname: String,
     hash: String,
     app_version: String,
     credential_id: String,
 }
 
-/// 身份代次：控制面地址 + 设备 id。
+impl BeatRequest {
+    /// 按一条协议发一次。先撞 401 再换另一条：切换期间总有一边说得通，而控制面
+    /// 换掉之后，那一次 401 正好把协议翻回来。
+    fn send(
+        &self,
+        protocol: Protocol,
+    ) -> (Protocol, Result<Option<remote::Heartbeat>, remote::Error>) {
+        let first = self.exchange(protocol);
+        if !matches!(first, Err(remote::Error::Unauthorized { .. })) {
+            return (protocol, first);
+        }
+        let other = protocol.flip();
+        if other == Protocol::DeviceId && self.device_id.is_empty() {
+            return (protocol, first);
+        }
+        (other, self.exchange(other))
+    }
+
+    fn exchange(&self, protocol: Protocol) -> Result<Option<remote::Heartbeat>, remote::Error> {
+        match protocol {
+            Protocol::Pubkey => self.api.heartbeat(
+                &self.hostname,
+                &self.hash,
+                &self.app_version,
+                &self.credential_id,
+                HEARTBEAT_TIMEOUT,
+            ),
+            Protocol::DeviceId => self.api.heartbeat_legacy(
+                &self.device_id,
+                &self.hash,
+                &self.app_version,
+                &self.credential_id,
+                HEARTBEAT_TIMEOUT,
+            ),
+        }
+    }
+}
+
+/// 一代 core 的代次：控制面地址。地址换了就是另一个控制面下发的配置。
 fn identity_key(config: &ClientConfig) -> String {
-    format!("{}\n{}", config.server_url, config.device_id)
+    config.server_url.clone()
 }
 
 /// 连接失败的退避：10s 起步，每次 ×1.5，最多 60s。

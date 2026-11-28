@@ -28,13 +28,13 @@ export function clearActionError(): void {
   actionError.value = "";
 } 
 
-// 没有设备身份时自动跳到设置页；用户手动切过就不再打扰。
+// 没有本地配置时自动跳到设置页；用户手动切过就不再打扰。
 let autoSwitch = true;
 // 在途的那一次请求：轮询与手动刷新都经过它，避免两个请求同时改写快照。
 let inflight: Promise<void> | null = null;
-// 引擎在 goroutine 里读本地配置，启动后的头一两帧 deviceId 必然为空，
-// 连续两次都空才认为是真的没配置，否则每次启动都会闪到设置页。
-let emptyStreak = 0;
+// 引擎启动后的头一两帧可能还没读出本地配置，连续两次「未配置」才当真，
+// 否则每次启动都会闪一下设置页。
+let unconfiguredStreak = 0;
 
 const status = computed<Status | "">(() => snapshot.value?.status ?? "");
 
@@ -80,20 +80,17 @@ export function refresh(force = false): Promise<void> {
 function maybeSwitchToSettings(): void {
   const current = snapshot.value;
   if (!current) return;
-  if (current.deviceId) {
-    emptyStreak = 0;
+  // 设备身份就是本地配置，只有完全没有配置时引擎才报 unconfigured。
+  if (current.status !== "unconfigured") {
+    unconfiguredStreak = 0;
     autoSwitch = true;
     return;
   }
-  emptyStreak += 1;
+  unconfiguredStreak += 1;
   if (!autoSwitch || view.value === "settings") return;
-  // 身份被服务端清掉时引擎会把原因写进 lastError，这种情况要立刻回设置页；
-  // 全新安装则连 serverUrl 都没有，等两帧确认不是启动瞬态再跳。
-  if (current.lastError) {
-    view.value = "settings";
-    return;
-  }
-  if (emptyStreak >= 2 && !current.serverUrl) view.value = "settings";
+  // 配置读不出来也立刻回设置页，别让用户对着一个空仪表盘猜原因；
+  // 全新安装则等两帧，确认不是启动瞬态。
+  if (current.lastError || unconfiguredStreak >= 2) view.value = "settings";
 }
 
 export function select(next: View): void {

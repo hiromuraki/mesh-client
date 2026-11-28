@@ -9,7 +9,6 @@ export type UpdateState = "" | "downloading" | "ready" | "error";
 export interface Snapshot {
   status: Status | "";
   serverUrl: string;
-  deviceId: string;
   /** 本机设备公钥（标准 base64）：填进控制台「新建设备」的就是它。 */
   pubkey: string;
   hostname: string;
@@ -37,6 +36,7 @@ export interface Snapshot {
   /** 配置里的加密算法原文，空表示配置没写这一项。 */
   encryption: string;
   lastHeartbeat: number;
+  /** 控制面最近一次拒绝、或本机最近一次错误的原因原文；空表示当前没有错误。 */
   lastError: string;
   appVersion: string;
   updateState: UpdateState;

@@ -101,6 +101,8 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), Failure> {
         .map(Path::to_path_buf)
         .ok_or_else(|| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&"<无父目录>"]))?;
     let root = resolve_root(options.root.as_deref(), &exe)?;
+    // 数据根与安装根分开：程序目录可以只读，配置、日志与待装包必须可写。
+    let data = layout::data_root(options.data_root.as_deref()).map_err(|err| err.to_string())?;
     // 安装不完整就直接失败：读不到自己槽里的 version.json 就不知道要报哪一版给服务端。
     let version = layout::read_version(&program_dir).map_err(|err| {
         mesh_text::format(
@@ -112,12 +114,12 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), Failure> {
         platform::say(&format!("{APP_TITLE} {version}"));
         return Ok(());
     }
-    let store = Store::open(&root).map_err(|err| err.to_string())?;
-    let _lock = match mesh_install::lock::acquire(&mesh_install::lock::Lock::path(&root)) {
+    let store = Store::open(&data).map_err(|err| err.to_string())?;
+    let _lock = match mesh_install::lock::acquire(&mesh_install::lock::Lock::path(&data)) {
         Ok(lock) => lock,
         Err(mesh_install::Error::AlreadyRunning) => {
             return instance::wake_existing(
-                &root.join(layout::CONFIG).join("ui.json"),
+                &data.join(layout::CONFIG).join("ui.json"),
                 platform::open_browser,
             )
             .map_err(Failure::from);
@@ -130,6 +132,7 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), Failure> {
     let (notice_tx, notice_rx) = channel::<Notice>();
     let config = Config {
         root: root.clone(),
+        data: data.clone(),
         program_dir: program_dir.clone(),
         self_version: version.clone(),
         hostname: platform::hostname(),
@@ -148,6 +151,7 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), Failure> {
         &options,
         desktop,
         &root,
+        &data,
         &program_dir,
         &version,
         &store,
@@ -169,6 +173,7 @@ fn serve(
     options: &cli::Options,
     desktop: bool,
     root: &Path,
+    data: &Path,
     program_dir: &Path,
     version: &str,
     store: &Store,
@@ -181,23 +186,17 @@ fn serve(
     // quit 是 /api/quit 的动作：必须先回 204，面板在 send 之后才调用它。
     let quit_shutdown = Arc::clone(shutdown);
     let quit: mesh_panel::Quit = Box::new(move || quit_shutdown.run_and_exit(0));
-    let log_path = root.join(layout::LOG).join("client.log");
+    let log_path = data.join(layout::LOG).join("client.log");
     let panel = mesh_panel::start(Arc::clone(cell), tx.clone(), log_path.clone(), quit)
         .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_START_PANEL, &[&err]))?;
     let panel_closer = panel.clone();
     shutdown.register(move || panel_closer.close());
-    let _ = mesh_panel::write_url(&root.join(layout::CONFIG).join("ui.json"), &panel.url);
+    let _ = mesh_panel::write_url(&data.join(layout::CONFIG).join("ui.json"), &panel.url);
 
     // 启动确认就是这一次提交：启动器在等 `bin/current` 变成正在跑的这个槽。
     // 时机不能只看「引擎与面板已就位」——进程形态本身（托盘）也得立起来，否则
     // 更新已提交、客户端随即退出，下一次登录同样失败，而新版本已经被当成能跑的了。
-    //
-    // 兼容标记的路径在这里定死：形状由 CLI 入口校验，拼出来的路径必须落在安装根内。
-    let marker = match options.boot_check.as_deref() {
-        Some(token) => Some(boot_marker(root, token)?),
-        None => None,
-    };
-    let ready = boot_ready(root, program_dir, marker);
+    let ready = boot_ready(root, program_dir);
 
     if desktop {
         return desktop_main(&panel, root, version, cell, tx, shutdown, ready);
@@ -209,41 +208,15 @@ fn serve(
     headless::run(Arc::clone(cell), &log_path, ready)
 }
 
-/// 旧启动器的一次性启动标记：`.boot-ok-<标记>`。**下一版随兼容入口删除。**
-///
-/// 标记的形状由 CLI 入口定死（1–8 位小写十六进制）；这里再确认拼出来的路径正好
-/// 落在安装根下——写标记的进程通常以高权限运行，拼路径的地方不能只信赖上游。
-fn boot_marker(root: &Path, token: &str) -> Result<PathBuf, String> {
-    let path = root.join(format!(".boot-ok-{token}"));
-    if path.parent() != Some(root) {
-        return Err(mesh_text::format(
-            mesh_text::id::CLIENT_ERROR_BOOT_CHECK_INVALID,
-            &[&token],
-        ));
-    }
-    Ok(path)
-}
-
 /// boot_ready 返回「这一版算成功启动」的回调：把正在跑的这个槽提交为 `bin/current`。
 /// 它只生效一次，可以重复调用。
-fn boot_ready(
-    root: &Path,
-    program_dir: &Path,
-    marker: Option<PathBuf>,
-) -> Box<dyn Fn() + Send + Sync> {
+fn boot_ready(root: &Path, program_dir: &Path) -> Box<dyn Fn() + Send + Sync> {
     let root = root.to_path_buf();
     let program_dir = program_dir.to_path_buf();
-    // 一次性兼容：旧启动器（还没有 `bin/current` 的那一版）靠 `.boot-ok-<标记>` 判断
-    // 新版本能不能跑起来，看不到就回滚。**下一版删除。**
     let done = AtomicBool::new(false);
     Box::new(move || {
         if done.swap(true, Ordering::SeqCst) {
             return;
-        }
-        if let Some(path) = marker.as_deref() {
-            if let Err(err) = std::fs::write(path, b"") {
-                platform::say_err(&format!("{APP_TITLE}: {}: {err}", path.display()));
-            }
         }
         if let Err(message) = commit::commit_current(&root, &program_dir) {
             platform::say_err(&format!("{APP_TITLE}: {message}"));
@@ -298,12 +271,8 @@ fn configure(
     if !given {
         // 还没来得及认领不算错误：桌面模式下面板会停在设置页让用户填服务端地址，
         // 并把本机公钥显示给他抄进控制台。headless 没人能填，只能直接失败。
-        let unregistered = current
-            .as_ref()
-            .map(|config| config.device_id.is_empty())
-            .unwrap_or(true);
-        if unregistered && !desktop {
-            return Err(mesh_text::get(mesh_text::id::CLIENT_ERROR_NOT_REGISTERED).to_string());
+        if current.is_none() && !desktop {
+            return Err(mesh_text::get(mesh_text::id::CLIENT_ERROR_NOT_CONFIGURED).to_string());
         }
         return Ok(());
     }
@@ -341,24 +310,4 @@ fn resolve_root(given: Option<&Path>, exe: &Path) -> Result<PathBuf, String> {
         };
     }
     Ok(layout::find_root(exe))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// 兼容标记只能落在安装根下：路径由外部给的标记拼成，拼出来的结果不能离开根。
-    #[test]
-    fn a_boot_marker_token_cannot_leave_the_install_root() {
-        let root =
-            std::env::temp_dir().join(format!("mesh-client-boot-marker-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-
-        let marker = boot_marker(&root, "1a2b3c4d").unwrap();
-        assert_eq!(marker, root.join(".boot-ok-1a2b3c4d"));
-        assert_eq!(marker.parent(), Some(root.as_path()));
-        assert!(boot_marker(&root, "a/b").is_err());
-        assert!(boot_marker(&root, "../escape").is_err());
-        let _ = std::fs::remove_dir_all(&root);
-    }
 }

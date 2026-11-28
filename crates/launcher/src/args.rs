@@ -24,6 +24,9 @@ pub struct Options {
     /// root 显式指定安装根；不给就用启动器自己所在目录。systemd 的 ExecStart
     /// 会传它，手动排障时也用它把启动器指向别处的一份安装。
     pub root: Option<PathBuf>,
+    /// data-root 显式指定数据根；不给就按平台规则推。与 `--root` 是两件事：
+    /// 程序可以只读，配置与待装包必须可写。
+    pub data_root: Option<PathBuf>,
 }
 
 /// 解析失败有两种：用户要帮助（正常请求），和参数真的不对。
@@ -44,12 +47,15 @@ pub fn usage() -> String {
         String::new(),
         mesh_text::get(id::LAUNCHER_TEXT_USAGE_URL_HEAD).to_string(),
         indented(id::LAUNCHER_TEXT_USAGE_URL_LINE),
+        String::new(),
+        mesh_text::get(id::LAUNCHER_TEXT_USAGE_DATA_ROOT).to_string(),
     ]
     .join("\n")
 }
 
 pub fn parse(argv: &[String]) -> Result<Options, ParseError> {
     let mut root = None;
+    let mut data_root = None;
     let mut file = None;
     let mut url = None;
     let mut sha = None;
@@ -64,6 +70,7 @@ pub fn parse(argv: &[String]) -> Result<Options, ParseError> {
         };
         match name {
             "--root" => root = Some(PathBuf::from(value(argv, &mut i, inline, name)?)),
+            "--data-root" => data_root = Some(PathBuf::from(value(argv, &mut i, inline, name)?)),
             "--file" => file = Some(PathBuf::from(value(argv, &mut i, inline, name)?)),
             "--url" => url = Some(value(argv, &mut i, inline, name)?),
             "--sha256" => sha = Some(value(argv, &mut i, inline, name)?),
@@ -114,7 +121,11 @@ pub fn parse(argv: &[String]) -> Result<Options, ParseError> {
             Command::Launch
         }
     };
-    Ok(Options { command, root })
+    Ok(Options {
+        command,
+        root,
+        data_root,
+    })
 }
 
 fn value(

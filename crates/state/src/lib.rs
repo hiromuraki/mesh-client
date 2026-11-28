@@ -125,9 +125,12 @@ impl Error {
 #[serde(default)]
 pub struct ClientConfig {
     pub server_url: String,
-    pub device_id: String,
     pub hostname: String,
     pub created_at: i64,
+    /// 过渡期：旧协议（签名第 4 行是 `device_id`）用的句柄。控制面切到公钥协议之后
+    /// 这一段随 PENDING 一起删除；新协议不读它，没有就是空串。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub device_id: String,
 }
 
 /// `config/credential.json`：控制面签发的凭据，取代 `secure.key` 成为这个节点
@@ -153,7 +156,7 @@ fn is_zero(value: &i64) -> bool {
 
 /// `config/` 的入口。
 pub struct Store {
-    root: PathBuf,
+    data: PathBuf,
     keys: Mutex<Keys>,
     /// 收紧 `config/` 权限失败的原因；`None` 表示收紧成功（或不在 Windows 上）。
     /// 由引擎在启动闸门里读取：非空即终止启动，不能带着旧的宽 ACE 跑。
@@ -167,12 +170,14 @@ struct Keys {
 }
 
 impl Store {
-    /// 打开安装根：`config/` 放在根下、跨版本共享，打开时确保它存在。
-    pub fn open(root: &Path) -> Result<Store, Error> {
-        if root.as_os_str().is_empty() {
+    /// 打开数据根：`config/` 放在它下面、跨版本共享，打开时确保它存在。
+    ///
+    /// 传的是数据根不是安装根：程序目录可以只读，配置与身份必须可写。
+    pub fn open(data: &Path) -> Result<Store, Error> {
+        if data.as_os_str().is_empty() {
             return Err(Error::EmptyRoot);
         }
-        let dir = root.join(layout::CONFIG);
+        let dir = data.join(layout::CONFIG);
         fs::create_dir_all(&dir).map_err(|err| Error::io(&dir, err))?;
         // 目录一建好就收权限，赶在写任何密钥之前：继承来的 ACL 可能对本地所有账户
         // 开放，晚一步就等于先把私钥暴露过一次。安装根由引擎的启动闸门单独收紧：
@@ -183,14 +188,15 @@ impl Store {
         // 生产启动路径由引擎的启动闸门读取这个原因并终止进程。
         let harden_error = harden_dir(&dir).err().map(|err| err.to_string());
         Ok(Store {
-            root: root.to_path_buf(),
+            data: data.to_path_buf(),
             keys: Mutex::new(Keys::default()),
             harden_error,
         })
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// 数据根：`config/` 与 `log/` 的父目录。
+    pub fn data(&self) -> &Path {
+        &self.data
     }
 
     /// 收紧 `config/` 权限失败的原因；启动时由引擎写进日志。
@@ -200,12 +206,12 @@ impl Store {
 
     /// `config/` 目录。
     pub fn dir(&self) -> PathBuf {
-        self.root.join(layout::CONFIG)
+        self.data.join(layout::CONFIG)
     }
 
     /// `log/` 目录（日志由引擎写，这里只给出与 `config/` 并列的位置）。
     pub fn log_dir(&self) -> PathBuf {
-        self.root.join(layout::LOG)
+        self.data.join(layout::LOG)
     }
 
     pub fn client_path(&self) -> PathBuf {
@@ -251,13 +257,14 @@ impl Store {
         atomic_replace(&path, text.as_bytes(), 0o600).map_err(|err| Error::io(&path, err))
     }
 
-    /// 清空 `device_id`（服务端吊销后回设置页），其余字段原样保留。
-    pub fn clear_device(&self) -> Result<(), Error> {
-        let Some(mut config) = self.load_client()? else {
-            return Ok(());
-        };
-        config.device_id.clear();
-        self.save_client(&config)
+    /// 删除 `client.json`（「删除本地配置」）：没有它就等于没有配置，引擎回首次设置。
+    pub fn remove_client(&self) -> Result<(), Error> {
+        let path = self.client_path();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(Error::io(&path, err)),
+        }
     }
 
     /// 读或生成 Ed25519 私钥（32 字节 seed，权限 0600）。
@@ -576,22 +583,23 @@ mod tests {
         assert!(store.load_client().unwrap().is_none());
         let config = ClientConfig {
             server_url: "http://10.126.126.1:8088".into(),
-            device_id: "0123456789abcdef0123456789abcdef".into(),
             hostname: "laptop".into(),
             created_at: 1795541874,
+            device_id: String::new(),
         };
         store.save_client(&config).unwrap();
         assert_eq!(store.load_client().unwrap(), Some(config.clone()));
         let text = fs::read_to_string(store.client_path()).unwrap();
-        // 磁盘格式是 snake_case，且只有这四个键。
+        // 磁盘格式是 snake_case；过渡期的 device_id 为空时不落盘。
         assert!(text.contains("\"server_url\""));
-        assert!(text.contains("\"device_id\""));
+        assert!(text.contains("\"hostname\""));
         assert!(text.contains("\"created_at\""));
+        assert!(!text.contains("device_id"));
         assert!(!text.contains("core_path"));
-        store.clear_device().unwrap();
-        let cleared = store.load_client().unwrap().unwrap();
-        assert_eq!(cleared.device_id, "");
-        assert_eq!(cleared.server_url, config.server_url);
+        // 删除本地配置：文件没了，读回来就是「还没有配置」。
+        store.remove_client().unwrap();
+        assert!(store.load_client().unwrap().is_none());
+        store.remove_client().unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 

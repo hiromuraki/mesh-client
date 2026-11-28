@@ -38,6 +38,9 @@ pub enum Error {
 
     #[error("{0}")]
     Io(#[from] io::Error),
+
+    #[error("{}", mesh_text::format(mesh_text::id::INSTALL_ERROR_DATA_ROOT, &[&reason]))]
+    DataRoot { reason: String },
     #[error("{}", mesh_text::get(mesh_text::id::INSTALL_ERROR_ALREADY_RUNNING))]
     AlreadyRunning,
 }

@@ -1,14 +1,12 @@
-//! 设置页的两个动作：认领（注册）、删除本地配置。
+//! 设置页的两个动作：保存设置、删除本地配置。
 //!
-//! 认领不需要任何共享秘密：本机先有 Ed25519 密钥，公钥显示在设置页，管理员把它填进
-//! 「新建设备」；保存设置就是拿这把钥匙去签名认领。`device_id` 由客户端先随机生成，
-//! 服务端接受后以响应为准。
+//! 没有「注册」这一步：设备身份就是本机的 Ed25519 公钥，管理员把它填进控制面的
+//! 「新建设备」，之后每一次签名心跳本身就是认领。保存设置因此只写本地，
+//! 控制面认不认这把钥匙由心跳结果反映到面板上。
 
 use crate::clock;
 use crate::run::Engine;
-use mesh_remote as remote;
-use mesh_state::{public_key_base64, ClientConfig};
-use std::time::Duration;
+use mesh_state::ClientConfig;
 
 /// 设置页提交的表单（字段名与前端一致，线上是 camelCase）。
 #[derive(Debug, Clone, Default)]
@@ -27,48 +25,37 @@ impl Engine {
         }
     }
 
-    /// 处理设置页提交：先向控制面认领，认领成功再写盘。
+    /// 处理设置页提交：写本地配置，由心跳去连。
     ///
-    /// 没有「先存本地、回头再说」的分支：认领是唯一让设置生效的路径，而配置只能从
-    /// 控制面拿到。认领失败留在设置页重试，磁盘上的身份与凭据一个都不动——写一半
-    /// 再回滚，等于让 core 拿着一代不存在的身份去连。
+    /// 保存只落本地：地址与设备名是这台机器的属性，控制面那边不保存它们，也就没有
+    /// 需要先获得同意的写。控制面认不认这把钥匙由心跳结果显示在面板上，一次 401
+    /// 不该把用户拦在设置页：他能做的只有去控制台把公钥填进槽位，而那时面板上正
+    /// 好写着原因。
     pub(crate) fn save_settings(&mut self, input: SettingsInput) -> Result<(), String> {
         let server_url = normalize_server_url(&input.server_url)?;
         // 留空表示用本机主机名，不把当前主机名固化进配置。
         let hostname = input.hostname.trim().to_string();
 
         let current = self.store.load_client().map_err(|err| err.to_string())?;
-        let key = self.store.signing_key().map_err(|err| err.to_string())?;
         let mut config = ClientConfig {
             server_url,
-            device_id: String::new(),
             hostname,
             created_at: 0,
+            device_id: String::new(),
         };
         if let Some(current) = current.as_ref() {
-            config.device_id = current.device_id.clone();
             config.created_at = current.created_at;
+            // 过渡期：旧协议要的那个句柄跟着配置走，切换完成后一起删。
+            config.device_id = current.device_id.clone();
         }
-        if config.device_id.is_empty() {
-            config.device_id = new_device_id();
-        }
-        let api = remote::Client::new(&config.server_url, &config.device_id, key.clone());
-        let pubkey = public_key_base64(&key);
-        let hostname_used = self.effective_hostname(&config);
-        let reply = api
-            .register(&hostname_used, &pubkey, Duration::from_secs(30))
-            .map_err(|err| register_error(&err))?;
-        if !reply.device_id.is_empty() {
-            config.device_id = reply.device_id;
-        }
-        // created_at 是「这台设备第一次被接受」的时刻，之后的每次保存不改它。
+        // created_at 是这份配置第一次生效的时刻，之后的每次保存不改它。
         if config.created_at == 0 {
             config.created_at = clock::unix_now();
         }
-        self.bind(config.clone(), current.as_ref())?;
+        self.bind(config, current.as_ref())?;
         self.logf(
             "app",
-            &mesh_text::format(mesh_text::id::ENGINE_LOG_REGISTERED, &[&config.device_id]),
+            mesh_text::get(mesh_text::id::ENGINE_LOG_SETTINGS_SAVED),
         );
         Ok(())
     }
@@ -100,9 +87,6 @@ impl Engine {
             })?;
             // 旧一代的发布授权随旧一代一起作废；删除失败时它还在，下一轮心跳照常。
             self.clear_stale_update();
-            // 认证失败计数记的是「这一代身份被拒绝了几次」：换一代就从零开始，
-            // 否则上一代控制面的 401 会记到新身份头上，凑满 3 次就清掉刚换好的身份。
-            self.reset_auth_fails();
         }
         self.store.save_client(&config).map_err(|err| {
             mesh_text::format(mesh_text::id::ENGINE_TEXT_SAVE_SETTINGS_FAILED, &[&err])
@@ -118,12 +102,13 @@ impl Engine {
         Ok(())
     }
 
-    /// 断开并清空本地身份与下发的配置，保留服务端地址、设备名等用户输入。
-    /// 服务端上的设备记录不受影响，重新注册即可再次绑定。
+    /// 删除本地配置：控制面地址、设备名、下发的配置与凭据一起清掉，回到首次设置。
+    ///
+    /// 本机公钥不受影响，控制台上的槽位也不受影响——重新填一次地址就能再连上。
     pub(crate) fn reset_config(&mut self) -> Result<(), String> {
         self.stop_core()?;
-        self.store.clear_device().map_err(|err| {
-            mesh_text::format(mesh_text::id::ENGINE_TEXT_CLEAR_DEVICE_FAILED, &[&err])
+        self.store.remove_client().map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err])
         })?;
         self.store.remove_config().map_err(|err| {
             mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err])
@@ -141,7 +126,7 @@ impl Engine {
         self.network_name.clear();
         self.last_error.clear();
         self.fault.clear();
-        self.unbind();
+        self.reload_identity();
         self.logf(
             "app",
             mesh_text::get(mesh_text::id::ENGINE_LOG_LOCAL_CONFIG_DELETED),
@@ -150,16 +135,13 @@ impl Engine {
     }
 }
 
-/// 换代次：控制面地址或设备 id 变了。
+/// 换代次：控制面地址变了。
 ///
-/// 凭据与配置都属于一个代次，换一处就必须把另一处也作废——只比设备 id 不够：
-/// id 是客户端生成的，同一台机器在两个控制面上可以是同一个 id，而那张凭据与
-/// 那个网络毫无关系。
+/// 凭据与配置都属于一个控制面，换地址就必须把两者一起作废——否则新控制面会拿到
+/// 上一个控制面签的凭据去连一个与它无关的网络。
 fn generation_changed(previous: Option<&ClientConfig>, next: &ClientConfig) -> bool {
     match previous {
-        Some(previous) => {
-            previous.device_id != next.device_id || previous.server_url != next.server_url
-        }
+        Some(previous) => previous.server_url != next.server_url,
         // 首次注册没有上一代可作废：磁盘上若还有别的残留，那是人工留下的，
         // 归「删除本地配置」处理，不在这里顺手删。
         None => false,
@@ -191,35 +173,6 @@ fn normalize_server_url(raw: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{}", rest.trim_end_matches('/')))
 }
 
-/// 注册失败的原因，翻成用户能看懂的一句话。
-fn register_error(err: &remote::Error) -> String {
-    match err {
-        remote::Error::Unauthorized { .. } => {
-            mesh_text::get(mesh_text::id::ENGINE_TEXT_DEVICE_NOT_CLAIMED).to_string()
-        }
-        remote::Error::Api { status: 401, .. } => {
-            mesh_text::get(mesh_text::id::ENGINE_TEXT_DEVICE_NOT_CLAIMED).to_string()
-        }
-        remote::Error::Api {
-            status: 409,
-            message,
-            ..
-        } => mesh_text::format(mesh_text::id::ENGINE_TEXT_REGISTER_REJECTED, &[&message]),
-        remote::Error::Api { .. } => {
-            mesh_text::format(mesh_text::id::ENGINE_TEXT_REGISTER_FAILED, &[&err])
-        }
-        _ => mesh_text::format(mesh_text::id::ENGINE_TEXT_REGISTER_CONNECT_FAILED, &[&err]),
-    }
-}
-
-/// 新设备的随机 id（16 字节十六进制）。服务端接受后以响应里的 `deviceId` 为准。
-fn new_device_id() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,13 +190,5 @@ mod tests {
         assert!(normalize_server_url("").is_err());
         assert!(normalize_server_url("ftp://x").is_err());
         assert!(normalize_server_url("http://").is_err());
-    }
-
-    #[test]
-    fn device_ids_are_32_hex_chars() {
-        let id = new_device_id();
-        assert_eq!(id.len(), 32);
-        assert!(id.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        assert_ne!(id, new_device_id());
     }
 }

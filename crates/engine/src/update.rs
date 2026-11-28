@@ -249,7 +249,7 @@ impl Engine {
             );
             return;
         }
-        let failures = mesh_install::failures::Failures::load(&self.config.root);
+        let failures = mesh_install::failures::Failures::load(&self.config.data);
         if failures.exhausted(&info.version) {
             self.logf(
                 "app",
@@ -318,8 +318,8 @@ impl Engine {
     fn start_offer(&mut self, info: &remote::UpdateInfo, auto: bool) {
         // 上一份 offer 的工件不再被授权：暂存件与未接收的固定包一起作废。
         // 在跑的下载任务留在原地：`.part` 只有一个，再起一个只会互相截断。
-        let root = self.config.root.clone();
-        self.update.discard_artifact(&root);
+        let data = self.config.data.clone();
+        self.update.discard_artifact(&data);
         self.update.attempts = 0;
         self.update.intent = None;
         self.update.offer = Some(Offer {
@@ -346,8 +346,8 @@ impl Engine {
 
     /// 控制面不再提供这份 offer（撤回）：把 offer 与授权显式清掉。
     pub(crate) fn clear_stale_update(&mut self) {
-        let root = self.config.root.clone();
-        self.update.withdraw(&root);
+        let data = self.config.data.clone();
+        self.update.withdraw(&data);
     }
 
     /// 用户点了“安装”（或面板上的重试）。
@@ -435,7 +435,7 @@ impl Engine {
                 let Some(owner) = self.own_install_root() else {
                     return Ok(());
                 };
-                let committed = match commit_package(&part, &self.config.root, &sha256) {
+                let committed = match commit_package(&part, &self.config.data, &sha256) {
                     Ok(path) => path,
                     Err(err) => {
                         drop(owner);
@@ -464,7 +464,7 @@ impl Engine {
                 committed
             }
             // 上一轮已经提交过、只是交接没被接收：不再改名，直接重试交接。
-            Artifact::Committed { .. } => self.config.root.join(layout::UPDATE_FILE),
+            Artifact::Committed { .. } => self.config.data.join(layout::UPDATE_FILE),
             Artifact::None | Artifact::Failed { .. } => {
                 self.prepare();
                 return Ok(());
@@ -537,13 +537,13 @@ impl Engine {
             "app",
             &mesh_text::format(mesh_text::id::ENGINE_LOG_DOWNLOAD_STARTED, &[&version]),
         );
-        let root = self.config.root.clone();
+        let data = self.config.data.clone();
         let tx = self.self_tx.clone();
         let sent = task.clone();
         let spawned = thread::Builder::new()
             .name("mesh-download".to_string())
             .spawn(move || {
-                let result = download_package(&api, &root, &url, &sent.sha256);
+                let result = download_package(&api, &data, &url, &sent.sha256);
                 let _ = tx.send(Cmd::Download { task: sent, result });
             });
         if spawned.is_err() {
@@ -728,7 +728,7 @@ impl Engine {
                 return;
             }
         }
-        let dir = self.config.root.join(UPDATE_DIR);
+        let dir = self.config.data.join(UPDATE_DIR);
         if let Err(err) = std::fs::create_dir_all(&dir) {
             self.logf(
                 "app",
@@ -752,7 +752,8 @@ impl Engine {
             ),
         );
         let api = Arc::clone(api);
-        let root = self.config.root.clone();
+        let data = self.config.data.clone();
+        let install = self.config.root.clone();
         let log = Arc::clone(&self.log);
         let tx = self.self_tx.clone();
         let url = info.url.clone();
@@ -760,7 +761,7 @@ impl Engine {
         let spawned = thread::Builder::new()
             .name("mesh-launcher-update".to_string())
             .spawn(move || {
-                let result = replace_launcher(&api, &root, &url, &sent, &log);
+                let result = replace_launcher(&api, &data, &install, &url, &sent, &log);
                 let _ = tx.send(Cmd::Launcher { task: sent, result });
             });
         if spawned.is_err() {
@@ -793,10 +794,10 @@ impl Engine {
 
     /// 清掉 `update/` 里上一轮留下的临时文件。
     ///
-    /// 只清这个目录：`update.tar.zst` 在安装根下，它是「请安装」的信号，不是临时
+    /// 只清这个目录：`update.tar.zst` 在数据根下，它是「请安装」的信号，不是临时
     /// 文件，任何时候都不该由客户端顺手删掉。
     pub(crate) fn clean_update_dir(&mut self) {
-        let dir = self.config.root.join(UPDATE_DIR);
+        let dir = self.config.data.join(UPDATE_DIR);
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(_) => return,
@@ -825,7 +826,8 @@ impl Engine {
 
     /// 安装根的写权；拿不到就是“这一轮先不提交”，由调用方保留暂存件。
     fn own_install_root(&mut self) -> Option<mesh_install::lock::Lock> {
-        match acquire_install_root(&self.config.root) {
+        // 锁在数据根下：安装根的写权由提权本身保证，这把锁只负责「谁在装」。
+        match acquire_install_root(&self.config.data) {
             Ok(owner) => Some(owner),
             Err(err) => {
                 self.logf("app", &err);
@@ -899,6 +901,31 @@ fn acquire_install_root(root: &Path) -> Result<mesh_install::lock::Lock, String>
     )
 }
 
+/// 用暂存件替换 `dst`，跨卷时也能原子落地。
+///
+/// 暂存在数据根、目标是安装根：两者常常不在同一个卷上（`%LOCALAPPDATA%` 在 C:，
+/// 程序装在 D: 或 S:），`rename` 会直接给 `EXDEV`。跨卷时先复制到目标旁边的同名
+/// 临时文件（这时是同一个卷），再改名覆盖——对外仍然只有「旧文件」与「新文件」两种
+/// 可见状态，不会出现半个启动器。
+fn replace_across_volumes(temp: &Path, dst: &Path) -> std::io::Result<()> {
+    match std::fs::rename(temp, dst) {
+        Ok(()) => return Ok(()),
+        Err(err) if err.raw_os_error() == Some(EXDEV) => {}
+        Err(err) => return Err(err),
+    }
+    let sibling = dst.with_extension("new");
+    std::fs::copy(temp, &sibling)?;
+    std::fs::rename(&sibling, dst)?;
+    let _ = std::fs::remove_file(temp);
+    Ok(())
+}
+
+/// 跨卷改名的错误码：Unix `EXDEV`，Windows `ERROR_NOT_SAME_DEVICE`。
+#[cfg(unix)]
+const EXDEV: i32 = 18;
+#[cfg(windows)]
+const EXDEV: i32 = 17;
+
 /// 把校验过的暂存文件连同它的整包摘要放到固定名：从这一刻起它才是「请安装」的信号。
 ///
 /// Unix 上摘要先落盘、包后改名：包名本身就是信号，常驻启动器可能在这一瞬间已经
@@ -940,12 +967,13 @@ fn retry_delay(attempts: u32) -> Duration {
 /// 后台替换启动器：下载、校验、拿写权、改名。
 fn replace_launcher(
     api: &remote::Client,
-    root: &Path,
+    data: &Path,
+    install: &Path,
     url: &str,
     task: &DownloadTask,
     log: &Log,
 ) -> LauncherResult {
-    let temp = root.join(UPDATE_DIR).join("launcher.new");
+    let temp = data.join(UPDATE_DIR).join("launcher.new");
     // 上一轮已经下好并校验过、只是没拿到安装根写权的那一份：直接复用，不重下。
     if !artifact::matches(&temp, &task.sha256) {
         let _ = std::fs::remove_file(&temp);
@@ -954,7 +982,9 @@ fn replace_launcher(
                 "app",
                 &mesh_text::format(mesh_text::id::ENGINE_LOG_LAUNCHER_DOWNLOAD_FAILED, &[&err]),
             );
-            return LauncherResult::Failed;
+            // 传输失败不是结论：下一轮心跳再试。判成失败会让这一份在进程余下的
+            // 生命周期里再也不重试，一次网络抖动就永久停在一个旧启动器上。
+            return LauncherResult::Deferred;
         }
         if !artifact::matches(&temp, &task.sha256) {
             log.add(
@@ -978,7 +1008,7 @@ fn replace_launcher(
         }
     }
     // 换启动器也是写安装根：启动器正装着东西时不能动它的文件。
-    let owner = match acquire_install_root(root) {
+    let owner = match acquire_install_root(install) {
         Ok(owner) => owner,
         Err(err) => {
             log.add(
@@ -989,8 +1019,8 @@ fn replace_launcher(
             return LauncherResult::Deferred;
         }
     };
-    let dst = root.join(mesh_install::platform::launcher_name());
-    let outcome = match std::fs::rename(&temp, &dst) {
+    let dst = install.join(mesh_install::platform::launcher_name());
+    let outcome = match replace_across_volumes(&temp, &dst) {
         Ok(()) => {
             log.add(
                 "app",

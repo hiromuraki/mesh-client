@@ -35,19 +35,27 @@ fn main() -> ExitCode {
             }
         },
     };
-    log::init(&root);
+    // 数据根与安装根分开：程序目录可以只读，日志与待装包必须可写。
+    let data = match mesh_install::layout::data_root(opts.data_root.as_deref()) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("mesh: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    log::init(&data);
     // 一进来就记下自己是哪一版：两条命令都写，手工 scp、`--file`、systemd 重启
     // 都覆盖得到，客户端下一轮心跳就能拿它判「这份启动器是不是更新的」。
-    record_version(&root);
+    record_version(&data);
 
     let outcome: Result<i32, String> = match opts.command {
-        args::Command::Launch => launch_installed(&root),
+        args::Command::Launch => launch_installed(&root, &data),
         args::Command::Install {
             source,
             sha256,
             wait_for,
             force,
-        } => install::run(&root, source, sha256, wait_for, force).map(|_| 0),
+        } => install::run(&root, &data, source, sha256, wait_for, force).map(|_| 0),
     };
 
     match outcome {
@@ -103,13 +111,13 @@ fn root_dir() -> Result<PathBuf, String> {
 /// 确认恒为真；确认只属于安装路径（拉起候选槽、等它提交）。客户端是独立进程，
 /// 启动器不观察它的结果。
 #[cfg(windows)]
-fn launch_installed(root: &Path) -> Result<i32, String> {
+fn launch_installed(root: &Path, _data: &Path) -> Result<i32, String> {
     install::launch_installed(root)?;
     Ok(0)
 }
 
 /// Linux 上启动器是常驻的：它守着客户端，客户端退出后把退出码透传给 systemd。
 #[cfg(unix)]
-fn launch_installed(root: &Path) -> Result<i32, String> {
-    supervisor::run(root)
+fn launch_installed(root: &Path, data: &Path) -> Result<i32, String> {
+    supervisor::run(root, data)
 }

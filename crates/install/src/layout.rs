@@ -38,6 +38,11 @@ pub const CONFIG: &str = "config";
 pub const LAUNCHER_VERSION: &str = "launcher.json";
 /// 日志。同样跨版本共享。
 pub const LOG: &str = "log";
+/// 数据目录的厂商段：`%LOCALAPPDATA%\hiromuraki\mesh`。
+pub const VENDOR: &str = "hiromuraki";
+/// 数据目录的产品段。单段 `mesh` 太泛，`LOCALAPPDATA` 又是所有应用共用的扁平命名空间；
+/// 加一层厂商段即够，产品段沿用仓库与二进制的名字，两个平台大小写也一致。
+pub const PRODUCT: &str = "mesh";
 
 /// `launcher.json` 的内容。字段只有版本号：它描述的是安装根下那份启动器。
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -127,6 +132,34 @@ pub fn read_version(slot_dir: &Path) -> Result<String, Error> {
     Ok(manifest::read(&slot_dir.join(MANIFEST))?
         .version()
         .to_string())
+}
+
+/// 数据根：`config/`、`log/`、待装包与安装记录都在这里；安装根只剩可执行文件。
+///
+/// Windows 走 `%LOCALAPPDATA%`，Linux 走 `/var/lib`（客户端是 root 服务）。两者都不是
+/// 从可执行文件的位置推出来的：程序目录可以只读，数据目录必须可写，这是两件事。
+///
+/// `override_dir` 来自 `--data-root`：排障、测试与并行跑两份实例时用它指到别处，
+/// 不用改环境变量——环境变量对被拉起的子进程与被托管的服务都不透明。
+pub fn data_root(override_dir: Option<&Path>) -> Result<PathBuf, Error> {
+    if let Some(dir) = override_dir {
+        if !dir.as_os_str().is_empty() {
+            return Ok(dir.to_path_buf());
+        }
+    }
+    #[cfg(windows)]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| Error::DataRoot {
+                reason: "LOCALAPPDATA".to_string(),
+            })?;
+        Ok(PathBuf::from(base).join(VENDOR).join(PRODUCT))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(PathBuf::from("/var/lib").join(VENDOR).join(PRODUCT))
+    }
 }
 
 /// 从主程序的路径定位安装根：主程序在 `<root>/bin/<槽>` 里，根是槽目录往上第三级。

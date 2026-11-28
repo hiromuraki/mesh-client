@@ -15,8 +15,7 @@ use std::sync::{Arc, RwLock};
 pub struct Snapshot {
     pub status: String,
     pub server_url: String,
-    pub device_id: String,
-    /// 本机设备公钥（标准 base64）。管理员把它填进「新建设备」，认领就靠它。
+    /// 本机设备公钥（标准 base64）。设备身份就是它，管理员把它填进「新建设备」。
     pub pubkey: String,
     pub hostname: String,
     /// 配置里保存的设备名；空表示用本机主机名。
@@ -121,8 +120,7 @@ impl Engine {
         let mut snapshot = Snapshot {
             status: self.status().as_str().to_string(),
             server_url: String::new(),
-            device_id: String::new(),
-            // 公钥在认领之前就有：它正是「把哪台设备建进控制台」的凭据。
+            // 公钥在配置之前就有：它正是「把哪台设备建进控制台」的凭据。
             pubkey: self
                 .store
                 .signing_key()
@@ -175,7 +173,6 @@ impl Engine {
         }
         if let Some(client) = self.client.as_ref() {
             snapshot.server_url = client.server_url.clone();
-            snapshot.device_id = client.device_id.clone();
             snapshot.hostname_set = client.hostname.clone();
             if !client.hostname.trim().is_empty() {
                 snapshot.hostname = client.hostname.clone();

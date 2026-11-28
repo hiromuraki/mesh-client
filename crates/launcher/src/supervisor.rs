@@ -17,12 +17,12 @@ use std::path::Path;
 /// 常驻启动器若一直握着，Linux 上的自动更新就永远提交不了。冲突不靠这把锁预防：
 /// 客户端在跑时手工 `mesh --file` 会被 `client_running` 判据拒掉（除非带
 /// `--wait-for`）。
-pub fn run(root: &Path) -> Result<i32, String> {
+pub fn run(root: &Path, data: &Path) -> Result<i32, String> {
     loop {
-        match round(root)? {
+        match round(root, data)? {
             Round::Running { mut client } => match client.wait()? {
                 // 客户端正常退出并留下了「请安装」信号：回到循环开头装它。
-                0 if root.join(layout::UPDATE_FILE).is_file() => {
+                0 if data.join(layout::UPDATE_FILE).is_file() => {
                     log::line(mesh_text::get(id::LAUNCHER_TEXT_CLIENT_LEFT_UPDATE));
                 }
                 code => return Ok(code),
@@ -39,12 +39,12 @@ enum Round {
     Retry,
 }
 
-fn round(root: &Path) -> Result<Round, String> {
+fn round(root: &Path, data: &Path) -> Result<Round, String> {
     // 整轮在所有权之内：选槽、装包、拉起并确认；确认之后放手再等客户端。
-    let owner = install::own(root)?;
+    let owner = install::own(root, data)?;
     let selected = owner.prepare()?;
     // 待装包是唯一的安装信号：文件名固定；包旁边的摘要由 apply_pending 对着包现算比对。
-    let installed = if root.join(layout::UPDATE_FILE).is_file() {
+    let installed = if data.join(layout::UPDATE_FILE).is_file() {
         owner.apply_pending(selected.as_ref())
     } else {
         None

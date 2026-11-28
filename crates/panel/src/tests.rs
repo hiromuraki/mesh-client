@@ -17,7 +17,6 @@ fn published() -> Published {
         snapshot: Snapshot {
             status: "online".into(),
             server_url: "http://10.126.126.1:8088".into(),
-            device_id: "abc123".into(),
             // 管理面板只在设置页显示它：这是「把本机建进控制台」的凭据。
             pubkey: "ZGV2aWNlLXB1YmxpYy1rZXk=".into(),
             hostname: "laptop".into(),
@@ -281,8 +280,7 @@ fn snapshot_uses_the_frontend_field_names() {
     let body = body_json(&response);
     assert_eq!(body["status"], "online");
     assert_eq!(body["serverUrl"], "http://10.126.126.1:8088");
-    assert_eq!(body["deviceId"], "abc123");
-    // 公钥是认领的唯一凭据：字段名与前端 Snapshot 一致，设置页要拿得到。
+    // 公钥就是设备身份：字段名与前端 Snapshot 一致，设置页要拿得到。
     assert_eq!(body["pubkey"], "ZGV2aWNlLXB1YmxpYy1rZXk=");
     assert_eq!(body["corePid"], 42);
     assert_eq!(body["localIp"], "10.126.126.100/24");
@@ -374,7 +372,7 @@ fn settings_are_forwarded_to_the_engine() {
             assert_eq!(input.server_url, "http://10.126.126.1:8088");
             assert_eq!(input.hostname, "laptop");
             let _ = reply.send(Ok(Snapshot {
-                device_id: "new-id".into(),
+                server_url: "http://10.126.126.1:8088".into(),
                 ..Snapshot::default()
             }));
         }
@@ -384,7 +382,10 @@ fn settings_are_forwarded_to_the_engine() {
     req.body = br#"{"serverUrl":"http://10.126.126.1:8088","hostname":"laptop"}"#.to_vec();
     let response = router.handle(req);
     assert_eq!(response.status, 200);
-    assert_eq!(body_json(&response)["deviceId"], "new-id");
+    assert_eq!(
+        body_json(&response)["serverUrl"],
+        "http://10.126.126.1:8088"
+    );
     engine.join().expect("引擎替身");
 }
 

@@ -88,8 +88,10 @@ fn harness(tag: &str) -> Harness {
     let cell = Arc::new(StateCell::new(Published::default()));
     let (notice_tx, notice_rx) = channel();
     let engine = Engine {
+        protocol: crate::run::Protocol::Pubkey,
         config: Config {
             root: dir.clone(),
+            data: dir.clone(),
             program_dir: dir.join("bin"),
             self_version: "2026.11.26-1".to_string(),
             hostname: "test-host".to_string(),
@@ -118,7 +120,6 @@ fn harness(tag: &str) -> Harness {
         core_halted: false,
         halted_until: None,
         core_tail: Arc::new(CoreTail::default()),
-        auth_fails: 0,
         update: Default::default(),
         next_task: 0,
         launcher: Default::default(),
@@ -244,9 +245,9 @@ fn saved_client(harness: &Harness) -> ClientConfig {
 fn saved_client_named(harness: &Harness, hostname: &str) -> ClientConfig {
     let config = ClientConfig {
         server_url: "http://127.0.0.1:1".to_string(),
-        device_id: "dev-1".to_string(),
         hostname: hostname.to_string(),
         created_at: 1_700_000_000,
+        device_id: String::new(),
     };
     harness.engine.store.save_client(&config).unwrap();
     config
@@ -255,7 +256,7 @@ fn saved_client_named(harness: &Harness, hostname: &str) -> ClientConfig {
 /// 装一个假连接并把它交给引擎。
 fn api(harness: &mut Harness) -> Arc<remote::Client> {
     let key = harness.engine.store.signing_key().unwrap();
-    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", "dev", key));
+    let api = Arc::new(remote::Client::new("http://127.0.0.1:1", key));
     harness.engine.api = Some(Arc::clone(&api));
     api
 }
@@ -301,49 +302,57 @@ fn save_cred(harness: &Harness, id: &str) {
         .unwrap();
 }
 
-// ------------------------------------------------------------ 401 的三支处理
+// ------------------------------------------------------------ 401 的处理
 
+/// 被拒绝的钥匙不改本地任何东西：身份就是这把钥匙，本地没有可清的状态。
+/// 能做的只有报出原因并按控制面失败退避重试。
 #[test]
-fn revoked_clears_the_device_identity() {
-    let mut harness = harness("revoked");
-    saved_client(&harness);
-    let cleared = harness
-        .engine
-        .handle_auth_rejected(&remote::Error::Unauthorized {
-            code: "revoked".to_string(),
+fn a_rejected_key_leaves_the_local_config_alone() {
+    let mut harness = harness("rejected");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config.clone());
+    api(&mut harness);
+    harness.engine.control.gen = 1;
+    harness.engine.on_heartbeat(
+        1,
+        crate::run::Protocol::Pubkey,
+        Err(remote::Error::Unauthorized {
+            code: "unauthorized".to_string(),
             server_time: None,
-        });
-    assert!(cleared, "revoked 必须立刻清身份");
-    let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.device_id, "");
+        }),
+    );
+    assert_eq!(harness.engine.store.load_client().unwrap(), Some(config));
     let snapshot = harness.published();
-    assert_eq!(snapshot.status, "unconfigured");
+    assert_eq!(snapshot.status, "degraded");
     assert!(
-        snapshot.last_error.contains("revoked"),
+        snapshot.last_error.contains("401"),
         "{}",
         snapshot.last_error
     );
+    assert!(harness.engine.control.due.is_some(), "被拒绝要继续退避重试");
 }
 
+/// 时钟偏差只说去对时：同样不动本地配置，也不把原因说成「钥匙不被接受」。
 #[test]
-fn a_clock_skew_only_degrades_and_keeps_the_identity() {
+fn a_clock_skew_is_explained_and_keeps_the_config() {
     let mut harness = harness("skew");
     let config = saved_client(&harness);
-    harness.engine.client = Some(config);
-    harness.engine.control.failures = 1;
+    harness.engine.client = Some(config.clone());
+    api(&mut harness);
     // 本机比服务端快 10 分钟（Date 头是服务端时间）。
     let server_time = SystemTime::now() - Duration::from_secs(600);
-    for attempt in 1..=10 {
-        let cleared = harness
-            .engine
-            .handle_auth_rejected(&remote::Error::Unauthorized {
+    for gen in 1..=3 {
+        harness.engine.control.gen = gen;
+        harness.engine.on_heartbeat(
+            gen,
+            crate::run::Protocol::Pubkey,
+            Err(remote::Error::Unauthorized {
                 code: "unauthorized".to_string(),
                 server_time: Some(server_time),
-            });
-        assert!(!cleared, "时钟偏差不能清身份（第 {attempt} 次）");
+            }),
+        );
     }
-    let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.device_id, "dev-1", "device_id 被时钟偏差清掉了");
+    assert_eq!(harness.engine.store.load_client().unwrap(), Some(config));
     let snapshot = harness.published();
     assert_eq!(snapshot.status, "degraded");
     assert!(
@@ -353,52 +362,19 @@ fn a_clock_skew_only_degrades_and_keeps_the_identity() {
     );
 }
 
+/// 5xx 是服务端自己的临时状况：按控制面失败退避重试，不动本地配置
+/// （nonce 缓存饱和也走这一支）。
 #[test]
-fn three_plain_401s_clear_the_identity() {
-    let mut harness = harness("401");
-    saved_client(&harness);
-    let plain = remote::Error::Unauthorized {
-        code: "unauthorized".to_string(),
-        server_time: None,
-    };
-    assert!(!harness.engine.handle_auth_rejected(&plain), "第 1 次不清");
-    assert!(!harness.engine.handle_auth_rejected(&plain), "第 2 次不清");
-    assert!(harness.engine.handle_auth_rejected(&plain), "第 3 次才清");
-    let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.device_id, "");
-}
-
-#[test]
-fn a_successful_request_resets_the_auth_failure_counter() {
-    let mut harness = harness("reset");
-    saved_client(&harness);
-    let plain = remote::Error::Unauthorized {
-        code: "unauthorized".to_string(),
-        server_time: None,
-    };
-    for _ in 0..2 {
-        assert!(!harness.engine.handle_auth_rejected(&plain));
-    }
-    harness.engine.reset_auth_fails();
-    for _ in 0..2 {
-        assert!(!harness.engine.handle_auth_rejected(&plain));
-    }
-    let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.device_id, "dev-1");
-}
-
-/// 5xx 是服务端自己的临时状况，不是身份失效：按控制面失败退避重试，既不累加
-/// 认证失败次数，也不清本地身份（nonce 缓存饱和也走这一支）。
-#[test]
-fn a_server_error_is_retried_without_touching_the_identity() {
+fn a_server_error_is_retried_without_touching_the_config() {
     let mut harness = harness("server-error");
     let config = saved_client(&harness);
-    harness.engine.client = Some(config);
+    harness.engine.client = Some(config.clone());
     api(&mut harness);
     for attempt in 1..=5u64 {
         harness.engine.control.gen = attempt;
         harness.engine.on_heartbeat(
             attempt,
+            crate::run::Protocol::Pubkey,
             Err(remote::Error::Api {
                 status: 503,
                 code: "unavailable".to_string(),
@@ -406,9 +382,11 @@ fn a_server_error_is_retried_without_touching_the_identity() {
             }),
         );
     }
-    let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.device_id, "dev-1", "5xx 不能清掉身份");
-    assert_eq!(harness.engine.auth_fails, 0, "5xx 不计认证失败");
+    assert_eq!(
+        harness.engine.store.load_client().unwrap(),
+        Some(config.clone()),
+        "5xx 不能清掉配置"
+    );
     assert_eq!(harness.engine.control.failures, 5, "5xx 按控制面失败退避");
     assert!(
         harness.engine.control.due.is_some(),
@@ -418,7 +396,9 @@ fn a_server_error_is_retried_without_touching_the_identity() {
 
     // 服务端恢复（204）就回到正常节拍，身份与计数都还是那份。
     harness.engine.control.gen = 6;
-    harness.engine.on_heartbeat(6, Ok(None));
+    harness
+        .engine
+        .on_heartbeat(6, crate::run::Protocol::Pubkey, Ok(None));
     assert_eq!(harness.engine.control.failures, 0);
     assert!(harness.engine.last_hb > 0);
 }
@@ -507,10 +487,10 @@ fn a_formal_node_reports_an_empty_credential_id() {
     );
 }
 
-/// 面板上的「凭证过期」就是落盘那份凭据的到期时间：心跳下发的凭据带着它，
-/// 引擎落盘后重算身份摘要，快照跟着它走（前端据此显示剩余天数）。
+/// 面板上的「凭证过期」就是落盘那份凭据的到期时间，快照跟着它走
+/// （前端据此显示剩余天数）。
 #[test]
-fn the_panel_shows_the_credential_expiry_from_the_heartbeat() {
+fn the_panel_shows_the_credential_expiry_from_the_stored_file() {
     let mut harness = harness("cred-expiry");
     let config = saved_client(&harness);
     harness.engine.client = Some(config);
@@ -519,37 +499,21 @@ fn the_panel_shows_the_credential_expiry_from_the_heartbeat() {
         .store
         .write_config("ipv4 = \"10.0.0.1/24\"\n")
         .unwrap();
-    api(&mut harness);
-    harness.engine.control.gen = 1;
-
-    harness.engine.on_heartbeat(
-        1,
-        Ok(Some(remote::Heartbeat {
-            credential: "Y3JlZC0x".to_string(),
-            credential_id: "cred-9".to_string(),
-            credential_expiry: 1_798_000_000,
-            ..remote::Heartbeat::default()
-        })),
-    );
-
-    let stored = harness.engine.store.load_credential().unwrap().unwrap();
-    assert_eq!(
-        stored.expires_at, 1_798_000_000,
-        "到期时间要跟着凭据一起落盘"
-    );
+    save_cred(&harness, "cred-9");
+    harness.engine.refresh_identity();
     let snapshot = harness.published();
     assert_eq!(snapshot.auth_mode, "credential");
     assert_eq!(
-        snapshot.credential_expiry, 1_798_000_000,
-        "面板显示的到期时间必须来自落盘的那份凭据"
+        snapshot.credential_expiry, 0,
+        "没有记录到期时间时面板显示 0，而不是猜一个"
     );
 }
 
-/// 封装坏了就这一轮作废：不写盘，也不回落到响应里的明文字段——能改响应字节的
-/// 一方正是这条封装要防的人，回落等于把封装变成可选的装饰。
+/// 心跳带回来的凭据必须是被封给本机公钥的那一份：没有封装就说明这一次没有
+/// 签发，不写盘、也不报错（正式节点与未到签发时机的节点每轮都长这样）。
 #[test]
-fn a_broken_sealed_credential_is_not_taken_from_the_plaintext() {
-    let mut harness = harness("sealed-broken");
+fn an_unsealed_credential_is_not_written() {
+    let mut harness = harness("sealed-missing");
     let config = saved_client(&harness);
     harness.engine.client = Some(config);
     api(&mut harness);
@@ -557,9 +521,8 @@ fn a_broken_sealed_credential_is_not_taken_from_the_plaintext() {
 
     harness.engine.on_heartbeat(
         1,
+        crate::run::Protocol::Pubkey,
         Ok(Some(remote::Heartbeat {
-            credential: "Y3JlZC0x".to_string(),
-            credential_sealed: "AAAA".to_string(),
             credential_id: "cred-9".to_string(),
             credential_expiry: 1_798_000_000,
             ..remote::Heartbeat::default()
@@ -568,12 +531,48 @@ fn a_broken_sealed_credential_is_not_taken_from_the_plaintext() {
 
     assert!(
         harness.engine.store.load_credential().unwrap().is_none(),
-        "坏掉的封装回落到了明文凭据"
+        "没有封装的凭据不能写盘"
     );
+    assert_eq!(harness.engine.last_error, "", "这不是错误，只是一次没下发");
+}
+
+/// 过渡期：控制面还在认 `deviceId` 时，心跳先撞一次 401，退回旧协议成功之后锁住它，
+/// 下一轮不再多撞一次。
+#[test]
+fn a_legacy_control_plane_is_reached_through_the_device_id_fallback() {
+    let stub = Stub::new(vec![
+        (401, br#"{"code":"unauthorized"}"#.to_vec()),
+        (204, Vec::new()),
+        (204, Vec::new()),
+    ]);
+    let mut harness = harness("legacy-fallback");
+    harness
+        .engine
+        .store
+        .save_client(&ClientConfig {
+            server_url: stub.url.clone(),
+            hostname: "laptop".to_string(),
+            created_at: 1,
+            device_id: "dev-1".to_string(),
+        })
+        .unwrap();
+    harness.engine.client = harness.engine.store.load_client().unwrap();
+
+    harness.engine.beat_now();
+    assert_eq!(
+        harness.engine.protocol,
+        crate::run::Protocol::DeviceId,
+        "旧协议说得通就锁住它"
+    );
+    assert!(harness.engine.last_hb > 0);
+
+    harness.engine.beat_now();
+    let requests = stub.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "第一次撞 401 退一次，第二次直接走旧协议");
+    let body = String::from_utf8_lossy(&requests[1].1);
     assert!(
-        harness.engine.last_error.contains("解封"),
-        "错误提示没有说明是解封失败：{}",
-        harness.engine.last_error
+        body.contains("\"deviceId\":\"dev-1\""),
+        "退回去的那次请求要带 deviceId: {body}"
     );
 }
 
@@ -645,6 +644,7 @@ fn a_heartbeat_without_a_config_body_is_not_a_config_change() {
     // 只带发布信息、没有 configB64：与 204 一样，没有配置要应用。
     harness.engine.on_heartbeat(
         1,
+        crate::run::Protocol::Pubkey,
         Ok(Some(remote::Heartbeat {
             config_hash: "stale".to_string(),
             ..remote::Heartbeat::default()
@@ -674,6 +674,7 @@ fn a_heartbeat_with_a_config_body_is_applied() {
     let body = "aG9zdG5hbWUgPSAibGFwdG9wIgppcHY0ID0gIjEwLjAuMC4xLzI0Igo=";
     harness.engine.on_heartbeat(
         1,
+        crate::run::Protocol::Pubkey,
         Ok(Some(remote::Heartbeat {
             config_hash: "h1".to_string(),
             config_b64: body.to_string(),
@@ -1077,6 +1078,7 @@ fn the_engine_thread_starts_publishes_and_exits() {
     let (tx, handle) = crate::spawn(
         Config {
             root: dir.clone(),
+            data: dir.clone(),
             program_dir,
             self_version: "2026.11.26-9".to_string(),
             hostname: "test-host".to_string(),
@@ -1152,7 +1154,9 @@ fn a_heartbeat_without_a_running_core_starts_it() {
     save_cred(&harness, "cred-1");
     api(&mut harness);
     harness.engine.control.gen = 1;
-    harness.engine.on_heartbeat(1, Ok(None));
+    harness
+        .engine
+        .on_heartbeat(1, crate::run::Protocol::Pubkey, Ok(None));
     assert!(matches!(harness.next_core(), Recorded::Start(_)));
 }
 
@@ -1171,7 +1175,9 @@ fn a_successful_heartbeat_recovers_the_status() {
     harness.engine.core = Some(applied_core(&harness));
     harness.engine.fault = "上一次失败".to_string();
     harness.engine.control.gen = 1;
-    harness.engine.on_heartbeat(1, Ok(None));
+    harness
+        .engine
+        .on_heartbeat(1, crate::run::Protocol::Pubkey, Ok(None));
     let snapshot = harness.published();
     assert_eq!(snapshot.status, "online");
     assert_eq!(snapshot.last_error, "");
@@ -1187,13 +1193,16 @@ fn a_heartbeat_401_does_not_clear_the_identity_on_the_first_strike() {
     harness.engine.control.gen = 1;
     harness.engine.on_heartbeat(
         1,
+        crate::run::Protocol::Pubkey,
         Err(remote::Error::Unauthorized {
             code: "unauthorized".to_string(),
             server_time: None,
         }),
     );
-    let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.device_id, "dev-1");
+    assert!(
+        harness.engine.store.load_client().unwrap().is_some(),
+        "401 不能清掉本地配置"
+    );
     assert_eq!(harness.published().status, "degraded");
 }
 
@@ -1216,7 +1225,9 @@ fn a_stale_heartbeat_result_is_ignored() {
     // 重连过一次：当前代次是 2，代次 1 的结果已经过期。
     harness.engine.control.gen = 2;
 
-    harness.engine.on_heartbeat(1, Ok(None));
+    harness
+        .engine
+        .on_heartbeat(1, crate::run::Protocol::Pubkey, Ok(None));
 
     let snapshot = harness.published();
     assert_eq!(snapshot.status, "error", "旧连接的心跳不能把状态改回去");
@@ -1226,7 +1237,9 @@ fn a_stale_heartbeat_result_is_ignored() {
     );
 
     // 当前代次照常生效。
-    harness.engine.on_heartbeat(2, Ok(None));
+    harness
+        .engine
+        .on_heartbeat(2, crate::run::Protocol::Pubkey, Ok(None));
     assert_eq!(harness.published().status, "online");
 }
 
@@ -1262,14 +1275,12 @@ fn a_control_outage_does_not_stop_the_core_revival() {
     );
 }
 
-/// 首次请求与周期心跳走同一段响应处理：第一次带配置与凭据，第二次没有任何变化。
+/// 首次请求与周期心跳走同一段响应处理：第一次带配置，第二次没有任何变化。
 #[test]
 fn the_first_and_periodic_heartbeats_share_one_response_handler() {
     let toml = "hostname = \"laptop\"\nipv4 = \"10.0.0.1/24\"\n";
     let config_b64 = "aG9zdG5hbWUgPSAibGFwdG9wIgppcHY0ID0gIjEwLjAuMC4xLzI0Igo=";
-    let first = format!(
-        r#"{{"configHash":"h1","configB64":"{config_b64}","credentialId":"cred-1","credential":"Y3JlZC0x"}}"#
-    );
+    let first = format!(r#"{{"configHash":"h1","configB64":"{config_b64}"}}"#);
     let stub = Stub::new(vec![(200, first.into_bytes()), (204, Vec::new())]);
     let mut harness = harness("beat-unified");
     harness
@@ -1277,21 +1288,19 @@ fn the_first_and_periodic_heartbeats_share_one_response_handler() {
         .store
         .save_client(&ClientConfig {
             server_url: stub.url.clone(),
-            device_id: "dev-1".to_string(),
             hostname: "laptop".to_string(),
             created_at: 1,
+            device_id: String::new(),
         })
         .unwrap();
+    // 凭据节点要有一张凭据才能起 core：这一轮心跳只负责把配置带回来。
+    save_cred(&harness, "cred-1");
     harness.engine.client = harness.engine.store.load_client().unwrap();
 
     harness.engine.beat_now();
     assert_eq!(
         harness.engine.store.read_config().unwrap().as_deref(),
         Some(toml)
-    );
-    assert_eq!(
-        harness.engine.store.load_credential().unwrap().unwrap().id,
-        "cred-1"
     );
     assert!(matches!(harness.next_core(), Recorded::Start(_)));
 
@@ -2361,52 +2370,37 @@ fn read_request(stream: &mut std::net::TcpStream) -> (String, Vec<u8>) {
     (request_line, body)
 }
 
+/// 保存设置只写本地：控制面那边没有要写的状态，认领由每一次签名心跳完成。
 #[test]
-fn registering_persists_the_identity_and_leaves_activation_to_the_loop() {
-    let reply = r#"{"deviceId":"d-server","configToml":"hostname = \"laptop\"\nipv4 = \"10.0.0.1/24\"\n","configHash":"h1"}"#;
-    let stub = Stub::new(vec![(200, reply.as_bytes().to_vec())]);
-    let mut harness = harness("register");
-    let pubkey = mesh_state::public_key_base64(&harness.engine.store.signing_key().unwrap());
+fn saving_settings_persists_the_config_and_leaves_activation_to_the_loop() {
+    let mut harness = harness("settings-save");
     harness
         .engine
         .save_settings(crate::SettingsInput {
-            server_url: stub.url.clone(),
+            server_url: "http://127.0.0.1:9".to_string(),
             hostname: "laptop".to_string(),
         })
         .unwrap();
     let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.device_id, "d-server");
-    assert_eq!(client.server_url, stub.url);
+    assert_eq!(client.server_url, "http://127.0.0.1:9");
+    assert_eq!(client.hostname, "laptop");
     assert!(client.created_at > 0);
-    // 认领成功才 bind：身份已经落盘，快照随之报出这一代。
-    assert_eq!(harness.engine.snapshot().device_id, "d-server");
+    // 保存之后配置已经落盘、快照随之报出这一代，但还没有拿到任何下发内容。
+    assert_eq!(harness.engine.snapshot().server_url, "http://127.0.0.1:9");
     assert_eq!(harness.engine.snapshot().status, "connecting");
     assert!(harness.engine.store.read_config().unwrap().is_none());
     assert!(harness.engine.store.load_credential().unwrap().is_none());
-    let requests = stub.requests.lock().unwrap();
-    assert_eq!(requests[0].0, "POST /api/v1/register HTTP/1.1");
-    let body = String::from_utf8_lossy(&requests[0].1);
-    assert!(!body.contains("\"token\""), "注册请求里不该有令牌: {body}");
-    assert!(body.contains("\"hostname\":\"laptop\""), "body = {body}");
-    // 请求里的公钥必须就是本机私钥对应的那一把：管理员把它填进「新建设备」。
-    assert!(
-        body.contains(&format!("\"pubkey\":\"{pubkey}\"")),
-        "body = {body}"
-    );
-    assert!(body.contains("\"signature\":"), "body = {body}");
+    harness.expect_no_core();
 }
 
+/// 第一次心跳就把配置带回来：保存本身不发请求，也不等控制面点头。
 #[test]
-fn a_registered_identity_is_activated_by_a_plain_heartbeat() {
-    let reply = r#"{"deviceId":"d-server","configToml":"","configHash":"h1"}"#;
+fn a_saved_config_is_activated_by_a_plain_heartbeat() {
     let toml = "hostname = \"laptop\"\nipv4 = \"10.0.0.1/24\"\n";
     let config_b64 = "aG9zdG5hbWUgPSAibGFwdG9wIgppcHY0ID0gIjEwLjAuMC4xLzI0Igo=";
     let beat = format!(r#"{{"configHash":"h1","configB64":"{config_b64}"}}"#);
-    let stub = Stub::new(vec![
-        (200, reply.as_bytes().to_vec()),
-        (200, beat.as_bytes().to_vec()),
-    ]);
-    let mut harness = harness("register-activate");
+    let stub = Stub::new(vec![(200, beat.into_bytes())]);
+    let mut harness = harness("settings-activate");
     harness
         .engine
         .save_settings(crate::SettingsInput {
@@ -2414,9 +2408,12 @@ fn a_registered_identity_is_activated_by_a_plain_heartbeat() {
             hostname: "laptop".to_string(),
         })
         .unwrap();
-    assert!(harness.engine.store.read_config().unwrap().is_none());
+    assert!(
+        harness.engine.store.read_config().unwrap().is_none(),
+        "保存不拉配置，配置只能由心跳带回来"
+    );
 
-    // 模拟「进程重启」：进程里没有任何内存状态，只有盘上那份身份。
+    // 模拟「进程重启」：进程里没有任何内存状态，只有盘上那份配置。
     harness.engine.reload_identity();
     harness.engine.beat_now();
 
@@ -2425,24 +2422,23 @@ fn a_registered_identity_is_activated_by_a_plain_heartbeat() {
         Some(toml)
     );
     let requests = stub.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2, "第二次是心跳，不是重放注册");
-    assert_eq!(requests[1].0, "POST /api/v1/heartbeat HTTP/1.1");
+    assert_eq!(requests.len(), 1, "只有心跳，没有注册请求");
+    assert_eq!(requests[0].0, "POST /api/v1/heartbeat HTTP/1.1");
 }
 
-/// 换代次：先把旧一代的配置与凭据从可读位置删掉，再写新身份。
+/// 换代次：先把旧一代的配置与凭据从可读位置删掉，再写新配置。
 #[test]
 fn switching_the_control_plane_drops_the_previous_generation() {
-    let reply = r#"{"deviceId":"same-id","configToml":"","configHash":"h1"}"#;
-    let stub = Stub::new(vec![(200, reply.as_bytes().to_vec())]);
-    let mut harness = harness("register-switch");
+    let stub = Stub::new(vec![]);
+    let mut harness = harness("settings-switch");
     harness
         .engine
         .store
         .save_client(&ClientConfig {
             server_url: "http://127.0.0.1:9".to_string(),
-            device_id: "same-id".to_string(),
             hostname: String::new(),
             created_at: 1,
+            device_id: String::new(),
         })
         .unwrap();
     harness
@@ -2465,7 +2461,6 @@ fn switching_the_control_plane_drops_the_previous_generation() {
 
     let client = harness.engine.store.load_client().unwrap().unwrap();
     assert_eq!(client.server_url, stub.url);
-    assert_eq!(client.device_id, "same-id", "设备 id 没变，代次却变了");
     assert!(
         harness.engine.store.load_credential().unwrap().is_none(),
         "上一代控制面的凭据必须作废"
@@ -2480,21 +2475,19 @@ fn switching_the_control_plane_drops_the_previous_generation() {
     );
 }
 
-/// 清理失败就是这次保存失败：不留下「新身份配旧配置」的一代。
+/// 清理失败就是这次保存失败：不留下「新地址配旧配置」的一代。
 #[test]
-fn a_failed_generation_cleanup_keeps_the_old_identity() {
-    // 认领先成功：这里要验的是「认领成功、清理失败」这一刻。
-    let reply = br#"{"deviceId":"same-id","configToml":"","configHash":""}"#;
-    let stub = Stub::new(vec![(200, reply.to_vec())]);
+fn a_failed_generation_cleanup_keeps_the_old_config() {
+    let stub = Stub::new(vec![]);
     let mut harness = harness("switch-cleanup-fails");
     harness
         .engine
         .store
         .save_client(&ClientConfig {
             server_url: "http://127.0.0.1:9".to_string(),
-            device_id: "same-id".to_string(),
             hostname: String::new(),
             created_at: 1,
+            device_id: String::new(),
         })
         .unwrap();
     // config.toml 是目录：remove_file 会失败（Windows 与 Unix 都如此）。
@@ -2509,16 +2502,14 @@ fn a_failed_generation_cleanup_keeps_the_old_identity() {
         .unwrap_err();
     assert!(err.contains("config.toml"), "err = {err}");
     let client = harness.engine.store.load_client().unwrap().unwrap();
-    assert_eq!(client.server_url, "http://127.0.0.1:9", "旧身份不能被换掉");
+    assert_eq!(client.server_url, "http://127.0.0.1:9", "旧配置不能被换掉");
 }
 
-/// 换绑的中途失败：旧数据面先停下了，清理却没做成。这是一次明确失败，不是半换绑：
-/// 旧一代的身份与配置原样留着，下一轮心跳仍按同一份身份收敛。
+/// 换代次的中途失败：旧数据面先停下了，清理却没做成。这是一次明确失败，不是半换：
+/// 旧一代的配置原样留着，下一轮心跳仍按同一份配置收敛。
 #[test]
 fn a_failed_generation_cleanup_stops_the_old_data_plane_first() {
-    // 认领先成功：这里要验的是「认领成功、清理失败」这一刻。
-    let reply = br#"{"deviceId":"dev-1","configToml":"","configHash":""}"#;
-    let stub = Stub::new(vec![(200, reply.to_vec())]);
+    let stub = Stub::new(vec![]);
     let mut harness = harness("switch-cleanup-fails-core");
     let config = saved_client(&harness);
     harness.engine.client = Some(config);
@@ -2593,13 +2584,11 @@ fn an_interrupted_generation_switch_stops_the_running_core() {
     harness.expect_no_core();
 }
 
-/// 换绑：控制面地址变了就是另一代。旧数据面必须先停下，新控制面还没下发配置时
-/// 什么都不启动，旧一代的配置、凭据与认证失败计数一起作废。
+/// 换控制面：地址变了就是另一代。旧数据面必须先停下，新控制面还没下发配置时
+/// 什么都不启动，旧一代的配置与凭据一起作废。
 #[test]
 fn rebinding_to_another_control_plane_stops_the_running_core() {
-    // 保存即认领：新控制面必须先应下这次认领，换绑才会走到清理这一步。
-    let reply = br#"{"deviceId":"dev-1","configToml":"","configHash":""}"#;
-    let stub = Stub::new(vec![(200, reply.to_vec())]);
+    let stub = Stub::new(vec![]);
     let mut harness = harness("rebind-stop");
     let config = saved_client(&harness);
     harness.engine.client = Some(config);
@@ -2610,7 +2599,6 @@ fn rebinding_to_another_control_plane_stops_the_running_core() {
         .unwrap();
     save_cred(&harness, "cred-old");
     harness.engine.core = Some(applied_core(&harness));
-    harness.engine.auth_fails = 2;
 
     harness
         .engine
@@ -2645,7 +2633,6 @@ fn rebinding_to_another_control_plane_stops_the_running_core() {
             .server_url,
         stub.url
     );
-    assert_eq!(harness.engine.auth_fails, 0, "认证失败计数属于上一代");
 }
 
 /// 旧数据面停不掉：失败必须可见，并且按重拉档位有界重试；停下之后实例才消失。
@@ -2685,18 +2672,17 @@ fn a_core_that_cannot_be_stopped_stays_visible_and_is_retried() {
 }
 
 #[test]
-fn re_registering_on_the_same_control_plane_keeps_the_local_state() {
-    let reply = r#"{"deviceId":"same-id","configToml":"","configHash":"h1"}"#;
-    let stub = Stub::new(vec![(200, reply.as_bytes().to_vec())]);
-    let mut harness = harness("register-same");
+fn saving_the_same_control_plane_again_keeps_the_local_state() {
+    let stub = Stub::new(vec![]);
+    let mut harness = harness("settings-same");
     harness
         .engine
         .store
         .save_client(&ClientConfig {
             server_url: stub.url.clone(),
-            device_id: "same-id".to_string(),
             hostname: String::new(),
             created_at: 1,
+            device_id: String::new(),
         })
         .unwrap();
     harness
@@ -2722,7 +2708,7 @@ fn re_registering_on_the_same_control_plane_keeps_the_local_state() {
         harness.engine.store.load_credential().unwrap().unwrap().id,
         "cred-kept"
     );
-    // created_at 是「这台设备第一次被接受」的时刻，再次认领不该刷新它。
+    // created_at 是这份配置第一次生效的时刻，再次保存不该刷新它。
     assert_eq!(
         harness
             .engine
@@ -2738,15 +2724,14 @@ fn re_registering_on_the_same_control_plane_keeps_the_local_state() {
 /// 设备名是 core 的启动参数：规格变了就换进程，没变就不动。
 #[test]
 fn changing_the_device_name_replaces_the_core() {
-    // 两次保存都要认领成功；控制面地址与设备 id 不变，换的只是设备名。
-    let reply = br#"{"deviceId":"dev-1","configToml":"","configHash":""}"#;
-    let stub = Stub::new(vec![(200, reply.to_vec()), (200, reply.to_vec())]);
+    // 控制面地址不变，换的只是设备名。
+    let stub = Stub::new(vec![]);
     let mut harness = harness("settings-hostname");
     let config = ClientConfig {
         server_url: stub.url.clone(),
-        device_id: "dev-1".to_string(),
         hostname: "old".to_string(),
         created_at: 1_700_000_000,
+        device_id: String::new(),
     };
     harness.engine.store.save_client(&config).unwrap();
     harness
@@ -2785,48 +2770,6 @@ fn changing_the_device_name_replaces_the_core() {
     harness.expect_no_core();
 }
 
-/// 保存设置就是认领：没有令牌可交，也没有「已有身份就只存本地」这支。认领被拒时
-/// 磁盘与进程里的身份都不动——写一半再回滚，等于让 core 拿一代不存在的身份去连。
-#[test]
-fn a_failed_claim_writes_nothing() {
-    let stub = Stub::new(vec![(401, br#"{"code":"unauthorized"}"#.to_vec())]);
-    let mut harness = harness("settings-claim-fails");
-    let config = saved_client(&harness);
-    harness.engine.client = Some(config.clone());
-
-    let err = harness
-        .engine
-        .save_settings(crate::SettingsInput {
-            server_url: stub.url.clone(),
-            hostname: "laptop".to_string(),
-        })
-        .unwrap_err();
-    assert_eq!(
-        err,
-        mesh_text::get(mesh_text::id::ENGINE_TEXT_DEVICE_NOT_CLAIMED),
-        "认领被拒要报「控制台还不认这把公钥」"
-    );
-    assert_eq!(
-        harness.engine.store.load_client().unwrap().unwrap(),
-        config,
-        "认领失败不能动磁盘上的身份（含 created_at）"
-    );
-    assert_eq!(
-        harness.engine.client.as_ref().unwrap(),
-        &config,
-        "认领失败不能换掉进程里的身份"
-    );
-    assert!(harness.engine.store.read_config().unwrap().is_none());
-    assert!(harness.engine.store.load_credential().unwrap().is_none());
-    assert_eq!(
-        harness.engine.snapshot().server_url,
-        config.server_url,
-        "失败的那次保存不能出现在快照里"
-    );
-    harness.expect_no_core();
-    assert_eq!(stub.requests.lock().unwrap().len(), 1, "失败只发一次认领");
-}
-
 /// 设置页显示的公钥就是本机私钥对应的那一把：认领之前它已经存在，管理员正是
 /// 照着它把设备建进控制台。
 #[test]
@@ -2850,7 +2793,7 @@ fn the_package_becomes_the_fixed_name_only_when_it_is_accepted() {
     let stub = Stub::new(vec![(200, payload.clone())]);
     let harness = harness("download");
     let key = harness.engine.store.signing_key().unwrap();
-    let api = remote::Client::new(&stub.url, "dev-1", key);
+    let api = remote::Client::new(&stub.url, key);
     let want = {
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(&payload))
@@ -2917,7 +2860,7 @@ fn a_missing_digest_is_refused() {
     let stub = Stub::new(vec![(200, b"package-bytes".to_vec())]);
     let harness = harness("download-no-digest");
     let key = harness.engine.store.signing_key().unwrap();
-    let api = remote::Client::new(&stub.url, "dev-1", key);
+    let api = remote::Client::new(&stub.url, key);
     let err = crate::update::download_package(&api, &harness.dir, &stub.url, "").unwrap_err();
     assert!(err.contains("没有给出包摘要"), "err = {err}");
     assert!(!harness.dir.join("update.tar.zst.part").exists());
@@ -2929,7 +2872,7 @@ fn a_mismatched_digest_is_refused() {
     let stub = Stub::new(vec![(200, b"package-bytes".to_vec())]);
     let harness = harness("download-mismatch");
     let key = harness.engine.store.signing_key().unwrap();
-    let api = remote::Client::new(&stub.url, "dev-1", key);
+    let api = remote::Client::new(&stub.url, key);
     let err = crate::update::download_package(&api, &harness.dir, &stub.url, &"0".repeat(64))
         .unwrap_err();
     assert!(err.contains("包摘要不符"), "err = {err}");

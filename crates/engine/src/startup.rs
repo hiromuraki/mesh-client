@@ -31,12 +31,14 @@ impl StartupBlocked {
 #[cfg(windows)]
 pub(crate) fn check(
     root: &Path,
+    data: &Path,
     _slot_dir: &Path,
     config_harden_error: Option<&str>,
     log: &Log,
 ) -> Result<(), StartupBlocked> {
     check_with(
         root,
+        data,
         config_harden_error,
         log,
         mesh_state::harden_install_root,
@@ -47,6 +49,7 @@ pub(crate) fn check(
 #[cfg(windows)]
 pub(crate) fn check_with(
     root: &Path,
+    data: &Path,
     config_harden_error: Option<&str>,
     log: &Log,
     harden: impl FnOnce(&Path) -> std::io::Result<()>,
@@ -60,7 +63,7 @@ pub(crate) fn check_with(
         ));
     }
     if let Some(err) = config_harden_error {
-        let config = root.join(mesh_install::layout::CONFIG);
+        let config = data.join(mesh_install::layout::CONFIG);
         let reason = format(id::ENGINE_ERROR_HARDEN_CONFIG, &[&config.display(), &err]);
         return Err(StartupBlocked::new(
             log,
@@ -75,6 +78,7 @@ pub(crate) fn check_with(
 #[cfg(unix)]
 pub(crate) fn check(
     root: &Path,
+    _data: &Path,
     slot_dir: &Path,
     _config_harden_error: Option<&str>,
     log: &Log,
@@ -117,8 +121,10 @@ mod tests {
         let dir = temp_dir("root");
         let path = dir.join("client.log");
         let log = Log::open(&path).unwrap();
-        let blocked =
-            check_with(&dir, None, &log, |_| Err(io::Error::other("access denied"))).unwrap_err();
+        let blocked = check_with(&dir, &dir, None, &log, |_| {
+            Err(io::Error::other("access denied"))
+        })
+        .unwrap_err();
         assert!(blocked.report.starts_with("ERROR "), "{}", blocked.report);
         assert!(
             blocked.reason.contains("access denied"),
@@ -136,7 +142,7 @@ mod tests {
     fn a_failed_config_harden_blocks_startup() {
         let dir = temp_dir("config");
         let log = Log::open(&dir.join("client.log")).unwrap();
-        let blocked = check_with(&dir, Some("access denied"), &log, |_| Ok(())).unwrap_err();
+        let blocked = check_with(&dir, &dir, Some("access denied"), &log, |_| Ok(())).unwrap_err();
         assert!(blocked.report.starts_with("ERROR "), "{}", blocked.report);
         assert!(
             blocked.reason.contains("access denied"),

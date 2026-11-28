@@ -1,4 +1,5 @@
-// 编译 Windows 资源：图标。启动器自己是 asInvoker，不需要额外 manifest。
+// 编译 Windows 资源：图标。启动器是 asInvoker：手工启动时由人决定要不要以管理员
+// 身份运行，不给二进制钉一个「永远提权」的清单。
 //
 // Linux 目标下 winresource 不在依赖里（Cargo.toml 按 target 分），所以整个资源
 // 编译必须跟着 cfg 一起消失；判断也写在 cfg 块里，别让非 Windows 的 main 以

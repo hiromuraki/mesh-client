@@ -1,8 +1,8 @@
-//! 设备面 HTTP：注册、心跳、整包下载。
+//! 设备面 HTTP：心跳、整包下载。
 //!
-//! 对应 Go 的 `internal/remote`。这一层不知道磁盘布局，也不持有身份：
-//! 密钥由引擎从 `mesh-state` 取出来传进来，`device_id` 是构造时给的一个字符串。
-//! 这样“谁是设备”与“怎么说话”分开，401 的分类处理留在引擎里。
+//! 对应 Go 的 `internal/remote`。这一层不知道磁盘布局：密钥由引擎从 `mesh-state`
+//! 取出来传进来，设备身份就是这把钥匙的公钥。这样“谁是设备”与“怎么说话”分开，
+//! 401 的处理留在引擎里。
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
@@ -19,8 +19,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 心跳响应体的上限（与 Go 版一致）。配置只有几 KB，超过这个量说明对端不对。
 const MAX_HEARTBEAT_BODY: u64 = 1 << 20;
-/// 注册响应体的上限：注册会带回整份配置，比心跳宽松。
-const MAX_REGISTER_BODY: u64 = 8 << 20;
 /// 错误响应体的上限：只需要读到 code 与一句话。
 const MAX_ERROR_BODY: u64 = 4096;
 
@@ -32,8 +30,8 @@ const CREDENTIAL_SECRET_LEN: usize = 32;
 
 /// 设备面 HTTP 的错误。
 ///
-/// `Unauthorized` 必须独立成变体并带上 `code` 与 `Date` 头：引擎要分三支
-/// （`revoked` / 时钟偏差 / 其它），把它们折成一句话就没法分了。
+/// `Unauthorized` 必须独立成变体并带上 `code` 与 `Date` 头：引擎要按时钟偏差与
+/// 其它原因分别提示，把它们折成一句话就没法分了。
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("401 {code}")]
@@ -66,8 +64,7 @@ pub enum Error {
 impl Error {
     /// 401 响应体里的 `code`；不是 401 时是空串。
     ///
-    /// 契约里只有“设备身份已被删除”会给 `revoked`，其余校验失败一律 `unauthorized`，
-    /// 所以这里不需要再细分。
+    /// 契约里校验失败一律是 `unauthorized`，这里保留 `code` 只为把它写进日志。
     pub fn unauthorized_code(&self) -> Option<&str> {
         match self {
             Error::Unauthorized { code, .. } => Some(code),
@@ -79,55 +76,25 @@ impl Error {
 /// 绑定一个服务端地址与设备身份。
 pub struct Client {
     base_url: String,
-    device_id: String,
+    /// 本机公钥的 base64：设备身份就是它，服务端按它找到槽位。
+    pubkey: String,
     key: SigningKey,
 }
 
 impl Client {
     /// `base_url` 末尾的 `/` 去掉：拼路径时只留一个分隔符。
-    pub fn new(base_url: &str, device_id: &str, key: SigningKey) -> Client {
+    pub fn new(base_url: &str, key: SigningKey) -> Client {
+        let pubkey = BASE64.encode(key.verifying_key().to_bytes());
         Client {
             base_url: base_url.trim_end_matches('/').to_string(),
-            device_id: device_id.to_string(),
+            pubkey,
             key,
         }
     }
 
-    /// `POST /api/v1/register`：认领槽位。服务端按公钥找到槽位，签名证明本机
-    /// 持有对应的私钥——没有可转交的令牌，所以注册与心跳用同一把钥匙、同一套签名。
-    pub fn register(
-        &self,
-        hostname: &str,
-        pubkey_b64: &str,
-        timeout: Duration,
-    ) -> Result<RegisterReply, Error> {
-        let timestamp = unix_now().to_string();
-        let nonce = random_hex(16)?;
-        let platform_id = platform::id();
-        // 注册请求没有配置与版本信息，签名里这两行留空。
-        let message = signing_string(
-            "POST",
-            "/api/v1/register",
-            &self.device_id,
-            &timestamp,
-            &nonce,
-            platform_id,
-            "",
-            "",
-        );
-        let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
-        let body = serde_json::json!({
-            "deviceId": self.device_id,
-            "hostname": hostname,
-            "pubkey": pubkey_b64,
-            "timestamp": timestamp,
-            "nonce": nonce,
-            "signature": signature,
-            "platform": platform_id,
-        })
-        .to_string();
-        let response = post(&self.url("/api/v1/register"), &body, timeout)?;
-        decode(response, MAX_REGISTER_BODY)
+    /// 本机的公钥（base64）：设置页把它显示给管理员填进新槽位。
+    pub fn pubkey(&self) -> &str {
+        &self.pubkey
     }
 
     /// `POST /api/v1/heartbeat`：`Ok(None)` 表示服务端回了 204（两边都没变）。
@@ -136,6 +103,7 @@ impl Client {
     /// 发布信息。「这份我已经有了」由调用方按版本与摘要自己判，不往请求里塞摘要。
     pub fn heartbeat(
         &self,
+        hostname: &str,
         config_hash: &str,
         app_version: &str,
         credential_id: &str,
@@ -147,7 +115,7 @@ impl Client {
         let message = signing_string(
             "POST",
             "/api/v1/heartbeat",
-            &self.device_id,
+            &self.pubkey,
             &timestamp,
             &nonce,
             platform_id,
@@ -156,7 +124,8 @@ impl Client {
         );
         let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
         let body = serde_json::json!({
-            "deviceId": self.device_id,
+            "pubkey": self.pubkey,
+            "hostname": hostname,
             "appVersion": app_version,
             "configHash": config_hash,
             "credentialId": credential_id,
@@ -166,6 +135,85 @@ impl Client {
             "platform": platform_id,
         });
         let body = body.to_string();
+        let response = post(&self.url("/api/v1/heartbeat"), &body, timeout)?;
+        if response.status() == 204 {
+            return Ok(None);
+        }
+        decode(response, MAX_HEARTBEAT_BODY).map(Some)
+    }
+
+    /// 过渡期：旧协议的认领（`POST /api/v1/register`）。设备在切换前从未认领过、
+    /// 又碰上还没换掉的控制面时用它把槽位绑上；切换完成后随 PENDING 删除。
+    pub fn register_legacy(
+        &self,
+        device_id: &str,
+        hostname: &str,
+        pubkey_b64: &str,
+        timeout: Duration,
+    ) -> Result<RegisterReply, Error> {
+        let timestamp = unix_now().to_string();
+        let nonce = random_hex(16)?;
+        let platform_id = platform::id();
+        let message = signing_string(
+            "POST",
+            "/api/v1/register",
+            device_id,
+            &timestamp,
+            &nonce,
+            platform_id,
+            "",
+            "",
+        );
+        let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
+        let body = serde_json::json!({
+            "deviceId": device_id,
+            "hostname": hostname,
+            "pubkey": pubkey_b64,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "signature": signature,
+            "platform": platform_id,
+        })
+        .to_string();
+        let response = post(&self.url("/api/v1/register"), &body, timeout)?;
+        decode(response, MAX_HEARTBEAT_BODY)
+    }
+
+    /// 过渡期：旧协议的一次心跳（签名第 4 行是 `device_id`）。控制面还在认
+    /// `deviceId` 句柄时用它，切换完成后这一段随 PENDING 一起删除。
+    pub fn heartbeat_legacy(
+        &self,
+        device_id: &str,
+        config_hash: &str,
+        app_version: &str,
+        credential_id: &str,
+        timeout: Duration,
+    ) -> Result<Option<Heartbeat>, Error> {
+        let timestamp = unix_now().to_string();
+        let nonce = random_hex(16)?;
+        let platform_id = platform::id();
+        let message = signing_string(
+            "POST",
+            "/api/v1/heartbeat",
+            device_id,
+            &timestamp,
+            &nonce,
+            platform_id,
+            config_hash,
+            app_version,
+        );
+        let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
+        let body = serde_json::json!({
+            "deviceId": device_id,
+            "appVersion": app_version,
+            "configHash": config_hash,
+            "credentialId": credential_id,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "signature": signature,
+            "platform": platform_id,
+        })
+        .to_string();
         let response = post(&self.url("/api/v1/heartbeat"), &body, timeout)?;
         if response.status() == 204 {
             return Ok(None);
@@ -219,13 +267,14 @@ impl Client {
         Ok(written)
     }
 
-    /// 心跳带的凭据私钥（base64）。带了封装的就必须用封装的那一份。
+    /// 心跳带的凭据私钥（base64）：只认封给设备公钥的那一份。
     ///
-    /// 解不开就是这一次下发作废，不回落到明文字段：能改响应字节的一方正是这条
-    /// 封装要防的人，回落等于把封装变成可选的装饰。
+    /// 没有封装说明这一次没有签发凭据（正式节点、或还没到签发时机），返回空串。
+    /// 解不开就是这一次下发作废，不回落到任何明文：能改响应字节的一方正是这条封装
+    /// 要防的人，回落等于把封装变成可选的装饰。
     pub fn credential_secret(&self, heartbeat: &Heartbeat) -> Result<String, Error> {
         if heartbeat.credential_sealed.is_empty() {
-            return Ok(heartbeat.credential.clone());
+            return Ok(String::new());
         }
         let secret = sealed::open(&self.key, &heartbeat.credential_sealed)?;
         if secret.len() != CREDENTIAL_SECRET_LEN {
@@ -242,9 +291,9 @@ impl Client {
     }
 }
 
-/// `POST /api/v1/register` 的响应。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// 过渡期：旧协议注册（认领 `deviceId`）的响应。控制面切到公钥协议之后不再调用。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct RegisterReply {
     pub device_id: String,
     pub config_toml: String,
@@ -295,11 +344,8 @@ pub struct Heartbeat {
     pub config_b64: String,
     pub app_update: Option<UpdateInfo>,
     pub launcher: Option<LauncherInfo>,
-    /// 凭据私钥只在下发的那一次响应里出现，之后服务端只剩 id。
-    ///
-    /// 它同时以两种形式回来：封给设备公钥的 credential_sealed（新客户端只认
-    /// 这一份），和过渡期的明文 credential（旧客户端只认它）。
-    pub credential: String,
+    /// 凭据私钥只在下发的那一次响应里出现，之后服务端只剩 id。明文从不过网：
+    /// 服务端只发封给设备公钥的 credential_sealed。
     pub credential_sealed: String,
     pub credential_id: String,
     pub credential_expiry: i64,
@@ -335,7 +381,7 @@ impl Heartbeat {
 fn signing_string(
     method: &str,
     path: &str,
-    device_id: &str,
+    pubkey: &str,
     timestamp: &str,
     nonce: &str,
     platform_id: &str,
@@ -346,7 +392,7 @@ fn signing_string(
         "MESH2",
         method,
         path,
-        device_id,
+        pubkey,
         timestamp,
         nonce,
         platform_id,
@@ -532,10 +578,15 @@ mod tests {
     }
 
     fn client(base_url: &str) -> Client {
-        Client::new(
-            base_url,
-            "0123456789abcdef0123456789abcdef",
-            SigningKey::from_bytes(&[7u8; 32]),
+        Client::new(base_url, SigningKey::from_bytes(&[7u8; 32]))
+    }
+
+    /// 测试私钥对应的公钥，也就是这些请求里出现的身份。
+    fn pubkey() -> String {
+        BASE64.encode(
+            SigningKey::from_bytes(&[7u8; 32])
+                .verifying_key()
+                .to_bytes(),
         )
     }
 
@@ -549,14 +600,14 @@ mod tests {
             signing_string(
                 "POST",
                 "/api/v1/heartbeat",
-                "dev",
+                "pubkey-b64",
                 "1795541874",
                 "abc",
                 "windows/amd64",
                 "hash",
                 "2026.11.26-13",
             ),
-            "MESH2\nPOST\n/api/v1/heartbeat\ndev\n1795541874\nabc\nwindows/amd64\nhash\n2026.11.26-13"
+            "MESH2\nPOST\n/api/v1/heartbeat\npubkey-b64\n1795541874\nabc\nwindows/amd64\nhash\n2026.11.26-13"
         );
     }
 
@@ -564,7 +615,7 @@ mod tests {
     fn heartbeat_is_signed_and_204_is_none() {
         let stub = Stub::new(vec![response(204, &[], b"")]);
         let reply = client(&stub.base_url)
-            .heartbeat("hash", "2026.11.26-13", "cred-1", timeout())
+            .heartbeat("laptop", "hash", "2026.11.26-13", "cred-1", timeout())
             .unwrap();
         assert!(reply.is_none());
         let captured = stub.captured.lock().unwrap();
@@ -575,7 +626,8 @@ mod tests {
             .any(|(name, value)| name == "content-type" && value.starts_with("application/json")));
         drop(captured);
         let body = stub.last_body();
-        assert_eq!(body["deviceId"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(body["pubkey"], pubkey());
+        assert_eq!(body["hostname"], "laptop");
         assert_eq!(body["configHash"], "hash");
         assert_eq!(body["appVersion"], "2026.11.26-13");
         assert_eq!(body["credentialId"], "cred-1");
@@ -589,7 +641,7 @@ mod tests {
         let message = signing_string(
             "POST",
             "/api/v1/heartbeat",
-            body["deviceId"].as_str().unwrap(),
+            body["pubkey"].as_str().unwrap(),
             timestamp,
             nonce,
             body["platform"].as_str().unwrap(),
@@ -606,7 +658,7 @@ mod tests {
     fn the_heartbeat_body_carries_no_update_digest() {
         let stub = Stub::new(vec![response(204, &[], b"")]);
         client(&stub.base_url)
-            .heartbeat("hash", "v", "none", timeout())
+            .heartbeat("laptop", "hash", "v", "none", timeout())
             .unwrap();
         let body = stub.last_body();
         // 请求里只有「我是谁、我现在的状态」：手上那份发布包不进请求，判重在客户端。
@@ -620,11 +672,11 @@ mod tests {
     fn heartbeat_parses_the_changes() {
         let config = BASE64.encode("hostname = \"laptop\"\n");
         let body = format!(
-            r#"{{"configHash":"h2","configB64":"{config}","appUpdate":{{"version":"2026.11.27-1","url":"http://10.126.126.1:18080/x.tar.zst","notes":"修了个 bug","sha256":"ab","autoUpdate":true}},"launcher":{{"version":"2026.11.27-1","url":"http://10.126.126.1:18080/mesh.exe","sha256":"cd"}},"credential":"c2VjcmV0","credentialId":"uuid","credentialExpiry":1798000000}}"#
+            r#"{{"configHash":"h2","configB64":"{config}","appUpdate":{{"version":"2026.11.27-1","url":"http://10.126.126.1:18080/x.tar.zst","notes":"修了个 bug","sha256":"ab","autoUpdate":true}},"launcher":{{"version":"2026.11.27-1","url":"http://10.126.126.1:18080/mesh.exe","sha256":"cd"}},"credentialId":"uuid","credentialExpiry":1798000000}}"#
         );
         let stub = Stub::new(vec![response(200, &[], body.as_bytes())]);
         let reply = client(&stub.base_url)
-            .heartbeat("hash", "2026.11.26-13", "none", timeout())
+            .heartbeat("laptop", "hash", "2026.11.26-13", "none", timeout())
             .unwrap()
             .unwrap();
         assert_eq!(reply.config_hash, "h2");
@@ -634,7 +686,6 @@ mod tests {
         assert_eq!(update.notes, "修了个 bug");
         assert!(update.auto_update);
         assert_eq!(reply.launcher.unwrap().sha256, "cd");
-        assert_eq!(reply.credential, "c2VjcmV0");
         assert_eq!(reply.credential_id, "uuid");
         assert_eq!(reply.credential_expiry, 1_798_000_000);
     }
@@ -643,7 +694,7 @@ mod tests {
     fn a_204_with_no_fields_leaves_everything_empty() {
         let stub = Stub::new(vec![response(200, &[], b"{}")]);
         let reply = client(&stub.base_url)
-            .heartbeat("hash", "v", "none", timeout())
+            .heartbeat("laptop", "hash", "v", "none", timeout())
             .unwrap()
             .unwrap();
         assert_eq!(reply.config_hash, "");
@@ -657,14 +708,14 @@ mod tests {
         let stub = Stub::new(vec![response(
             401,
             &[("Date", "Wed, 21 Oct 2015 07:28:00 GMT")],
-            br#"{"code":"revoked"}"#,
+            br#"{"code":"unauthorized"}"#,
         )]);
         let error = client(&stub.base_url)
-            .heartbeat("hash", "v", "none", timeout())
+            .heartbeat("laptop", "hash", "v", "none", timeout())
             .unwrap_err();
         match error {
             Error::Unauthorized { code, server_time } => {
-                assert_eq!(code, "revoked");
+                assert_eq!(code, "unauthorized");
                 assert_eq!(
                     server_time.unwrap(),
                     UNIX_EPOCH + Duration::from_secs(1_445_412_480)
@@ -683,7 +734,7 @@ mod tests {
             r#"{"code":"device_limit","message":"设备数已达上限"}"#.as_bytes(),
         )]);
         let error = client(&stub.base_url)
-            .register("laptop", "pubkey", timeout())
+            .heartbeat("laptop", "hash", "v", "none", timeout())
             .unwrap_err();
         match error {
             Error::Api {
@@ -697,58 +748,6 @@ mod tests {
             }
             other => panic!("应是 Api，得到 {other:?}"),
         }
-    }
-
-    #[test]
-    fn register_sends_the_expected_fields() {
-        // 注册没有令牌可交：请求体里是设备 id、主机名与公钥，外加一次性 nonce 与
-        // 对同一套原文的签名。公钥就是签名私钥对应的那一把。
-        let key = SigningKey::from_bytes(&[7u8; 32]);
-        let pubkey = BASE64.encode(key.verifying_key().to_bytes());
-        let stub = Stub::new(vec![response(
-            200,
-            &[],
-            br#"{"deviceId":"d1","configToml":"hostname = \"x\"","configHash":"h1"}"#,
-        )]);
-        let reply = client(&stub.base_url)
-            .register("laptop", &pubkey, timeout())
-            .unwrap();
-        assert_eq!(reply.device_id, "d1");
-        assert_eq!(reply.config_hash, "h1");
-        assert_eq!(reply.config_toml, "hostname = \"x\"");
-        let captured = stub.captured.lock().unwrap();
-        assert_eq!(captured[0].request_line, "POST /api/v1/register HTTP/1.1");
-        drop(captured);
-        let body = stub.last_body();
-        assert!(
-            body.get("token").is_none(),
-            "注册请求里不该再有令牌: {body}"
-        );
-        assert_eq!(body["deviceId"], "0123456789abcdef0123456789abcdef");
-        assert_eq!(body["hostname"], "laptop");
-        assert_eq!(body["pubkey"], pubkey.as_str());
-        assert_eq!(body["platform"], platform::id());
-        let nonce = body["nonce"].as_str().unwrap();
-        assert_eq!(nonce.len(), 32);
-        assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()));
-        let timestamp = body["timestamp"].as_str().unwrap();
-        assert!(timestamp.parse::<u64>().unwrap() > 1_700_000_000);
-        // 注册请求没有配置与版本信息：签名原文的最后两行留空。
-        let message = signing_string(
-            "POST",
-            "/api/v1/register",
-            body["deviceId"].as_str().unwrap(),
-            timestamp,
-            nonce,
-            body["platform"].as_str().unwrap(),
-            "",
-            "",
-        );
-        let signature = BASE64.decode(body["signature"].as_str().unwrap()).unwrap();
-        let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
-        key.verifying_key()
-            .verify(message.as_bytes(), &signature)
-            .unwrap();
     }
 
     #[test]
@@ -777,13 +776,12 @@ mod tests {
         for (index, byte) in seed.iter_mut().enumerate() {
             *byte = index as u8;
         }
-        Client::new("http://10.0.0.1:8089", "dev", SigningKey::from_bytes(&seed))
+        Client::new("http://10.0.0.1:8089", SigningKey::from_bytes(&seed))
     }
 
     #[test]
-    fn a_sealed_credential_wins_over_the_plaintext_one() {
+    fn a_sealed_credential_is_used() {
         let heartbeat = Heartbeat {
-            credential: "cGxhaW50ZXh0".to_string(),
             credential_sealed: SEALED.to_string(),
             credential_id: "cred-1".to_string(),
             ..Heartbeat::default()
@@ -797,25 +795,27 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_sealed_credential_never_falls_back_to_the_plaintext() {
-        for broken in ["", "not base64", "AAAA"] {
+    fn a_broken_sealed_credential_is_refused_rather_than_trusted() {
+        for broken in ["not base64", "AAAA"] {
             let heartbeat = Heartbeat {
-                credential: "cGxhaW50ZXh0".to_string(),
                 credential_sealed: broken.to_string(),
                 credential_id: "cred-1".to_string(),
                 ..Heartbeat::default()
             };
-            // 空串是「服务端没封」这一种，按明文处理；其余一律失败。
-            let secret = seed_client().credential_secret(&heartbeat);
-            if broken.is_empty() {
-                assert_eq!(secret.unwrap(), "cGxhaW50ZXh0");
-            } else {
-                assert!(
-                    matches!(secret, Err(Error::Sealed(_))),
-                    "封装的凭据坏了却回落了明文：{secret:?}"
-                );
-            }
+            assert!(
+                matches!(
+                    seed_client().credential_secret(&heartbeat),
+                    Err(Error::Sealed(_))
+                ),
+                "封装的凭据坏了却不能当成成功：{broken:?}"
+            );
         }
+        // 没有封装就是这一次没有签发凭据，不是「解不开」。
+        let none = Heartbeat {
+            credential_id: "cred-1".to_string(),
+            ..Heartbeat::default()
+        };
+        assert_eq!(seed_client().credential_secret(&none).unwrap(), "");
     }
 
     #[test]
@@ -827,11 +827,7 @@ mod tests {
             credential_id: "cred-1".to_string(),
             ..Heartbeat::default()
         };
-        let other = Client::new(
-            "http://10.0.0.1:8089",
-            "dev",
-            SigningKey::from_bytes(&[3u8; 32]),
-        );
+        let other = Client::new("http://10.0.0.1:8089", SigningKey::from_bytes(&[3u8; 32]));
         assert!(matches!(
             other.credential_secret(&heartbeat),
             Err(Error::Sealed(_))

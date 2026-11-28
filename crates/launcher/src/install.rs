@@ -79,7 +79,10 @@ const UNPACK_WINDOW_LOG: u32 = 26;
 ///
 /// 进程退出（含被杀）时内核会释放文件锁，不会留下需要人工删的东西。
 pub(crate) struct Owner {
+    /// 安装根：槽目录、`bin/current` 与 `install.lock`。
     root: PathBuf,
+    /// 数据根：待装包、失败计数与 `launcher.json`。
+    data: PathBuf,
     /// 验清单签名用的公钥。生产代码用编进二进制的发布公钥；轮换与测试换这一项。
     public: String,
     _lock: Lock,
@@ -122,15 +125,15 @@ impl BootFailure {
 /// * 也可能是客户端（正在提交更新包或替换启动器）。
 ///
 /// 冲突不靠它预防：客户端在跑时手工安装由 `client_running` 判断并拒绝。
-pub(crate) fn own(root: &Path) -> Result<Owner, String> {
-    own_with_key(root, signing::RELEASE_PUBLIC_KEY)
+pub(crate) fn own(root: &Path, data: &Path) -> Result<Owner, String> {
+    own_with_key(root, data, signing::RELEASE_PUBLIC_KEY)
 }
 
 /// 用给定公钥验清单的 [`own`]。轮换公钥与测试走这一条，所有权语义完全相同。
-fn own_with_key(root: &Path, public_hex: &str) -> Result<Owner, String> {
+fn own_with_key(root: &Path, data: &Path, public_hex: &str) -> Result<Owner, String> {
     // 文案与客户端的单实例锁分开：占着安装根的可能是另一个启动器，那时「已有客户端
     // 实例在运行」是错的（客户端可能早就退出了）。非争用错误照原样上抛。
-    let lock = match acquire_lock(&Lock::owner_path(root)) {
+    let lock = match acquire_lock(&Lock::owner_path(data)) {
         Ok(lock) => lock,
         Err(mesh_install::Error::AlreadyRunning) => {
             return Err(mesh_text::get(id::LAUNCHER_ERROR_INSTALL_ROOT_BUSY).to_string())
@@ -139,21 +142,19 @@ fn own_with_key(root: &Path, public_hex: &str) -> Result<Owner, String> {
     };
     Ok(Owner {
         root: root.to_path_buf(),
+        data: data.to_path_buf(),
         public: public_hex.to_string(),
         _lock: lock,
     })
 }
 
 impl Owner {
-    /// prepare 是每个入口在拉起任何进程之前做的第一件事：清掉旧布局残留、迁移旧布局、
-    /// 清理另一个槽、修复 `bin/current`，再按选槽顺序挑一个能启动的槽。
+    /// prepare 是每个入口在拉起任何进程之前做的第一件事：清理另一个槽、修复
+    /// `bin/current`，再按选槽顺序挑一个能启动的槽。
     ///
     /// 返回 `None` 表示两个槽都无效：首次安装或需要人工。这不是错误——装包路径会
     /// 把候选槽定为 `alice`，普通启动路径据此报「没有可启动版本」。
     pub(crate) fn prepare(&self) -> Result<Option<Selected>, String> {
-        self.clean_legacy();
-        self.migrate_flat_layout()?;
-
         let current = layout::read_current(&self.root);
         let alice = self.valid_slot(layout::SLOT_ALICE);
         let bob = self.valid_slot(layout::SLOT_BOB);
@@ -181,20 +182,20 @@ impl Owner {
 
         // 修复：`current` 缺失、值非法或指向的槽无效时补写一次。
         //
-        // 写不进去必须让这一次流程失败：安装确认的唯一判据是「`current` 变成正在
-        // 跑的那个槽」，而这个判据只在「拉起之前它不等于那个槽」时才成立。修复
-        // 失败还照样拉起，启动器就把一次修不了指针的安装当成了正常路径。
+        // 写不进去只记一行、不让这一次流程失败：普通启动不该要求安装根可写，
+        // 而未提权时它确实不可写。确认判据不受影响——客户端启动成功后会自己提交
+        // `current`（它带 requireAdministrator），那次写入本来就要发生。
         if current != Some(name) {
             log::line(&mesh_text::format(
                 id::LAUNCHER_TEXT_REPAIR_CURRENT,
                 &[&name],
             ));
-            layout::write_current(&self.root, name).map_err(|err| {
-                mesh_text::format(
+            if let Err(err) = layout::write_current(&self.root, name) {
+                log::line(&mesh_text::format(
                     id::LAUNCHER_ERROR_CURRENT_WRITE,
                     &[&layout::current_path(&self.root).display(), &err],
-                )
-            })?;
+                ));
+            }
         }
         Ok(Some(Selected { name, version }))
     }
@@ -204,53 +205,6 @@ impl Owner {
         verify_slot(&layout::slot_dir(&self.root, slot), &self.public)
             .ok()
             .map(|manifest| manifest.version().to_string())
-    }
-
-    /// 一次性迁移：旧布局的扁平 `bin/` → `bin/alice`。**下一版删除整段。**
-    ///
-    /// 三步文件操作：`bin` → `bin.migrate`；建空 `bin/`；`bin.migrate` → `bin/alice`。
-    /// 断在任何一步都能从目录形状接着做（`bin` 不在而 `bin.migrate` 在 ⇒ 继续后两步），
-    /// 不逐文件移动。`bin/current` 已存在说明迁移早已完成，不再看 `bin.migrate`。
-    fn migrate_flat_layout(&self) -> Result<(), String> {
-        let bin = self.root.join(layout::BIN);
-        let migrate = self.root.join("bin.migrate");
-        if layout::current_path(&self.root).exists() {
-            return Ok(());
-        }
-        if migrate.exists() {
-            // 断在第 1 步之后，或第 2 步之后：把半成品接完。
-            let target = layout::slot_dir(&self.root, layout::SLOT_ALICE);
-            if target.exists() {
-                return Ok(());
-            }
-            fs::create_dir_all(&bin)
-                .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MIGRATE, &[&e]))?;
-            fs::rename(&migrate, &target)
-                .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MIGRATE, &[&e]))?;
-            log::line(mesh_text::get(id::LAUNCHER_TEXT_MIGRATED));
-            return Ok(());
-        }
-        if !bin.join(layout::MANIFEST).is_file() {
-            return Ok(());
-        }
-        // 只有验签通过、确实是一份完整的扁平安装才迁移：半包留在原处，不猜。
-        if verify_slot(&bin, &self.public).is_err() {
-            return Ok(());
-        }
-        fs::rename(&bin, &migrate)
-            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MIGRATE, &[&e]))?;
-        fs::create_dir(&bin).map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MIGRATE, &[&e]))?;
-        fs::rename(&migrate, layout::slot_dir(&self.root, layout::SLOT_ALICE))
-            .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_MIGRATE, &[&e]))?;
-        log::line(mesh_text::get(id::LAUNCHER_TEXT_MIGRATED));
-        Ok(())
-    }
-
-    /// 旧布局的残留。它们不属于新布局，存在与否都不影响判定，删掉只是收尾。
-    fn clean_legacy(&self) {
-        for name in ["bin.old", "bin.stale", "install.state"] {
-            remove_path(&self.root.join(name));
-        }
     }
 
     /// install 把包装进候选槽：先清空它，解包，再按最终落盘的内容校验。
@@ -298,7 +252,7 @@ impl Owner {
                     ));
                 }
             }
-            let failed = Failures::load(&self.root);
+            let failed = Failures::load(&self.data);
             if failed.exhausted(&version) {
                 return Err(mesh_text::format(
                     id::LAUNCHER_ERROR_FAILURES_EXHAUSTED,
@@ -349,11 +303,11 @@ impl Owner {
     /// 包是命令参数，摘要也在命令行上。
     #[cfg(unix)]
     pub(crate) fn apply_pending(&self, selected: Option<&Selected>) -> Option<Selected> {
-        let pkg = self.root.join(UPDATE_FILE);
+        let pkg = self.data.join(UPDATE_FILE);
         if !pkg.is_file() {
             return None;
         }
-        let digest = self.root.join(layout::UPDATE_DIGEST);
+        let digest = self.data.join(layout::UPDATE_DIGEST);
         let target = candidate(selected);
         let current_version = selected.map(|slot| slot.version.as_str());
         // 摘要就是客户端验过发布签名的那一份：对不上说明盘上的字节已经不是被授权
@@ -408,13 +362,13 @@ impl Owner {
             Err(reason) => {
                 // 进程都没创建出来：这一次必然失败，按版本计次，免得同一版本被
                 // 反复拉起、反复在同一个地方失败。
-                record_failure(&self.root, &installed.version);
+                record_failure(&self.data, &installed.version);
                 return Err(BootFailure::Create(reason));
             }
         };
         match self.confirm(installed.name, &mut client) {
             Ok(()) => {
-                clear_failure(&self.root, &installed.version);
+                clear_failure(&self.data, &installed.version);
                 self.drop_old_slot(installed.name);
                 Ok(client)
             }
@@ -455,7 +409,7 @@ impl Owner {
     ) -> BootFailure {
         match stopped {
             Ok(()) => {
-                record_failure(&self.root, &installed.version);
+                record_failure(&self.data, &installed.version);
                 BootFailure::Confirm(reason)
             }
             Err(e) => {
@@ -532,28 +486,30 @@ pub(crate) fn no_slot_error() -> String {
 /// 成功与失败都由它自己收口：客户端已经退出，没有人替它把节点拉回来。
 pub fn run(
     root: &Path,
+    data: &Path,
     source: Source,
     want_sha: Option<String>,
     wait_for: Option<u32>,
     force: bool,
 ) -> Result<(), String> {
     // 整个事务在所有权之内：从等旧客户端、清理槽到启动确认，中间不放锁。
-    let owner = own(root)?;
+    let owner = own(root, data)?;
     if let Some(pid) = wait_for {
         log::line(&mesh_text::format(id::LAUNCHER_TEXT_WAIT_PROCESS, &[&pid]));
         launch::wait_exit(pid, WAIT_CLIENT)?;
-    } else if client_running(root) {
+    } else if client_running(data) {
         // 没有 --wait-for 却还有客户端在跑：在它脚下换槽目录，它的下一次文件访问就
         // 落到另一个版本上。直接拒绝，让人先退出客户端。
         return Err(mesh_text::get(id::INSTALL_ERROR_ALREADY_RUNNING).to_string());
     }
+    ensure_install_root_writable(root)?;
     let selected = owner.prepare()?;
     let target = candidate(selected.as_ref());
 
     let pkg = match source {
-        Source::File(p) => p,
+        Source::File(p) => resolve_package(p, data),
         Source::Url(url) => {
-            let dest = root.join(UPDATE_FILE);
+            let dest = data.join(UPDATE_FILE);
             log::line(&mesh_text::format(id::LAUNCHER_TEXT_DOWNLOAD, &[&url]));
             download(&url, &dest)?;
             dest
@@ -567,7 +523,7 @@ pub fn run(
     let sum = sha256_file(&pkg)?;
     // 只有自己下载到 <root>/update.tar.zst 的那份才删：--file 给的是用户的文件，
     // 同样的路径成功安装时反而保留，两种结果不该由失败与否决定。
-    let downloaded = pkg == root.join(UPDATE_FILE);
+    let downloaded = pkg == data.join(UPDATE_FILE);
     if let Some(want) = want_sha {
         if !sum.eq_ignore_ascii_case(&want) {
             if downloaded {
@@ -669,7 +625,7 @@ fn restore_after_failure(_owner: &Owner, _selected: Option<&Selected>, reason: S
 /// launch_installed 是 Windows 的普通启动入口：清理、选槽、拉起、放手。
 #[cfg(windows)]
 pub(crate) fn launch_installed(root: &Path) -> Result<(), String> {
-    let owner = own(root)?;
+    let owner = own(root, root)?;
     let selected = owner.prepare()?.ok_or_else(no_slot_error)?;
     log::line(&mesh_text::format(
         id::LAUNCHER_TEXT_STARTING,
@@ -680,12 +636,50 @@ pub(crate) fn launch_installed(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 装包前先确认安装根可写；写不了就是没提权，直接给一句能照做的话。
+///
+/// 普通启动不需要这一步：它不写安装根。只有装包会创建槽目录、改 `bin/current`、
+/// 删旧槽，那时安装根必须可写。
+fn ensure_install_root_writable(root: &Path) -> Result<(), String> {
+    let probe = root.join(".write-probe");
+    match fs::write(&probe, b"") {
+        Ok(()) => {
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            Err(mesh_text::get(id::LAUNCHER_ERROR_NEED_ADMIN).to_string())
+        }
+        Err(err) => Err(mesh_text::format(
+            id::LAUNCHER_ERROR_CURRENT_WRITE,
+            &[&root.display(), &err],
+        )),
+    }
+}
+
+/// 交接包的实际位置。
+///
+/// 交接时客户端给的是它自己写下的路径。旧客户端写在安装根，而启动器一进来就把状态
+/// 搬去了数据根——包跟着一起搬走，命令行上的路径于是指空。这里按同一个文件名在数据根
+/// 再找一次：字节没变，摘要校验照做，只是路径换了地方。
+fn resolve_package(path: PathBuf, data: &Path) -> PathBuf {
+    if path.is_file() {
+        return path;
+    }
+    let moved = data.join(UPDATE_FILE);
+    if moved.is_file() {
+        return moved;
+    }
+    path
+}
+
 /// 有没有客户端正占着这个安装根。
 ///
-/// 判据与客户端自己启动时用的是同一个锁文件：拿得到就是没人在跑，拿不到就是有。
+/// 判据与客户端自己启动时用的是同一个锁文件（`instance.lock`，在数据根下）：
+/// 拿得到就是没人在跑，拿不到就是有。
 /// 拿到之后立刻放开——这里只是看一眼，不是要占住它。
-fn client_running(root: &Path) -> bool {
-    match acquire_lock(&Lock::path(root)) {
+fn client_running(data: &Path) -> bool {
+    match acquire_lock(&Lock::path(data)) {
         Ok(lock) => {
             drop(lock);
             false
@@ -1347,7 +1341,7 @@ mod tests {
 
     /// 测试里的「这一个启动器」：取到安装根写权，用测试公钥验清单。
     fn owner(root: &Path) -> Owner {
-        own_with_key(root, &public_hex(&test_key())).unwrap()
+        own_with_key(root, root, &public_hex(&test_key())).unwrap()
     }
 
     fn set_current(root: &Path, slot: &str) {
@@ -1798,6 +1792,7 @@ mod tests {
 
         let err = run(
             &root,
+            &root,
             Source::File(pkg.clone()),
             Some("0".repeat(64)),
             None,
@@ -1916,6 +1911,67 @@ mod tests {
         let _ = fs::remove_dir_all(&src);
     }
 
+    /// 安装根只读时，普通启动照样选出槽：`install.lock` 在数据根，`bin/current`
+    /// 修不了只记一行，不该把启动打死。
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_install_root_still_selects_a_slot() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("readonly-root");
+        let data = temp_root("readonly-data");
+        let key = test_key();
+        write_slot(
+            &root,
+            layout::SLOT_ALICE,
+            &key,
+            "2026.11.27-1",
+            &required_entries(),
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let owner = own_with_key(&root, &data, &public_hex(&test_key())).unwrap();
+        let selected = owner.prepare().unwrap().expect("alice 有效");
+        assert_eq!(selected.name, layout::SLOT_ALICE);
+        assert_eq!(layout::read_current(&root), None, "写不进去就保持原样");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    /// 装包路径要求安装根可写：写不了时说「请以管理员身份运行」，不给一句「拒绝访问」。
+    #[cfg(unix)]
+    #[test]
+    fn installing_into_a_read_only_root_asks_for_admin() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp_root("readonly-install");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o555)).unwrap();
+        let err = ensure_install_root_writable(&root).unwrap_err();
+        assert!(err.contains("管理员"), "提示要能照做：{err}");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 交接包被迁移搬到数据根之后，命令行上的旧路径要能落到新位置。
+    #[test]
+    fn the_handoff_package_is_found_after_the_state_moved() {
+        let root = temp_root("handoff-moved");
+        let data = temp_root("handoff-moved-data");
+        fs::write(data.join(UPDATE_FILE), b"pkg").unwrap();
+        let given = root.join(UPDATE_FILE);
+        assert_eq!(
+            resolve_package(given.clone(), &data),
+            data.join(UPDATE_FILE)
+        );
+        // 给了不存在的路径、数据根也没有：原样返回，让调用方报「文件不存在」。
+        let missing_data = temp_root("handoff-missing");
+        assert_eq!(resolve_package(given.clone(), &missing_data), given);
+        // 路径本身还在（新客户端写在数据根）：直接用。
+        let direct = data.join(UPDATE_FILE);
+        assert_eq!(resolve_package(direct.clone(), &data), direct);
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&data);
+        let _ = fs::remove_dir_all(&missing_data);
+    }
+
     /// 启动确认失败：候选槽保留、current 不动、按版本记一次失败。
     #[test]
     fn a_boot_failure_keeps_the_candidate_and_counts_by_version() {
@@ -2020,107 +2076,6 @@ mod tests {
         assert!(outcome.is_err());
         let _ = fs::remove_dir_all(&root);
     }
-    // 一次性迁移用例：与 `migrate_flat_layout` 一起删。
-    fn write_flat_bin(
-        root: &Path,
-        key: &SigningKey,
-        version: &str,
-        entries: &[(&str, &[u8])],
-    ) -> PathBuf {
-        let dir = root.join(layout::BIN);
-        fs::create_dir_all(&dir).unwrap();
-        for (name, body) in entries {
-            fs::write(dir.join(name), body).unwrap();
-        }
-        fs::write(
-            dir.join(layout::MANIFEST),
-            signed_manifest(key, version, entries),
-        )
-        .unwrap();
-        dir
-    }
-
-    /// 一次性迁移：扁平 `bin/` 整个进 `alice`，不逐文件搬。
-    #[test]
-    fn a_flat_bin_is_migrated_into_alice() {
-        let root = temp_root("migrate-flat");
-        let key = test_key();
-        write_flat_bin(&root, &key, "2026.11.27-1", &required_entries());
-
-        let selected = owner(&root).prepare().unwrap().expect("alice 有效");
-
-        assert_eq!(selected.name, layout::SLOT_ALICE);
-        assert!(layout::slot_dir(&root, layout::SLOT_ALICE)
-            .join(layout::MANIFEST)
-            .is_file());
-        assert!(!root.join("bin.migrate").exists());
-        assert!(!root.join(layout::BIN).join(layout::MANIFEST).exists());
-        assert_eq!(layout::read_current(&root), Some(layout::SLOT_ALICE));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// 断在第 1 步之后：`bin` 不在、`bin.migrate` 在，接着做后两步。
-    #[test]
-    fn migration_resumes_when_bin_is_missing() {
-        let root = temp_root("migrate-resume");
-        let key = test_key();
-        let bin = write_flat_bin(&root, &key, "2026.11.27-1", &required_entries());
-        fs::rename(&bin, root.join("bin.migrate")).unwrap();
-
-        let selected = owner(&root).prepare().unwrap().expect("alice 有效");
-        assert_eq!(selected.name, layout::SLOT_ALICE);
-        assert!(layout::slot_dir(&root, layout::SLOT_ALICE)
-            .join(layout::MANIFEST)
-            .is_file());
-        assert!(!root.join("bin.migrate").exists());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// 断在第 2 步之后：空 `bin/` 已在，`bin.migrate` 还在。
-    #[test]
-    fn migration_resumes_when_bin_exists_but_is_empty() {
-        let root = temp_root("migrate-resume-empty");
-        let key = test_key();
-        let bin = write_flat_bin(&root, &key, "2026.11.27-1", &required_entries());
-        fs::rename(&bin, root.join("bin.migrate")).unwrap();
-        fs::create_dir(&bin).unwrap();
-
-        let selected = owner(&root).prepare().unwrap().expect("alice 有效");
-        assert_eq!(selected.name, layout::SLOT_ALICE);
-        assert!(layout::slot_dir(&root, layout::SLOT_ALICE)
-            .join(layout::MANIFEST)
-            .is_file());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// 已经有 `bin/current` 就不迁移：迁移只认「current 不存在」。
-    #[test]
-    fn migration_is_skipped_when_current_exists() {
-        let root = temp_root("migrate-skip");
-        let key = test_key();
-        write_flat_bin(&root, &key, "2026.11.27-1", &required_entries());
-        set_current(&root, layout::SLOT_ALICE);
-
-        assert!(owner(&root).prepare().unwrap().is_none());
-        assert!(root.join(layout::BIN).join(layout::MANIFEST).is_file());
-        assert!(!layout::slot_dir(&root, layout::SLOT_ALICE).exists());
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn legacy_residue_is_removed_before_selection() {
-        let root = temp_root("legacy-residue");
-        fs::create_dir_all(root.join("bin.old")).unwrap();
-        fs::write(root.join("bin.old").join("OLD"), b"old").unwrap();
-        fs::create_dir_all(root.join("bin.stale")).unwrap();
-        fs::write(root.join("install.state"), b"replaced").unwrap();
-
-        assert!(owner(&root).prepare().unwrap().is_none());
-        assert!(!root.join("bin.old").exists());
-        assert!(!root.join("bin.stale").exists());
-        assert!(!root.join("install.state").exists());
-        let _ = fs::remove_dir_all(&root);
-    }
 
     /// 安装失败不能删用户给的文件：--file 收的是用户自己的包。
     #[test]
@@ -2134,7 +2089,7 @@ mod tests {
         );
 
         assert!(
-            run(&root, Source::File(pkg.clone()), None, None, true).is_err(),
+            run(&root, &root, Source::File(pkg.clone()), None, None, true).is_err(),
             "坏包应当安装失败"
         );
         assert!(pkg.is_file(), "用户给的包被删掉了: {}", pkg.display());
@@ -2148,8 +2103,12 @@ mod tests {
         let root = temp_root("ownership");
         let src = temp_root("ownership-src");
         let first = owner(&root);
-        assert!(own(&root).is_err(), "安装根已经有一个写者，第二个必须失败");
+        assert!(
+            own(&root, &root).is_err(),
+            "安装根已经有一个写者，第二个必须失败"
+        );
         assert!(run(
+            &root,
             &root,
             Source::File(package(
                 &src,
@@ -2162,7 +2121,7 @@ mod tests {
         )
         .is_err());
         drop(first);
-        assert!(own(&root).is_ok(), "第一个写者退出后应当能让位");
+        assert!(own(&root, &root).is_ok(), "第一个写者退出后应当能让位");
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }
@@ -2410,6 +2369,7 @@ mod tests {
 
         let err = run(
             &root,
+            &root,
             Source::File(valid_package(&src, "2026.11.27-2", &required_entries())),
             None,
             None,
@@ -2447,7 +2407,7 @@ mod tests {
         file.set_len(PACKAGE_BYTES + 1).unwrap();
         drop(file);
 
-        let err = run(&root, Source::File(pkg.clone()), None, None, false).unwrap_err();
+        let err = run(&root, &root, Source::File(pkg.clone()), None, None, false).unwrap_err();
 
         assert!(err.contains("超过上限"), "拒绝原因要指向大小：{err}");
         assert!(!layout::slot_dir(&root, layout::SLOT_ALICE).exists());

@@ -152,22 +152,23 @@ pub fn atomic_replace(path: &Path, bytes: &[u8], perm: u32) -> io::Result<()>;  
 **对外 API**：
 
 ```rust
-pub struct Store { /* root, key 缓存, secure_key 缓存 */ }
-pub struct ClientConfig { server_url, device_id, hostname, created_at }   // snake_case
+pub struct Store { /* data, key 缓存, secure_key 缓存 */ }
+pub struct ClientConfig { server_url, hostname, created_at }   // snake_case
 pub struct Credential { id, secret, expires_at }
 pub struct ConfigHints { hostname, ipv4, network_name, network_secret, encryption }
 impl ConfigHints { pub fn formal(&self) -> bool; }   // network_secret 非空 == 正式节点
 
 impl Store {
-    pub fn open(root: &Path) -> Result<Store, Error>;
+    pub fn open(data: &Path) -> Result<Store, Error>;
     pub fn load_client(&self) -> Result<Option<ClientConfig>, Error>;
     pub fn save_client(&self, c: &ClientConfig) -> Result<(), Error>;
-    pub fn clear_device(&self) -> Result<(), Error>;
+    pub fn remove_client(&self) -> Result<(), Error>;      // 删除本地配置：client.json
     pub fn signing_key(&self) -> Result<SigningKey, Error>;  // 读不到就生成一次
     pub fn secure_key(&self) -> Result<String, Error>;       // base64 的 32 字节
     pub fn load_credential(&self) -> Result<Option<Credential>, Error>;
     pub fn save_credential(&self, c: &Credential) -> Result<(), Error>;
     pub fn remove_credential(&self) -> Result<(), Error>;
+    pub fn remove_config(&self) -> Result<(), Error>;
     pub fn read_config(&self) -> Result<Option<String>, Error>;
     pub fn write_config(&self, toml: &str) -> Result<(), Error>;   // 临时文件 + rename
     pub fn config_path(&self) -> &Path;
@@ -181,18 +182,16 @@ pub fn parse_hints(toml: &str) -> ConfigHints;   // 解析失败给零值，不�
 
 ### 3.3 `mesh-remote`
 
-**职责**：设备面 HTTP。`/api/v1/register`、`/api/v1/heartbeat` 的组装与 Ed25519 签名、响应结构、错误码与 `Date` 头偏差、整包下载（带上限），以及发布包的签名验证。不知道磁盘布局，也不持有身份。
+**职责**：设备面 HTTP。`/api/v1/heartbeat` 的组装与 Ed25519 签名（公钥就是设备身份）、响应结构、错误码与 `Date` 头偏差、整包下载（带上限），以及发布包的签名验证。不知道磁盘布局，也不持有身份。
 
 **对外 API**：
 
 ```rust
-pub struct Client { /* base_url, device_id, key, agent（带超时） */ }
+pub struct Client { /* base_url, pubkey, key, agent（带超时） */ }
 impl Client {
-    pub fn new(base_url: &str, device_id: &str, key: SigningKey) -> Client;
-    pub fn register(&self, token: &str, hostname: &str, pubkey_b64: &str, timeout: Duration)
-        -> Result<RegisterReply, Error>;
-    pub fn heartbeat(&self, config_hash: &str, app_version: &str, credential_id: &str,
-                     timeout: Duration)
+    pub fn new(base_url: &str, key: SigningKey) -> Client;   // 公钥由私钥推出
+    pub fn heartbeat(&self, hostname: &str, config_hash: &str, app_version: &str,
+                     credential_id: &str, timeout: Duration)
         -> Result<Option<Heartbeat>, Error>;  // None == 204
     pub fn download(&self, url: &str, dst: &Path, limit: u64, timeout: Duration)
         -> Result<u64, Error>;
@@ -200,11 +199,11 @@ impl Client {
         // 优先解 credential_sealed；解不开即报错，不回落明文
 }
 pub enum Error {
-    Unauthorized { code: String, server_time: Option<SystemTime> },  // 引擎按 code/偏差分支
+    Unauthorized { code: String, server_time: Option<SystemTime> },  // 引擎按偏差分支
     Api { status: u16, code: String, message: String },
     Transport(...), Decode(...), Sealed(...),
 }
-pub struct Heartbeat { config_hash, config_b64, app_update, launcher, credential, credential_sealed, credential_id, credential_expiry }
+pub struct Heartbeat { config_hash, config_b64, app_update, launcher, credential_sealed, credential_id, credential_expiry }
 ```
 
 **拥有的状态**：无。签名原文（`MESH2\n<method>\n<path>\n...`）在 `signing_string` 里现拼，字段顺序写死并有单测。
@@ -272,7 +271,8 @@ pub fn spawn(events: Sender<Event>, on_line: impl Fn(&str) + Send + 'static) -> 
 **对外 API**：
 
 ```rust
-pub struct Config { pub root: PathBuf, pub self_version: String, pub hostname: String,
+pub struct Config { pub root: PathBuf, pub data: PathBuf, pub program_dir: PathBuf,
+                    pub self_version: String, pub hostname: String,
                     pub auto_update_disabled: bool }
 pub fn spawn(cfg: Config, cell: Arc<StateCell>, notices: Sender<Notice>,
              shutdown: Arc<Shutdown>) -> Result<(Sender<Cmd>, JoinHandle<()>), StartupBlocked>;
@@ -299,7 +299,7 @@ pub fn logs(path: &Path, n: usize) -> Vec<Line>;      // 纯函数，读文件
 pub fn events(path: &Path, n: usize) -> Vec<Line>;
 ```
 
-**拥有的状态**：全部。`status`、`last_error`、`cfg`、`core_running`/`core_pid`/`core_cred_id`、`local_ip`、`stun`、`core_version`、`identity`、`update`（`UpdateState`：`offer`、`task`、`artifact`、`attempts`、`intent`）、`auth_fails`、`revive_attempt`/`core_started_at`、`autostart_on`、`launcher_sum`/`launcher_tried`/`auto_tried`。**没有一个被 `Mutex` 保护**，因为只有引擎线程读写；对外只发布只读副本（`Published`）。
+**拥有的状态**：全部。`status`、`last_error`、`cfg`、`core_running`/`core_pid`/`core_cred_id`、`local_ip`、`stun`、`core_version`、`identity`、`update`（`UpdateState`：`offer`、`task`、`artifact`、`attempts`、`intent`）、`control`（心跳代次、退避档位与下一次期限）、`revive_attempt`/`core_started_at`、`autostart_on`、`launcher_sum`/`launcher_tried`/`auto_tried`。**没有一个被 `Mutex` 保护**，因为只有引擎线程读写；对外只发布只读副本（`Published`）。
 
 `beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。`core_gen` 是引擎给每代 core 分配、只增的代次（`0` 表示还没有 core 进过），与 `rpc` 一起标识「哪个 core 实例」：重启后即使复用同一个回环端口，代次也不同。
 
@@ -325,7 +325,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.8 `mesh-client`（bin）
 
-**职责**：进程形态。参数解析、根目录、单实例锁、线程装配、退出顺序、桌面/headless 分支、托盘、浏览器与资源管理器、消息框、启动成功时提交 `bin/current`、headless 的日志跟随与控制台附着。
+**职责**：进程形态。参数解析（含 `--root` 与 `--data-root`）、单实例锁、线程装配、退出顺序、桌面/headless 分支、托盘、浏览器与资源管理器、消息框、启动成功时提交 `bin/current`、headless 的日志跟随与控制台附着。
 
 **模块**：`main`、`cli`（手写，风格同启动器 `args.rs`）、`instance`（锁与「唤起已有实例」）、`shutdown`（唯一的退出路径）、`commit`（启动成功后提交 `bin/current`）、`desktop`（托盘 + 主线程消息泵）、`tray`（Win32）、`headless`、`browser`（COM）、`opendir`、`notify`、`follow_log`。
 
@@ -335,13 +335,13 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.9 `mesh-launcher`（bin `mesh`）
 
-**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽，随即放手，不观察结果），带 `--file` / `--url` 是 `Install`（装进候选槽，拉起并等它提交 `bin/current`）。Linux 上还消费 `<安装根>/update.tar.zst` 与它的 `.sha256`：先比对摘要，再解包。改动安装根的动作全部在 `Owner` 之内：清空候选槽、解包、校验、拉起，确认成功之后删旧槽（选槽时不删任何槽）。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
+**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽，随即放手，不观察结果），带 `--file` / `--url` 是 `Install`（装进候选槽，拉起并等它提交 `bin/current`）。Linux 上还消费 `<数据根>/update.tar.zst` 与它的 `.sha256`：先比对摘要，再解包。改动安装根的动作全部在 `Owner` 之内：清空候选槽、解包、校验、拉起，确认成功之后删旧槽（选槽时不删任何槽）。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
 
 **模块**（职责 → 关键入口）：
 
 | 模块 | 职责 | 关键入口 |
 | --- | --- | --- |
-| `main` | 解析参数、定安装根、初始化日志、把自身版本写进 `launcher.json`，按命令分派 | `main`、`root_dir`、`record_version` |
+| `main` | 解析参数、定安装根与数据根、初始化日志、把自身版本写进 `launcher.json`，按命令分派 | `main`、`root_dir`、`record_version` |
 | `args` | 两条命令的形状与互斥规则 | `Command`、`Source`、`Options`、`parse` |
 | `install` | 安装根写权与一次安装事务：选槽与修复、装包、两条出口、确认、失败收尾、包预算与校验 | `own`、`run`、`launch_installed`、`Owner::prepare`、`Owner::install`、`Owner::boot_current`、`Owner::boot_candidate`、`Owner::apply_pending` |
 | `launch` | 客户端子进程句柄：拉起、问死活、停并确认退出 | `Client::{exited, stop, wait}`、`start`、`wait_exit` |
@@ -421,7 +421,7 @@ pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>
 | `stop` 失败（停不下来） | 不动 `current`，保留候选槽，不计数，下一轮接着判 |
 | 确认成功 | 清失败计数；删掉旧槽 |
 
-**谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——先对摘要，再读包里的清单；不比当前槽新、清单读不出、摘要不符都当场删掉，装与不装都删包与摘要。Windows 上没有人按固定名去读：客户端在持锁时把 `.part` 改名成这个路径，再把它作为 `--file` 交给启动器；`run` 只在路径正好是安装根里那一份时删它（成功失败都删），指向别处的 `--file` 是用户文件，原样保留。引擎只在交接还没被接收时删固定路径上的包（撤回或换 offer）。
+**谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——先对摘要，再读包里的清单；不比当前槽新、清单读不出、摘要不符都当场删掉，装与不装都删包与摘要。Windows 上没有人按固定名去读：客户端在持锁时把 `.part` 改名成这个路径，再把它作为 `--file` 交给启动器；`run` 只在路径正好是数据根里那一份时删它（成功失败都删），指向别处的 `--file` 是用户文件，原样保留。引擎只在交接还没被接收时删固定路径上的包（撤回或换 offer）。
 
 **拥有的状态**：`Owner`（安装根路径 + 验签公钥 + `install.lock` 的锁句柄；当前槽每次从 `bin/current` 现读，不留内存副本）；`launch::Client`（客户端子进程句柄：Windows 是自己 `spawn` 的 `Child` 或 `runas` 交回的 `HANDLE`，Unix 是 `Child`）。除这些之外没有跨调用的内存状态：`Budget` 与命令参数都是值。
 
@@ -544,7 +544,7 @@ Go 里 `quit`（停资源 + 通知主循环）与 `stop`（只停资源）是两
 |---|---|---|
 | `mesh-install` | `Error { ManifestRead, Io, AlreadyRunning }` | 清单读不出来（版本号非法也归在这里）、普通 IO、锁被占。`AlreadyRunning` 必须独立成变体：上层要据此走「唤起已有实例」或「下一轮再提交」而不是报错 |
 | `mesh-state` | `Error { Io, Parse, KeyLength }` | 文件读写与格式；`client.key` 长度异常直接失败，不重建 |
-| `mesh-remote` | `Error { Unauthorized{code,server_time}, Api{status,code,message}, Transport, Decode, Sealed }` | `Unauthorized` 带 `code` 与 `Date` 偏差，因为引擎要分三支：`revoked` / 时钟偏差 / 其它；`Sealed` 是凭据解封失败，引擎据此既不写盘也不回落明文 |
+| `mesh-remote` | `Error { Unauthorized{code,server_time}, Api{status,code,message}, Transport, Decode, Sealed }` | `Unauthorized` 带 `code` 与 `Date` 偏差，因为引擎要分两支：时钟偏差 / 其它；`Sealed` 是凭据解封失败，引擎据此不写盘 |
 | `mesh-etrpc` | `Error { Connect, Frame, Protocol{field}, Rpc(String), Timeout }` | `Rpc(String)` 已在 crate 内把 `error.Error` 的 oneof 翻成一句话 |
 | `mesh-core` | 不出现在 API 上 | 失败一律折成 `Event::StartFailed{reason}` / `Exited{err}`：「core 起不来」对引擎是一个状态，不是一个要向上传播的错误 |
 | `mesh-engine` | 后台路径不返回 `Result` | 失败写进 `status`/`last_error`（与 Go 的 `setStatus`/`degrade` 一致）；只有「用户动作」返回 `Result<Snapshot, String>` |
@@ -654,6 +654,6 @@ strip = true
 | 「心跳→重连→心跳」零延迟回路 | 心跳循环不立刻 beat | `engine::heartbeat` 的 ticker 与 `core_running` 判断 |
 | 自动更新反复重试同版本 | `auto_tried` / `launcher_tried` | `engine::update` |
 | 失败态被下一轮心跳抹掉 | `phase == Failed` 且版本相同时不改写 | `engine::update::offer` |
-| 401 一律清身份 | `revoked` / 时钟偏差 / 连续 3 次三支 | `engine::sync::handle_auth_rejected` |
+| 401 一律清身份 | 只报原因：时钟偏差 / 其它两支，不改本地状态 | `engine::sync::report_auth_rejected` |
 | 日志被超长行卡死 | 4MiB 单行上限 + 继续排空管道 | `mesh-core` 的输出泵 |
 | Windows 日志裁剪无法 rename | close → rename → reopen | `engine::log::rotate` |

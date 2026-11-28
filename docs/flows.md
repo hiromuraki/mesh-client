@@ -1,6 +1,6 @@
 # 客户端流程图
 
-依据 `client/`（Rust）的当前实现绘制：启动器在 `crates/launcher`，客户端在 `crates/client`。图中常量均取自代码：心跳 30s、请求超时 20s、core 就绪 25s、停止 core 5s、core 重拉固定 10s 间隔（8 次一轮，之后挂起 10 分钟）、连接退避 10s→60s、面板端口 11020（最多顺延 20 个）、更新包下载 20 分钟、更新包上限 200MB、启动确认 60s、启动器等旧进程退出 60s。
+依据 `client/`（Rust）的当前实现绘制：启动器在 `crates/launcher`，客户端在 `crates/client`。图中常量均取自代码：心跳 30s、请求超时 20s、core 就绪 25s、停止 core 5s、core 重拉固定 30s 间隔（10 次一轮，之后挂起 10 分钟）、连接退避 10s→60s、面板端口 11020（最多顺延 20 个）、更新包下载 20 分钟、更新包上限 200MB、启动确认 60s、启动器等旧进程退出 60s。
 
 安装目录布局、槽位与提交规则见 [contract/updates.md](../../docs/contract/updates.md)。
 
@@ -74,8 +74,8 @@ flowchart TD
 
 客户端只负责下载与交接；解包进候选槽、校验、拉起、等确认由启动器做；提交 `bin/current` 由客户端在启动成功时做。两个平台的差别只在交接方式：
 
-- **Linux**：客户端先把整包摘要写到 `<安装根>/update.tar.zst.sha256`，再把包改名成 `update.tar.zst`，然后正常退出。常驻启动器（systemd 的 `ExecStart`）看到子进程退出就回到循环开头：先按摘要自算比对，不符就丢弃包与摘要、不碰候选槽；相符再读包里的 `version.json`，不比当前槽新就丢弃，否则清空候选槽、解包、校验、拉起。确认以 `current` 变成该槽为准；旧槽不在确认那一瞬删，留到下一次启动、选槽之前清理。失败则停掉候选、`current` 不动。
-- **Windows**：包已经在本地，客户端拉起 `mesh.exe --file <包> --wait-for <pid> --sha256 <摘要>` 后退出。启动器等旧进程退出（≤60s）、清空候选槽、解包、校验、拉起，等 `current` 变化；失败就停掉候选并把当前槽拉回来；旧槽同样留到下一次启动、选槽之前清理。
+- **Linux**：客户端先把整包摘要写到 `<数据根>/update.tar.zst.sha256`，再把包改名成 `update.tar.zst`，然后正常退出。常驻启动器（systemd 的 `ExecStart`）看到子进程退出就回到循环开头：先按摘要自算比对，不符就丢弃包与摘要、不碰候选槽；相符再读包里的 `version.json`，不比当前槽新就丢弃，否则清空候选槽、解包、校验、拉起。确认以 `current` 变成该槽为准，确认成功之后删旧槽。失败则停掉候选、`current` 不动。
+- **Windows**：包已经在本地，客户端拉起 `mesh.exe --file <包> --wait-for <pid> --sha256 <摘要>` 后退出。启动器等旧进程退出（≤60s）、清空候选槽、解包、校验、拉起，等 `current` 变化；失败就停掉候选并把当前槽拉回来；确认成功之后删旧槽。
 
 ```mermaid
 sequenceDiagram
@@ -98,7 +98,7 @@ sequenceDiagram
       L->>N: 拉起候选槽的 mesh-client，等启动确认（≤60s）
       Note over E,L: 启动成功后客户端原子写 bin/current = 该槽名
       alt current 变成该槽
-        Note over L: 旧槽留到下一次启动、选槽之前清理
+        Note over L: 清该版本失败计数，删旧槽
       else 子进程退出或超时
         Note over L: 停掉候选槽；current 不动、候选槽保留<br/>记一次失败（同一版本 2 次后不再自动装）
       end
@@ -118,7 +118,7 @@ sequenceDiagram
 
 启动器只拉起 `bin/current` 选中的槽。槽名固定为 `alice`、`bob`，启动器与程序路径集合都不随版本变化，防火墙规则与服务配置只认这两条。选槽顺序：`current` 有效就用它；否则在有效槽里取目录名字典序最大的（`bob` 优先）；两个都无效即没有可启动版本。启动器从不提交，只在 `current` 缺失、非法或指向无效槽时补写一次（修复）。
 
-客户端进程先取单实例锁，再读本地身份；没有身份时起本地面板等用户填地址与 token，有身份时打一次心跳取配置与凭据、起 core、等就绪后进入心跳循环。界面是浏览器里的面板（`127.0.0.1:11020`，被占用就顺延），启动时**不再自动打开浏览器**，托盘菜单里的「打开面板」才开。起 core 需要身份：正式节点用 `--secure-mode` 加 `ET_LOCAL_PRIVATE_KEY`，其余节点等控制面签发凭据、私钥走 `ET_CREDENTIAL`；两把私钥都不进命令行。没有凭据就先停在 `error` 并让心跳继续跑。启动成功（引擎与面板就位；桌面版还要求托盘起来）后，客户端若发现自身可执行文件的父目录是槽名，就原子写 `bin/current` = 该槽名；启动器在 60 秒内看到它即确认成功。
+客户端进程先取单实例锁，再读本地配置；没有 `client.json` 时起本地面板等用户填地址（保存只写本地，不发请求），有配置时打一次心跳取配置与凭据、起 core、等就绪后进入心跳循环。界面是浏览器里的面板（`127.0.0.1:11020`，被占用就顺延），启动时**不再自动打开浏览器**，托盘菜单里的「打开面板」才开。起 core 需要身份：正式节点用 `--secure-mode` 加 `ET_LOCAL_PRIVATE_KEY`，其余节点等控制面签发凭据、私钥走 `ET_CREDENTIAL`；两把私钥都不进命令行。没有凭据就先停在 `error` 并让心跳继续跑。启动成功（引擎与面板就位；桌面版还要求托盘起来）后，客户端若发现自身可执行文件的父目录是槽名，就原子写 `bin/current` = 该槽名；启动器在 60 秒内看到它即确认成功。
 
 ```mermaid
 sequenceDiagram
@@ -128,7 +128,7 @@ sequenceDiagram
   participant S as 控制面
   participant C as easytier-core
 
-  L->>L: 拿到 install.lock；current 与另一个槽都有效时先删另一个槽，并清旧布局残留
+  L->>L: 拿到 install.lock；选槽（current 有效用它，否则 bob 优先），不删任何槽
   L->>L: 读 bin/current；缺失、非法或槽无效 → 按选槽顺序选一个并补写（修复）
   L->>L: 有 update.tar.zst 且比当前槽新 → 清空候选槽、解包、校验
   L->>M: 启动选中槽的 mesh-client --root 安装根
@@ -137,14 +137,15 @@ sequenceDiagram
   M->>L: 启动成功，原子写 bin/current = 所在槽名
   Note over L: 60s 内 current 变成该槽 → 确认成功；子进程退出或超时 → 失败
   M->>M: 读 config/client.json
-  alt 无身份（没有 client.json 或 deviceId 为空）
-    M->>P: 停在设置页，等用户填服务端地址与 token
-    M->>S: POST /api/v1/register（token 一次性，10 分钟有效）
-    S-->>M: deviceId、configToml、configHash
-    M->>M: 保存身份、写 config.toml，触发重启 core
-  else 已有身份
+  alt 没有 client.json（首次启动）
+    M->>P: 停在设置页，显示本机公钥，等用户填控制面地址
+    Note over M,P: 保存只写 client.json 并开始连接，不发任何请求
+    M->>S: POST /api/v1/heartbeat（首轮，credentialId = none，20s 超时）
+    S-->>M: configB64（有变化时），可能带首张凭据
+    M->>M: 解封凭据落盘 credential.json；写 config.toml
+  else 已有配置
     M->>S: POST /api/v1/heartbeat（首轮，20s 超时）
-    S-->>M: configHash + configB64（有变化时），可能带首张凭据
+    S-->>M: configHash + configB64（有变化时），可能带凭据
     M->>M: 内容相同且文件存在则不重写
   end
   M->>C: core --config-file config.toml --rpc-portal loopback 地址
@@ -179,7 +180,7 @@ sequenceDiagram
     Note over E: corePID 清零，关闭 log/client.log，停面板监听
   else 更新交接（Linux）
     E->>M: 包装到 update.tar.zst，停资源后正常退出
-    Note over L: 子进程退出 → 循环回到开头 → apply_pending()
+    Note over L: 子进程退出 → 循环回到开头 → 消费 update.tar.zst
   else 更新交接（Windows）
     E->>L: 启动器已带 --file --wait-for 拉起
     Note over E: 回调 quit()，客户端退出
@@ -192,9 +193,20 @@ sequenceDiagram
 
 ## 6. 心跳与 401
 
-30s 一次 `POST /api/v1/heartbeat {deviceId, timestamp, nonce, platform, signature, configHash, appVersion, credentialId}`。`credentialId` 报本地正在用的那张：没有凭据报 `none`，正式节点报空串。
+30s 一次 `POST /api/v1/heartbeat {pubkey, hostname, timestamp, nonce, signature, platform, configHash, appVersion, credentialId}`。`pubkey` 就是本机公钥，控制面按它找槽位；`credentialId` 报本地正在用的那张：没有凭据报 `none`，正式节点与「拿到了但 core 还没加载」报空串。
 
-401 不「一律清身份」（服务端只在删除身份时回 `revoked`）：
+401 不改本地任何状态（服务端对所有认证失败都回 `unauthorized`）：
 
-- `code=revoked`：清本地 `device_id`、停 core、回设置页。
-- 其它 401（`unauthorized`）：服务端不区分时钟偏差、nonce 冲突与签名错误，客户端用响应的 `Date` 头判断本机时间偏差。偏差超过 300 秒窗口时只降级并提示「请校准本机时间」，**不清身份**；没有明显偏差时，连续 3 次 401 才按身份失效处理。任何一次成功的心跳或连接都会清零计数。
+- 客户端用响应的 `Date` 头判断本机时间偏差；偏差超过 300 秒窗口时，错误行提示校准本机时间。
+- 其余 401：错误行写明「控制面不认这把钥匙」，提示去控制台建槽位或用「换钥匙」。
+- 两种情况都按控制面失败退避重试（10s 起每次 ×1.5，60s 封顶）；控制面接受这把公钥之后，下一次成功心跳让状态自己回到 `online`。
+
+```mermaid
+flowchart TD
+  A["心跳返回 401"] --> B{"Date 头可用且偏差 > 300s？"}
+  B -- 是 --> C["错误行：请校准本机时间"]
+  B -- 否 --> D["错误行：控制面不认这把钥匙"]
+  C --> E["连接退避加一，按退避重试"]
+  D --> E
+  E --> F["配置、凭据、core 与身份都不动"]
+```

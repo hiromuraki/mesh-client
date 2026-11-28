@@ -12,7 +12,7 @@ use mesh_state::hints::{parse_hints, ConfigHints};
 use mesh_state::ClientConfig;
 use std::net::SocketAddr;
 
-/// 本地状态的三种读法：读坏了、还没有身份、有身份。
+/// 本地状态的三种读法：读坏了、还没有配置、有配置。
 pub(crate) enum Loaded {
     Failed(String),
     Missing,
@@ -26,8 +26,6 @@ pub(crate) fn no_credential() -> String {
 
 /// 时钟偏差上限：与服务端校验签名的时间窗一致（契约 1.3：`|now-ts| <= 300` 秒）。
 const CLOCK_SKEW_LIMIT_SECONDS: i64 = 300;
-/// 连续 401 的次数上限：单次可能只是时钟抖动或 nonce 撞车。
-const AUTH_FAIL_LIMIT: u32 = 3;
 
 /// 本机凭据的实际状态。
 ///
@@ -69,7 +67,6 @@ impl Engine {
         match self.store.load_client() {
             Err(err) => Loaded::Failed(err.to_string()),
             Ok(None) => Loaded::Missing,
-            Ok(Some(config)) if config.device_id.is_empty() => Loaded::Missing,
             Ok(Some(config)) => Loaded::Configured(config),
         }
     }
@@ -128,25 +125,15 @@ impl Engine {
         }
     }
 
-    /// 处理 401，返回是否已经清空设备身份。
+    /// 处理 401：解释原因，不改本地任何状态。
     ///
-    /// 只有 401 会走到这里（`Engine::on_heartbeat` 的分类）：其余状态码——包括服务端
-    /// nonce 缓存饱和（5xx）——都不是身份问题，走控制面失败退避，既不计这里的次数，
-    /// 也不清本地身份。
+    /// 设备身份就是本机那把钥匙，401 说明控制面不认它——槽位没建、换了钥匙、或者
+    /// 设备被删了。这三种都只能去控制面看：客户端自己猜不出来，也不该拿本地状态去
+    /// 试错，所以这里只把原因报出来，由控制面失败退避继续重试。
     ///
-    /// 服务端只在“设备身份被删除”时明确回 `revoked`，其余校验失败一律回
-    /// `unauthorized`（不区分时钟偏差、nonce 冲突与签名错误）。所以：
-    /// - `revoked`：身份已被服务端判定无效，直接清。
-    /// - 其它：看响应的 `Date` 头。本机时间与服务端相差超过契约允许的 300 秒时只
-    ///   降级提示去对时，绝不清身份——一次对时错误不该换来一次换机重注册。
-    /// - 时间没有明显偏差时，连续 3 次 401 才按身份失效处理。
-    pub(crate) fn handle_auth_rejected(&mut self, err: &remote::Error) -> bool {
-        let code = err.unauthorized_code().unwrap_or("").to_string();
-        if code == "revoked" {
-            self.reset_auth_fails();
-            self.handle_identity_invalid(err);
-            return true;
-        }
+    /// 唯一需要分辨的是时钟偏差：本机时间跑偏会让所有签名落在时间窗之外，那时提示
+    /// 去对时比提示「钥匙不被接受」有用得多。
+    pub(crate) fn report_auth_rejected(&mut self, err: &remote::Error) {
         if let remote::Error::Unauthorized {
             server_time: Some(server_time),
             ..
@@ -154,75 +141,19 @@ impl Engine {
         {
             let skew = clock::skew_seconds(*server_time);
             if skew.abs() > CLOCK_SKEW_LIMIT_SECONDS {
-                self.reset_auth_fails();
                 let msg = mesh_text::format(mesh_text::id::ENGINE_TEXT_CLOCK_SKEW, &[&skew]);
                 self.logf("app", &msg);
                 self.last_error = msg;
-                return false;
+                return;
             }
         }
-        let failures = self.note_auth_fail();
-        if failures >= AUTH_FAIL_LIMIT {
-            self.logf(
-                "app",
-                &mesh_text::format(mesh_text::id::ENGINE_LOG_AUTH_FAILURES_LIMIT, &[&failures]),
-            );
-            self.reset_auth_fails();
-            self.handle_identity_invalid(err);
-            return true;
-        }
-        self.last_error = mesh_text::format(
-            mesh_text::id::ENGINE_TEXT_AUTH_REJECTED_RETRY,
-            &[&failures, &AUTH_FAIL_LIMIT],
-        );
-        false
-    }
-
-    fn note_auth_fail(&mut self) -> u32 {
-        self.auth_fails += 1;
-        self.auth_fails
-    }
-
-    pub(crate) fn reset_auth_fails(&mut self) {
-        self.auth_fails = 0;
-    }
-
-    /// 服务端明确判定设备身份无效：清 `device_id`、停 core、回设置页。
-    fn handle_identity_invalid(&mut self, err: &remote::Error) {
         let detail = match err.unauthorized_code() {
             Some(code) if !code.is_empty() => format!("401 {code}"),
             _ => "401".to_string(),
         };
-        self.logf(
-            "app",
-            &mesh_text::format(
-                mesh_text::id::ENGINE_LOG_IDENTITY_INVALID_CLEARED,
-                &[&detail],
-            ),
-        );
-        if let Err(err) = self.store.clear_device() {
-            self.logf(
-                "app",
-                &mesh_text::format(mesh_text::id::ENGINE_LOG_CLEAR_DEVICE_FAILED, &[&err]),
-            );
-        }
-        // 旧数据面必须停下：停不掉不是静默成功——stop_core 已经记了一行，这里按重拉
-        // 档位再试。身份已经作废，没有心跳可等，重试只能靠这条期限。
-        if self.stop_core().is_err() {
-            let attempt = self.on_start_failed_attempt();
-            self.schedule_revive(attempt);
-        }
-        // 本地凭据这时已经作废（服务端删设备是先撤销凭据再删记录），留着只是把一份
-        // 再也用不上的私钥继续放在磁盘上。
-        let _ = self.store.remove_credential();
-        self.clear_stale_update();
-        self.refresh_identity();
-        self.local_ip.clear();
-        self.unbind();
-        self.last_error = mesh_text::format(
-            mesh_text::id::ENGINE_TEXT_IDENTITY_INVALID_REGISTER,
-            &[&detail],
-        );
+        let msg = mesh_text::format(mesh_text::id::ENGINE_TEXT_KEY_REJECTED, &[&detail]);
+        self.logf("app", &msg);
+        self.last_error = msg;
     }
 
     /// 重读磁盘上的 `config.toml` 与 `credential.json`，重算身份摘要与提示字段。
