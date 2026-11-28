@@ -24,8 +24,8 @@ sequenceDiagram
         S-->>E: 200（只带变化项，可能含新凭据、appUpdate、launcher）
       end
       Note over E: 记录 lastHeartbeat；degraded 恢复 online
-      opt credential 非空
-        Note over E: 落盘 credential.json 并重启 core<br/>core 不支持热更新身份，只能换进程
+      opt credentialSealed 非空
+        Note over E: 用设备私钥解封；解不开即本轮作废（不回落明文）<br/>落地 credential.json 并重启 core（core 不支持热更新身份）
       end
       opt appUpdate 非空且 autoUpdate
         Note over E: 下载新包（见第 3 节）<br/>已就绪或下载中则忽略

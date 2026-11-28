@@ -71,7 +71,7 @@ stateDiagram-v2
     [*] --> Missing: 磁盘上没有凭据
     Formal --> Missing: 配置不再带 network_secret，且磁盘无凭据
     Formal --> Held: 配置不再带 network_secret，磁盘有凭据
-    Missing --> Held: 心跳带回凭据，落盘 credential.json
+    Missing --> Held: 心跳带回凭据，封装解开后落盘 credential.json
     Held --> Loaded: core 以这张凭据就绪，上报进程号
     Loaded --> Held: core 退出或换进程，磁盘上那张还在
     Held --> Missing: 凭据文件被删
