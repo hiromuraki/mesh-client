@@ -44,22 +44,33 @@ struct Budget {
     manifest: u64,
     /// 解包后的总字节数。正常包 11–20 MiB。
     unpacked: u64,
-    /// 读清单与解包的截止时刻。
+    /// 读清单与解包的**同一个**截止时刻。契约里的 120 s 是这两步合起来的预算：
+    /// 各自新建一个等于把上限翻倍，重复扫描的代价也就被藏在两次时限之间。
     deadline: Instant,
 }
 
 impl Budget {
     /// 一个包允许的最大开销。留了两个数量级余量，同时把「把安装根写满」与
     /// 「解一辈子」挡在外面。
+    ///
+    /// 清单字节数与 [`manifest::MANIFEST_BYTES`] 是同一个数字：包里的清单与已安装
+    /// 槽里的清单没有理由用两套上限。
     fn package() -> Self {
         Self {
             entries: 1024,
-            manifest: 64 << 10,
+            manifest: manifest::MANIFEST_BYTES,
             unpacked: 256 << 20,
             deadline: Instant::now() + Duration::from_secs(120),
         }
     }
 }
+
+/// 解压器的窗口预算：zstd 的窗口最大 2^26 = 64 MiB。
+///
+/// 与 [`Budget::unpacked`] 是两个预算：那个管写出多少字节，这个管解压器自己要占
+/// 多少内存。窗口大小由包在帧头里声明，不设上限就等于把启动器的内存交给包——
+/// 一个 20 MiB 的包可以声明 4 GiB 的窗口。
+const UNPACK_WINDOW_LOG: u32 = 26;
 
 /// 安装根的所有权：槽目录、`bin/current` 的修复、待装包的写都在它之内。
 ///
@@ -79,6 +90,30 @@ pub(crate) struct Owner {
 pub(crate) struct Selected {
     pub(crate) name: &'static str,
     pub(crate) version: String,
+}
+
+/// 候选槽试运行失败时的三种形状。调用方不能把它们收成一个 String：
+/// 「没创建出来」「确认失败且已停止」按版本计次、可以回退；「停不下来」的进程
+/// 事实还在，既不能计次，也不能在它脚下把旧槽拉起来。
+#[derive(Debug)]
+pub(crate) enum BootFailure {
+    /// 候选槽的客户端进程没能创建。
+    Create(String),
+    /// 拉起成功但没等到 `bin/current`，且已经确认候选进程退出。
+    Confirm(String),
+    /// 没等到确认，且没能确认候选进程退出：它可能还活着。
+    NotStopped(String),
+}
+
+impl BootFailure {
+    /// 给日志与调用方看的原文。三种形状的文案在产生处就已经写清原因。
+    pub(crate) fn reason(&self) -> &str {
+        match self {
+            BootFailure::Create(reason)
+            | BootFailure::Confirm(reason)
+            | BootFailure::NotStopped(reason) => reason,
+        }
+    }
 }
 
 /// own 取得安装根的写权。已有写者时返回错误，不排队：
@@ -132,25 +167,34 @@ impl Owner {
             _ => None,
         };
         let Some(name) = chosen else {
+            // 两个槽都无效：`current` 无论指向哪个槽都不可达，留着它只会在下一次
+            // 安装里与候选槽撞名——首次安装固定进 `alice`，那个遗留值会被当成
+            // 「这一次的启动确认」。删掉它等于回到契约里的「还没有提交过」。
+            if current.is_some() {
+                remove_path(&layout::current_path(&self.root));
+            }
             return Ok(None);
         };
         let version = slot_version(&alice, &bob, name)
             .unwrap_or_default()
             .to_string();
 
-        // 修复：`current` 缺失、值非法或指向的槽无效时补写一次。写不进去只影响这一次
-        // 修复，照样拉起——客户端启动成功后会自己提交。
+        // 修复：`current` 缺失、值非法或指向的槽无效时补写一次。
+        //
+        // 写不进去必须让这一次流程失败：安装确认的唯一判据是「`current` 变成正在
+        // 跑的那个槽」，而这个判据只在「拉起之前它不等于那个槽」时才成立。修复
+        // 失败还照样拉起，启动器就把一次修不了指针的安装当成了正常路径。
         if current != Some(name) {
             log::line(&mesh_text::format(
                 id::LAUNCHER_TEXT_REPAIR_CURRENT,
                 &[&name],
             ));
-            if let Err(err) = layout::write_current(&self.root, name) {
-                log::line(&mesh_text::format(
+            layout::write_current(&self.root, name).map_err(|err| {
+                mesh_text::format(
                     id::LAUNCHER_ERROR_CURRENT_WRITE,
                     &[&layout::current_path(&self.root).display(), &err],
-                ));
-            }
+                )
+            })?;
         }
         Ok(Some(Selected { name, version }))
     }
@@ -221,7 +265,24 @@ impl Owner {
         current_version: Option<&str>,
         force: bool,
     ) -> Result<Selected, String> {
-        let manifest = read_manifest(pkg)?;
+        // 所有进入安装的包走同一道字节闸：Linux 的 update.tar.zst 不经过 run()，
+        // 只在那里判等于给这条路留了后门。
+        check_package_bytes(pkg)?;
+        // 不变量：开始试运行之前 current 不得已经等于本次候选槽。
+        //
+        // 启动确认的唯一判据是「current 变成正在跑的那个槽」。若它本来就是这个槽，
+        // 拉起之后的第一眼就会看见它，一次根本没提交过的安装会被当成确认成功，
+        // 随后删掉旧槽。这个形状只能来自遗留指针（两个槽都无效时的 current 已被
+        // prepare 清掉），在这里明确拒绝，不去猜。
+        if layout::read_current(&self.root) == Some(target) {
+            return Err(mesh_text::format(
+                id::LAUNCHER_ERROR_CANDIDATE_IS_CURRENT,
+                &[&target],
+            ));
+        }
+        // 读清单与解包共用一个预算：同一个截止时刻，同一组上限。
+        let budget = Budget::package();
+        let manifest = read_manifest_with(pkg, budget)?;
         // 签名与本机适用性放在动候选槽之前：坏包不该先清掉唯一的启动材料。
         check_manifest(&manifest, &self.public)?;
         let version = manifest.version().to_string();
@@ -255,7 +316,7 @@ impl Owner {
         fs::create_dir_all(&dir).map_err(|e| {
             mesh_text::format(id::LAUNCHER_ERROR_CREATE_SLOT, &[&dir.display(), &e])
         })?;
-        if let Err(e) = unpack(pkg, &dir, Budget::package()) {
+        if let Err(e) = unpack(pkg, &dir, budget) {
             return Err(self.discard_candidate(target, e));
         }
         if let Err(e) = verify_slot(&dir, &self.public) {
@@ -316,10 +377,22 @@ impl Owner {
 
     /// 拉起刚装好的候选槽并等它提交 `bin/current`；安装路径的出口。
     ///
-    /// 失败时停掉候选槽、按版本记一次失败：`current` 不动、候选槽留着，下一轮按
-    /// 选槽判据重来。停不掉就不计数——它可能还活着，下一轮接着判。
-    pub(crate) fn boot_candidate(&self, installed: &Selected) -> Result<launch::Client, String> {
-        let mut client = self.start(installed.name)?;
+    /// 失败时停掉候选槽、按版本记一次失败：`current` 不动、候选槽留着。
+    /// 停不掉就不计数——它可能还活着，「起不来」还没被证明。调用方必须按
+    /// BootFailure 的三种形状分别收尾，不能把它们当成同一种失败。
+    pub(crate) fn boot_candidate(
+        &self,
+        installed: &Selected,
+    ) -> Result<launch::Client, BootFailure> {
+        let mut client = match self.start(installed.name) {
+            Ok(client) => client,
+            Err(reason) => {
+                // 进程都没创建出来：这一次必然失败，按版本计次，免得同一版本被
+                // 反复拉起、反复在同一个地方失败。
+                record_failure(&self.root, &installed.version);
+                return Err(BootFailure::Create(reason));
+            }
+        };
         match self.confirm(installed.name, &mut client) {
             Ok(()) => {
                 clear_failure(&self.root, &installed.version);
@@ -331,8 +404,7 @@ impl Owner {
                     id::LAUNCHER_TEXT_BOOT_FAILED,
                     &[&installed.name],
                 ));
-                self.candidate_failed(installed, client.stop());
-                Err(reason)
+                Err(self.candidate_failed(installed, reason, client.stop()))
             }
         }
     }
@@ -351,12 +423,29 @@ impl Owner {
         }
     }
 
-    /// 候选槽没有确认启动时记一次失败。停止失败时不计数：那说明它还活着，
-    /// 「起不来」还没被证明，下一轮接着判才是对的。
-    fn candidate_failed(&self, installed: &Selected, stopped: Result<(), String>) {
+    /// 确认失败之后的收尾：先停掉候选槽，再按「停没停掉」分成两个结局。
+    ///
+    /// 停掉了才是「这一版起不来」，按版本记一次失败。停不掉则进程事实还在，
+    /// 计数与回退都会把它当成「没在跑」——那会把一个还占着 TUN 与实例锁的进程
+    /// 留在后面每一次安装的脚下。
+    fn candidate_failed(
+        &self,
+        installed: &Selected,
+        reason: String,
+        stopped: Result<(), String>,
+    ) -> BootFailure {
         match stopped {
-            Ok(()) => record_failure(&self.root, &installed.version),
-            Err(e) => log::line(&mesh_text::format(id::LAUNCHER_TEXT_STOP_FAILED, &[&e])),
+            Ok(()) => {
+                record_failure(&self.root, &installed.version);
+                BootFailure::Confirm(reason)
+            }
+            Err(e) => {
+                log::line(&mesh_text::format(id::LAUNCHER_TEXT_STOP_FAILED, &[&e]));
+                BootFailure::NotStopped(mesh_text::format(
+                    id::LAUNCHER_ERROR_CANDIDATE_NOT_STOPPED,
+                    &[&installed.name, &e],
+                ))
+            }
         }
     }
 
@@ -452,6 +541,9 @@ pub fn run(
         }
     };
 
+    // 摘要之前先按文件大小拒绝：--file 收的是用户给的文件，整包求摘要本身就是
+    // 一次不受长度限制的读。这个闸与 install() 里那道是同一个函数、同一组上限。
+    check_package_bytes(&pkg)?;
     // 这一条只防“下载完成到安装之间”包被换掉，与解包结果无关。
     let sum = sha256_file(&pkg)?;
     // 只有自己下载到 <root>/update.tar.zst 的那份才删：--file 给的是用户的文件，
@@ -501,13 +593,13 @@ pub fn run(
                 // Linux 的客户端由常驻启动器托管：这一次拉起只为确认它能跑，确认之后
                 // 收手，交给 systemd 的 ExecStart 正式接管——否则系统里会多一个不受
                 // 监督的客户端，下一次服务启动还会撞上它的 instance.lock。
+                //
+                // 停不掉就是失败：临时客户端还握着 instance.lock，systemd 接管的那一份
+                // 起不来，而安装已经报「完成」。这里不宣完成。
                 let mut client = client;
-                if let Err(e) = client.stop() {
-                    log::line(&mesh_text::format(
-                        id::LAUNCHER_ERROR_WAIT_CLIENT_EXIT,
-                        &[&e],
-                    ));
-                }
+                client
+                    .stop()
+                    .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_WAIT_CLIENT_EXIT, &[&e]))?;
                 log::line(mesh_text::get(id::LAUNCHER_TEXT_INSTALLED_FOR_SYSTEMD));
             }
             #[cfg(windows)]
@@ -517,7 +609,14 @@ pub fn run(
             }
             Ok(())
         }
-        Err(e) => Err(restore_after_failure(&owner, selected.as_ref(), e)),
+        // 停不下来：候选进程可能还活着。此刻把当前槽拉起来只会与它抢 instance.lock，
+        // 所以不回退、不宣告完成，把失败原样交出去。
+        Err(BootFailure::NotStopped(reason)) => Err(reason),
+        Err(failure) => Err(restore_after_failure(
+            &owner,
+            selected.as_ref(),
+            failure.reason().to_string(),
+        )),
     }
 }
 
@@ -618,14 +717,27 @@ fn clear_failure(root: &Path, version: &str) {
     }
 }
 
+/// 进入安装的包的字节闸：超过 [`PACKAGE_BYTES`] 的包在求摘要、读清单之前就拒绝。
+///
+/// 两条入口（`--file` / `--url` 的 `run()`，Linux 常驻启动器的 `update.tar.zst`）
+/// 走同一个函数：一个包因为来路不同而免检，等于没有上限。
+fn check_package_bytes(pkg: &Path) -> Result<(), String> {
+    let size = fs::metadata(pkg)
+        .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_OPEN_PACKAGE, &[&pkg.display(), &e]))?
+        .len();
+    if size > PACKAGE_BYTES {
+        return Err(package_error(
+            pkg,
+            &format!("包有 {size} 字节，超过上限 {PACKAGE_BYTES} 字节"),
+        ));
+    }
+    Ok(())
+}
+
 /// 读包根的清单，同时把预算核一遍。
 ///
 /// 清单必须在动候选槽之前读出来，预算也只能在这里判：条目过多、或声明的解压后
 /// 总量超限的包，不该走到「候选槽已经被清空」那一步。
-fn read_manifest(pkg: &Path) -> Result<Manifest, String> {
-    read_manifest_with(pkg, Budget::package())
-}
-
 fn read_manifest_with(pkg: &Path, budget: Budget) -> Result<Manifest, String> {
     let file = File::open(pkg)
         .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_OPEN_PACKAGE, &[&pkg.display(), &e]))?;
@@ -709,9 +821,19 @@ fn read_manifest_entry<R: Read>(
 /// 只接受单层普通文件名：清单的合法域就只允许这个形状，解包这一侧不按另一套规则
 /// 收——路径穿越、符号链接、目录都由这一条判据挡掉。
 fn unpack(pkg: &Path, dest: &Path, budget: Budget) -> Result<(), String> {
+    unpack_with(pkg, dest, budget, UNPACK_WINDOW_LOG)
+}
+
+/// 同 [`unpack`]，但解压器的窗口上限由调用方给：测试用它证明这一道预算真的生效。
+fn unpack_with(pkg: &Path, dest: &Path, budget: Budget, window_log: u32) -> Result<(), String> {
     let file = File::open(pkg)
         .map_err(|e| mesh_text::format(id::LAUNCHER_ERROR_OPEN_PACKAGE, &[&pkg.display(), &e]))?;
-    let decoder = zstd::Decoder::new(file).map_err(|e| {
+    let mut decoder = zstd::Decoder::new(file).map_err(|e| {
+        mesh_text::format(id::LAUNCHER_ERROR_DECOMPRESS_PACKAGE, &[&pkg.display(), &e])
+    })?;
+    // 窗口大小写在包自己的帧头里：不设上限，一个 20 MiB 的包就能让解压器申请
+    // 几 GiB。这一道与「解压后总字节」分开，管的正是解压器要占多少内存。
+    decoder.window_log_max(window_log).map_err(|e| {
         mesh_text::format(id::LAUNCHER_ERROR_DECOMPRESS_PACKAGE, &[&pkg.display(), &e])
     })?;
     let mut archive = tar::Archive::new(decoder);
@@ -906,6 +1028,10 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 
 /// wait_current 等客户端提交这个槽。进程提前退出是「装上就崩」，越早知道越好；
 /// 两个平台同一个判据：它是不是还活着由 `exited` 回答（调用方传进程句柄）。
+///
+/// 前提：拉起之前 `bin/current` 不得已经等于这个槽。安装路径在清空候选槽之前
+/// 判过这一条（`Owner::install`），所以「看见 current 等于该槽」才等价于
+/// 「这一次启动提交了它」——否则一个遗留指针会让确认在第一眼就为真。
 ///
 /// `exited` 是唯一的可测试缝隙：确认逻辑只有「看到 current、看到进程退出、超时」
 /// 三种结局，不必为了测它造一个会写文件的客户端。
@@ -1756,8 +1882,9 @@ mod tests {
             )
             .unwrap();
 
-        owner.candidate_failed(&installed, Ok(()));
+        let failure = owner.candidate_failed(&installed, "没确认".to_string(), Ok(()));
 
+        assert!(matches!(failure, BootFailure::Confirm(_)), "{failure:?}");
         assert!(
             layout::slot_dir(&root, layout::SLOT_BOB).is_dir(),
             "失败路径不删候选槽"
@@ -1768,7 +1895,8 @@ mod tests {
         let _ = fs::remove_dir_all(&src);
     }
 
-    /// 停不掉候选槽时不计数：它可能还活着，「起不来」还没被证明。
+    /// 停不掉候选槽时不计数：它可能还活着，「起不来」还没被证明；结局必须是
+    /// 「停止未确认」，调用方据此不回退。
     #[test]
     fn a_candidate_that_cannot_be_stopped_is_not_counted() {
         let root = temp_root("boot-stop-failed");
@@ -1776,7 +1904,12 @@ mod tests {
             name: layout::SLOT_BOB,
             version: "2026.11.27-2".to_string(),
         };
-        owner(&root).candidate_failed(&installed, Err("still running".to_string()));
+        let failure = owner(&root).candidate_failed(
+            &installed,
+            "没确认".to_string(),
+            Err("still running".to_string()),
+        );
+        assert!(matches!(failure, BootFailure::NotStopped(_)), "{failure:?}");
         assert_eq!(count_failures(&root, "2026.11.27-2"), 0);
         let _ = fs::remove_dir_all(&root);
     }
@@ -1991,7 +2124,10 @@ mod tests {
         let manifest = signed_manifest(&key, "2026.11.27-6", &required_entries());
         let pkg = package(&src, &manifest, &entries);
 
-        assert!(read_manifest(&pkg).is_err(), "条目数超限必须拒绝");
+        assert!(
+            read_manifest_with(&pkg, Budget::package()).is_err(),
+            "条目数超限必须拒绝"
+        );
         assert!(owner(&root)
             .install(&pkg, layout::SLOT_ALICE, None, true)
             .is_err());
@@ -2120,6 +2256,243 @@ mod tests {
         assert!(!layout::slot_dir(&root, layout::SLOT_ALICE)
             .join("sub")
             .exists());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 两个槽都无效时，指向其中的 current 会被下一次安装当成自己的候选槽：
+    /// 首次安装固定进 alice，那个遗留值就成了「已经提交过」的假证据。
+    #[test]
+    fn an_unbootable_install_drops_a_stale_current() {
+        let root = temp_root("stale-current");
+        fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        fs::write(layout::current_path(&root), "alice\n").unwrap();
+
+        assert!(owner(&root).prepare().unwrap().is_none());
+        assert!(
+            !layout::current_path(&root).exists(),
+            "两个槽都无效时不能留下会与候选槽撞名的旧指针"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 同一件事的端到端形状：清掉旧指针之后，装进 alice 不再被当成「已确认」，
+    /// 安装本身也不写 current。
+    #[test]
+    fn a_stale_current_does_not_confirm_the_next_install() {
+        let root = temp_root("stale-current-install");
+        let src = temp_root("stale-current-install-src");
+        fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        fs::write(layout::current_path(&root), "alice\n").unwrap();
+
+        assert!(owner(&root).prepare().unwrap().is_none());
+        let owner = owner(&root);
+        let installed = owner
+            .install(
+                &valid_package(&src, "2026.11.27-5", &required_entries()),
+                layout::SLOT_ALICE,
+                None,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(installed.name, layout::SLOT_ALICE);
+        assert_eq!(
+            layout::read_current(&root),
+            None,
+            "安装不写 current：提交只发生在客户端启动成功之后"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 不变量：开始试运行之前 current 不得已经等于本次候选槽。这里直接造出那个
+    /// 形状（current 指着一个半包），安装必须在清空候选槽之前拒绝。
+    #[test]
+    fn an_install_refuses_a_candidate_that_current_already_names() {
+        let root = temp_root("candidate-is-current");
+        let src = temp_root("candidate-is-current-src");
+        fs::create_dir_all(root.join(layout::BIN)).unwrap();
+        fs::write(layout::current_path(&root), "alice\n").unwrap();
+
+        let err = owner(&root)
+            .install(
+                &valid_package(&src, "2026.11.27-4", &required_entries()),
+                layout::SLOT_ALICE,
+                None,
+                true,
+            )
+            .unwrap_err();
+
+        assert!(err.contains("bin/current"), "{err}");
+        assert!(
+            !layout::slot_dir(&root, layout::SLOT_ALICE).exists(),
+            "拒绝要发生在清空候选槽之前"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 修不好指针就不开始安装：确认判据依赖「拉起之前 current 不等于候选槽」，
+    /// 修不了它还把候选槽清空，等于把这次安装交给一个无法归属的确认。
+    #[test]
+    fn an_install_fails_when_bin_current_cannot_be_repaired() {
+        let root = temp_root("repair-fails");
+        let src = temp_root("repair-fails-src");
+        let key = test_key();
+        write_slot(
+            &root,
+            layout::SLOT_ALICE,
+            &key,
+            "2026.11.27-1",
+            &required_entries(),
+        );
+        // bin/current 是个目录：读不出来（当作缺失），改写必然失败。
+        fs::create_dir_all(layout::current_path(&root)).unwrap();
+
+        let err = run(
+            &root,
+            Source::File(valid_package(&src, "2026.11.27-2", &required_entries())),
+            None,
+            None,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(!err.is_empty());
+        assert!(
+            layout::current_path(&root).is_dir(),
+            "不能把指针写成别的东西"
+        );
+        assert!(
+            layout::slot_dir(&root, layout::SLOT_ALICE)
+                .join(platform::client_exe())
+                .is_file(),
+            "修复失败必须保留有效槽"
+        );
+        assert!(
+            !layout::slot_dir(&root, layout::SLOT_BOB).exists(),
+            "修复失败不得开始安装"
+        );
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// --file 给的包在求摘要之前就按文件大小拒绝：整包求摘要本身就是一次
+    /// 不受长度限制的读。
+    #[test]
+    fn a_package_over_the_byte_budget_is_refused_before_its_digest() {
+        let root = temp_root("budget-package-bytes");
+        let src = temp_root("budget-package-bytes-src");
+        let pkg = src.join("big.tar.zst");
+        let file = File::create(&pkg).unwrap();
+        file.set_len(PACKAGE_BYTES + 1).unwrap();
+        drop(file);
+
+        let err = run(&root, Source::File(pkg.clone()), None, None, false).unwrap_err();
+
+        assert!(err.contains("超过上限"), "拒绝原因要指向大小：{err}");
+        assert!(!layout::slot_dir(&root, layout::SLOT_ALICE).exists());
+        assert!(pkg.is_file(), "用户给的包不能被删");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 解压器的窗口预算单独生效：同一份包，窗口降到 1 KiB 就解不开。
+    #[test]
+    fn the_decoder_refuses_a_frame_window_over_its_budget() {
+        let src = temp_root("window-src");
+        let ok = temp_root("window-ok");
+        let narrow = temp_root("window-narrow");
+        let pkg = valid_package(&src, "2026.11.27-8", &required_entries());
+
+        assert!(unpack_with(&pkg, &ok, Budget::package(), UNPACK_WINDOW_LOG).is_ok());
+        assert!(
+            unpack_with(&pkg, &narrow, Budget::package(), 10).is_err(),
+            "窗口超过预算的包必须解不开"
+        );
+        let _ = fs::remove_dir_all(&src);
+        let _ = fs::remove_dir_all(&ok);
+        let _ = fs::remove_dir_all(&narrow);
+    }
+
+    /// 进程创建失败也算这一版失败：否则同一版本会被反复拉起、反复在这里失败。
+    #[test]
+    fn a_candidate_that_cannot_be_started_counts_a_failure_and_keeps_current() {
+        let root = temp_root("boot-create-failed");
+        let src = temp_root("boot-create-failed-src");
+        let key = test_key();
+        write_slot(
+            &root,
+            layout::SLOT_ALICE,
+            &key,
+            "2026.11.27-1",
+            &required_entries(),
+        );
+        set_current(&root, layout::SLOT_ALICE);
+        let owner = owner(&root);
+        // 包里的 mesh-client 只是一段文本：拉起必然失败。
+        let installed = owner
+            .install(
+                &valid_package(&src, "2026.11.27-2", &required_entries()),
+                layout::SLOT_BOB,
+                Some("2026.11.27-1"),
+                false,
+            )
+            .unwrap();
+
+        let failure = match owner.boot_candidate(&installed) {
+            Ok(_) => panic!("候选槽起不来时不该返回成功"),
+            Err(failure) => failure,
+        };
+
+        assert!(matches!(failure, BootFailure::Create(_)), "{failure:?}");
+        assert_eq!(count_failures(&root, "2026.11.27-2"), 1);
+        assert_eq!(layout::read_current(&root), Some(layout::SLOT_ALICE));
+        assert!(layout::slot_dir(&root, layout::SLOT_BOB).is_dir());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 客户端起来了却没提交 current：确认失败、候选槽保留、按版本计次。
+    /// 用测试二进制本身当客户端：它不认识 --root，起来就退出。
+    #[test]
+    fn a_candidate_that_exits_without_confirming_is_counted_and_keeps_current() {
+        let root = temp_root("boot-exit-failed");
+        let src = temp_root("boot-exit-failed-src");
+        let key = test_key();
+        write_slot(
+            &root,
+            layout::SLOT_ALICE,
+            &key,
+            "2026.11.27-1",
+            &required_entries(),
+        );
+        set_current(&root, layout::SLOT_ALICE);
+        let exits_at_once = fs::read(std::env::current_exe().unwrap()).unwrap();
+        let entries: [(&str, &[u8]); 2] = [
+            (platform::client_exe(), exits_at_once.as_slice()),
+            (platform::core_name(), b"core"),
+        ];
+        let owner = owner(&root);
+        let installed = owner
+            .install(
+                &valid_package(&src, "2026.11.27-3", &entries),
+                layout::SLOT_BOB,
+                Some("2026.11.27-1"),
+                false,
+            )
+            .unwrap();
+
+        let failure = match owner.boot_candidate(&installed) {
+            Ok(_) => panic!("候选槽起不来时不该返回成功"),
+            Err(failure) => failure,
+        };
+
+        assert!(matches!(failure, BootFailure::Confirm(_)), "{failure:?}");
+        assert_eq!(count_failures(&root, "2026.11.27-3"), 1);
+        assert_eq!(layout::read_current(&root), Some(layout::SLOT_ALICE));
+        assert!(layout::slot_dir(&root, layout::SLOT_BOB).is_dir());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }

@@ -18,7 +18,7 @@ pub(crate) struct Options {
     pub name: String,
     pub disable_auto_update: bool,
     /// 旧启动器在安装交接时传的一次性标记：写 `.boot-ok-<标记>` 让它确认启动。
-    /// **下一版删除。**
+    /// 只接受旧启动器实际生成的形状（1–8 位小写十六进制）。**下一版删除。**
     pub boot_check: Option<String>,
 }
 
@@ -91,8 +91,11 @@ pub(crate) fn parse(argv: &[String]) -> Result<Options, ParseError> {
             "name" => options.name = value(argv, &mut index, inline, name)?,
             // 一次性兼容：旧启动器在安装交接时会传 `--boot-check <标记>`，它在等
             // `.boot-ok-<标记>` 这个文件；不写它，旧启动器会判定新版起不来并回滚。
-            // **下一版删除。**
-            "boot-check" => options.boot_check = Some(value(argv, &mut index, inline, name)?),
+            // 标记会被拼进安装根的路径，而客户端通常以高权限运行：形状在这里定死，
+            // 不合形状的取值是明确的参数错误。**下一版删除。**
+            "boot-check" => {
+                options.boot_check = Some(boot_token(&value(argv, &mut index, inline, name)?)?)
+            }
             other => {
                 return Err(ParseError::Invalid(mesh_text::format(
                     id::CLIENT_ERROR_UNKNOWN_OPTION,
@@ -118,6 +121,25 @@ fn value(
     argv.get(*index).cloned().ok_or_else(|| {
         ParseError::Invalid(mesh_text::format(id::CLIENT_ERROR_MISSING_VALUE, &[&name]))
     })
+}
+
+/// 旧启动器生成的启动确认标记：`format!("{:x}", nanos & 0xffff_ffff)`，
+/// 即 1–8 位小写十六进制。
+///
+/// 只认这个形状。标记来自命令行、会被拼进安装根的路径，而客户端通常以高权限
+/// 运行；把任意字符串收进来再拼路径，等于给兼容入口开了一个写文件的洞。
+fn boot_token(raw: &str) -> Result<String, ParseError> {
+    let valid = (1..=8).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'));
+    if !valid {
+        return Err(ParseError::Invalid(mesh_text::format(
+            id::CLIENT_ERROR_BOOT_CHECK_INVALID,
+            &[&raw],
+        )));
+    }
+    Ok(raw.to_string())
 }
 
 /// 布尔开关；--flag=false 也认（Go 的 flag 支持 strconv.ParseBool 的那几种写法）。
@@ -212,6 +234,37 @@ mod tests {
             parse(&argv(&["--headless", "extra", "more"])),
             Err(ParseError::Invalid(message)) if message.contains("extra more")
         ));
+    }
+
+    /// 旧启动器生成的是 1–8 位小写十六进制；别的形状一律是参数错误，
+    /// 而不是拿去拼安装根里的路径。
+    #[test]
+    fn boot_check_accepts_only_the_old_launcher_marker_shape() {
+        for ok in ["1", "0", "ffffffff", "1a2b3c4d", "00ff"] {
+            assert_eq!(
+                parse(&argv(&["--boot-check", ok]))
+                    .unwrap()
+                    .boot_check
+                    .as_deref(),
+                Some(ok)
+            );
+        }
+        for bad in [
+            "",
+            "123456789",
+            "1A2B",
+            "0x1f",
+            "../root",
+            "a/b",
+            "1 2",
+            "-1",
+            "é",
+        ] {
+            assert!(
+                matches!(parse(&argv(&["--boot-check", bad])), Err(ParseError::Invalid(message)) if message.contains("boot-check")),
+                "{bad:?} 必须被拒绝"
+            );
+        }
     }
 
     #[test]

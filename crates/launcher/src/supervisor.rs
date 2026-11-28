@@ -59,16 +59,27 @@ fn round(root: &Path) -> Result<Round, String> {
             ));
             match owner.boot_candidate(&installed) {
                 Ok(client) => client,
-                Err(e) => {
+                // 候选进程停不下来：它可能还占着 instance.lock。回到选槽只会把
+                // 当前槽再拉起来，与它抢同一份 config/ 与同一个 TUN。这里结束
+                // 这一轮并报出失败，让下一次启动重新判，而不是假装回退成功。
+                Err(failure @ install::BootFailure::NotStopped(_)) => {
                     log::line(&mesh_text::format(
                         id::LAUNCHER_TEXT_START_FAILED,
-                        &[&installed.version, &e],
+                        &[&installed.version, &failure.reason()],
                     ));
-                    // 还有一个有效的当前槽：下一轮回到选槽，起旧的那一份。
+                    return Err(failure.reason().to_string());
+                }
+                Err(failure) => {
+                    log::line(&mesh_text::format(
+                        id::LAUNCHER_TEXT_START_FAILED,
+                        &[&installed.version, &failure.reason()],
+                    ));
+                    // 已经停掉候选进程，且还有一个有效的当前槽：下一轮回到
+                    // 选槽，起旧的那一份。
                     if selected.is_some() {
                         return Ok(Round::Retry);
                     }
-                    return Err(e);
+                    return Err(failure.reason().to_string());
                 }
             }
         }

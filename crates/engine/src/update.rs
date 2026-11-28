@@ -3,12 +3,16 @@
 //! 三个问题各有唯一表示，不再用 `Ready` 一词同时表示它们：
 //!
 //! - 手上是哪一份发布：`offer`（版本 + 摘要 + 策略）；
-//! - 本地工件准备好没有：`artifact`（没有 / 已校验暂存 / 失败）；
+//! - 本地工件准备好没有：`artifact`（没有 / 已校验暂存 / 已提交待交接 / 失败）；
 //! - 谁授权安装：`intent`（无 / 手动 / 自动）。意图只活到 offer 变化为止，
 //!   因此它天然只指向当前这一份，不需要再存一份 offer 身份副本。
 //!
 //! 固定路径 `<root>/update.tar.zst` 仍是「请安装」的唯一信号，但只有真正要交接时
 //! 才从暂存件改名过去；拿不到安装根写权只延期提交，已校验的暂存件不重下。
+//!
+//! 「工件已就绪」与「安装事务已接收」是两件事：改名成固定名只说明前者，拉起启动器
+//! 成功才说明后者。交接没被接收时工件与授权都留着，下一轮心跳只重试交接——已校验的
+//! 字节不重下，自动尝试标记也不被消耗。
 
 use crate::log::Log;
 use crate::run::Engine;
@@ -28,7 +32,7 @@ const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 const LAUNCHER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// 下载失败后自动重试的次数上限。用完就停下来等人处理，别把日志和发布文件服务
 /// 一起刷满。
-const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
+pub(crate) const MAX_DOWNLOAD_ATTEMPTS: u32 = 5;
 /// 启动器替换用的临时目录（Go 也叫 `update/`）。
 const UPDATE_DIR: &str = "update";
 
@@ -75,12 +79,14 @@ pub(crate) enum Artifact {
     None,
     /// 已下载并校验，暂存在 `.part`：等安装根写权或等授权。
     Staged(PathBuf),
-    /// 本份 offer 最近一次准备失败。
-    Failed {
-        error: String,
-        attempts: u32,
-        retry_at: Instant,
-    },
+    /// 已提交成固定名 `update.tar.zst`：安装信号已就位，等交接被接收。
+    ///
+    /// `error` 是最近一次交接没被接收的原因，空串表示这一轮还没试过。工件本身保持
+    /// 可用：下一轮心跳只重试交接，不重下。
+    Committed { error: String },
+    /// 本份 offer 最近一次下载失败。失败次数不在这里：它属于整份 offer
+    /// （[`UpdateState::attempts`]），要活过「起任务 → 失败 → 重试」整段。
+    Failed { error: String, retry_at: Instant },
 }
 
 /// 谁授权安装。
@@ -98,6 +104,11 @@ pub(crate) struct UpdateState {
     /// 正在跑的下载任务。任何时刻最多一个：两个线程写同一个 `.part` 只会互相截断。
     pub task: Option<DownloadTask>,
     pub artifact: Artifact,
+    /// 本份 offer 已经连续失败了几次下载。
+    ///
+    /// 它必须活过「起任务 → 失败 → 重试」整段：起任务时清掉它，连续失败就永远只剩
+    /// 第 1 次，既到不了上限，退避也回不到更大的档。只有手动重试与换 offer 才清零。
+    pub attempts: u32,
     /// 当前 offer 的安装授权；offer 变化时随之清空。
     pub intent: Option<Intent>,
 }
@@ -109,6 +120,8 @@ impl UpdateState {
             (None, _) => Phase::Idle,
             (Some(_), _) if self.task.is_some() => Phase::Downloading,
             (Some(_), Artifact::Failed { .. }) => Phase::Failed,
+            // 包已就绪、安装事务没接收：失败要给人看，工件仍可重试。
+            (Some(_), Artifact::Committed { error }) if !error.is_empty() => Phase::Failed,
             (Some(_), _) => Phase::Ready,
         }
     }
@@ -116,18 +129,32 @@ impl UpdateState {
     /// 界面上要显示的错误行。
     pub(crate) fn error(&self) -> &str {
         match &self.artifact {
-            Artifact::Failed { error, .. } => error,
+            Artifact::Failed { error, .. } | Artifact::Committed { error } => error,
             _ => "",
         }
     }
 
-    /// 撤回当前 offer：意图与暂存件一起作废。在跑的任务留着——线程取消不了，
-    /// 它的完成消息回来时身份已经对不上，只会清掉自己的临时文件。
-    fn withdraw(&mut self) {
+    /// 撤回当前 offer：意图、失败次数与工件一起作废。在跑的任务留着——线程取消
+    /// 不了，它的完成消息回来时身份已经对不上，只会清掉自己的临时文件。
+    fn withdraw(&mut self, root: &Path) {
         self.offer = None;
         self.intent = None;
-        if let Artifact::Staged(part) = std::mem::take(&mut self.artifact) {
-            let _ = std::fs::remove_file(part);
+        self.attempts = 0;
+        self.discard_artifact(root);
+    }
+
+    /// 丢掉手上的工件：只删引擎自己创建、安装事务还没接手的那一份。
+    fn discard_artifact(&mut self, root: &Path) {
+        match std::mem::take(&mut self.artifact) {
+            Artifact::Staged(part) => {
+                let _ = std::fs::remove_file(part);
+            }
+            // 交接没被接收时，固定路径上的包是引擎自己放的：撤回要把它一起撤掉，
+            // 否则下一轮安装事务会装一个已经不再被授权的版本。
+            Artifact::Committed { .. } => {
+                let _ = std::fs::remove_file(root.join(layout::UPDATE_FILE));
+            }
+            Artifact::None | Artifact::Failed { .. } => {}
         }
         self.artifact = Artifact::None;
     }
@@ -273,8 +300,12 @@ impl Engine {
             offer.version == info.version && offer.sha256.eq_ignore_ascii_case(&info.sha256)
         });
         if same {
-            // 同一份：策略可能刚变，进度与在跑的下载由现有状态机管。
+            // 同一份工件就是同一份 offer：策略、地址与说明都按最新下发值刷新——
+            // 发布方搬迁了地址，客户端还按旧地址重试就永远下不到。已暂存件与在跑的
+            // 任务不受影响：它们按版本与摘要认这一份，与地址无关。
             if let Some(offer) = self.update.offer.as_mut() {
+                offer.url = info.url.clone();
+                offer.notes = info.notes.clone();
                 offer.auto = auto;
             }
             return;
@@ -284,12 +315,11 @@ impl Engine {
 
     /// 换上一份新的 offer。撤回、同版本重发与换版本走的是同一条状态迁移。
     fn start_offer(&mut self, info: &remote::UpdateInfo, auto: bool) {
-        // 上一份 offer 已经下好但还没提交的包：内容不再被授权，删掉暂存件。
+        // 上一份 offer 的工件不再被授权：暂存件与未接收的固定包一起作废。
         // 在跑的下载任务留在原地：`.part` 只有一个，再起一个只会互相截断。
-        if let Artifact::Staged(part) = std::mem::take(&mut self.update.artifact) {
-            let _ = std::fs::remove_file(part);
-        }
-        self.update.artifact = Artifact::None;
+        let root = self.config.root.clone();
+        self.update.discard_artifact(&root);
+        self.update.attempts = 0;
         self.update.intent = None;
         self.update.offer = Some(Offer {
             version: info.version.clone(),
@@ -315,7 +345,8 @@ impl Engine {
 
     /// 控制面不再提供这份 offer（撤回）：把 offer 与授权显式清掉。
     pub(crate) fn clear_stale_update(&mut self) {
-        self.update.withdraw();
+        let root = self.config.root.clone();
+        self.update.withdraw(&root);
     }
 
     /// 用户点了“安装”（或面板上的重试）。
@@ -323,9 +354,10 @@ impl Engine {
         if self.update.offer.is_none() {
             return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_NOTHING_TO_INSTALL).to_string());
         }
-        // 用户主动重试：失败退避作废，次数还回来。
+        // 用户主动重试：失败退避作废，次数从第一档重新记。
         if matches!(self.update.artifact, Artifact::Failed { .. }) {
             self.update.artifact = Artifact::None;
+            self.update.attempts = 0;
         }
         self.update.intent = Some(Intent::Manual);
         self.try_apply()
@@ -368,6 +400,10 @@ impl Engine {
     }
 
     /// 有意图时把已验工件交接给启动器；没有已验工件就先准备。
+    ///
+    /// 「工件已就绪」与「安装事务已接收」在这里分开：改名成固定名只说明前者，
+    /// 拉起启动器成功才说明后者。交接没被接收时工件与授权原样留着，下一轮心跳只
+    /// 重试交接——已校验的字节不重下。
     fn try_apply(&mut self) -> Result<(), String> {
         let Some(intent) = self.update.intent else {
             return Ok(());
@@ -381,9 +417,18 @@ impl Engine {
             self.update.intent = None;
             return Ok(());
         }
+        // 启动器替换还没结束：这一轮要拉起的正是那个正在被换掉的文件。延期交接，
+        // 决策留在引擎里，不去猜两把锁的先后。要下载的分支不受影响。
+        let ready = matches!(
+            self.update.artifact,
+            Artifact::Staged(_) | Artifact::Committed { .. }
+        );
+        if ready && self.launcher.task.is_some() {
+            return Ok(());
+        }
         let version = offer.version.clone();
         let sha256 = offer.sha256.clone();
-        match self.update.artifact.clone() {
+        let committed = match self.update.artifact.clone() {
             Artifact::Staged(part) => {
                 // 拿不到安装根写权：延期提交，已验工件留在暂存区，绝不重下。
                 let Some(owner) = self.own_install_root() else {
@@ -396,7 +441,6 @@ impl Engine {
                         let _ = std::fs::remove_file(&part);
                         self.update.artifact = Artifact::Failed {
                             error: err.clone(),
-                            attempts: 0,
                             retry_at: Instant::now(),
                         };
                         self.update.intent = None;
@@ -405,9 +449,10 @@ impl Engine {
                     }
                 };
                 drop(owner);
-                // 从这一刻起，文件归安装事务所有；引擎手上的状态不再指向它。
-                self.update.artifact = Artifact::None;
-                self.update.intent = None;
+                // 工件已就绪：字节在固定路径上，从这一刻起不再属于暂存区。
+                self.update.artifact = Artifact::Committed {
+                    error: String::new(),
+                };
                 self.logf(
                     "app",
                     &mesh_text::format(
@@ -415,18 +460,38 @@ impl Engine {
                         &[&version],
                     ),
                 );
-                self.handoff(&committed, &version, &sha256)
+                committed
             }
+            // 上一轮已经提交过、只是交接没被接收：不再改名，直接重试交接。
+            Artifact::Committed { .. } => self.config.root.join(layout::UPDATE_FILE),
             Artifact::None | Artifact::Failed { .. } => {
                 self.prepare();
-                Ok(())
+                return Ok(());
+            }
+        };
+        match self.handoff(&committed, &version, &sha256) {
+            Ok(()) => {
+                // 安装事务已接收：工件与意图都归它，引擎不再持有；退出是交接的收尾。
+                self.update.artifact = Artifact::None;
+                self.update.intent = None;
+                self.shutdown.run_and_exit(0)
+            }
+            Err(err) => {
+                // 交接没被接收：保留已就绪的工件与失败事实，也不消耗自动尝试标记——
+                // 下一轮心跳再来一次，包已经在盘上，不需要重下。
+                self.update.artifact = Artifact::Committed { error: err.clone() };
+                if let Some(offer) = self.update.offer.as_mut() {
+                    offer.auto_tried = false;
+                }
+                Err(err)
             }
         }
     }
 
     /// 为当前 offer 准备本地工件：需要、且没有已验工件时才下载。
     ///
-    /// 已有暂存件（安装根被占过）或已有任务在跑就直接返回——已校验的字节不重下。
+    /// 已有暂存件、已提交待交接的包（安装根被占过、上一次交接没被接收）或已有任务
+    /// 在跑就直接返回——已校验的字节不重下。
     fn prepare(&mut self) {
         if self.update.task.is_some() {
             return;
@@ -434,25 +499,23 @@ impl Engine {
         let Some(offer) = self.update.offer.as_ref() else {
             return;
         };
-        if matches!(self.update.artifact, Artifact::Staged(_)) {
+        if matches!(
+            self.update.artifact,
+            Artifact::Staged(_) | Artifact::Committed { .. }
+        ) {
             return;
         }
         // 没有安装意图时只有 Windows 预取需要字节；Unix 等用户点安装。
         if self.update.intent.is_none() && !cfg!(windows) {
             return;
         }
-        let attempts = match &self.update.artifact {
-            Artifact::Failed {
-                attempts, retry_at, ..
-            } => {
-                if Instant::now() < *retry_at {
-                    return;
-                }
-                *attempts
+        // 退避只在失败态下成立；次数不在失败态里，起任务不会把它清掉。
+        if let Artifact::Failed { retry_at, .. } = &self.update.artifact {
+            if Instant::now() < *retry_at {
+                return;
             }
-            _ => 0,
-        };
-        if attempts >= MAX_DOWNLOAD_ATTEMPTS {
+        }
+        if self.update.attempts >= MAX_DOWNLOAD_ATTEMPTS {
             return;
         }
         let Some(api) = self.api.clone() else {
@@ -486,14 +549,34 @@ impl Engine {
             self.update.task = None;
             let message =
                 mesh_text::get(mesh_text::id::ENGINE_TEXT_DOWNLOAD_THREAD_FAILED).to_string();
-            let attempts = attempts.saturating_add(1);
-            self.update.artifact = Artifact::Failed {
-                error: message.clone(),
-                attempts,
-                retry_at: Instant::now() + retry_delay(attempts),
-            };
-            self.logf("app", &message);
+            self.note_download_failure(message);
         }
+    }
+
+    /// 一次下载失败：本份 offer 的失败次数加一，并按这一档安排退避。
+    ///
+    /// 次数记在 [`UpdateState::attempts`]，不从当前工件反推：起下载任务时工件会被
+    /// 清空，反推出来的次数永远只有 1，连续失败既到不了上限也退不到更大的档。
+    fn note_download_failure(&mut self, error: String) {
+        self.update.attempts = self.update.attempts.saturating_add(1);
+        let attempts = self.update.attempts;
+        self.update.artifact = Artifact::Failed {
+            error: error.clone(),
+            retry_at: Instant::now() + retry_delay(attempts),
+        };
+        let version = self
+            .update
+            .offer
+            .as_ref()
+            .map(|offer| offer.version.clone())
+            .unwrap_or_default();
+        self.logf(
+            "app",
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_DOWNLOAD_FAILED,
+                &[&version, &attempts, &error],
+            ),
+        );
     }
 
     /// 下载线程把包写到 `.part` 后回报。
@@ -533,36 +616,17 @@ impl Engine {
                 // 任务跑完时 offer 已经换了或撤回：这份内容不再被授权。
                 let _ = std::fs::remove_file(part);
             }
-            Err(err) if current => {
-                let attempts = match &self.update.artifact {
-                    Artifact::Failed { attempts, .. } => attempts.saturating_add(1),
-                    _ => 1,
-                };
-                let version = self
-                    .update
-                    .offer
-                    .as_ref()
-                    .map(|offer| offer.version.clone())
-                    .unwrap_or_default();
-                self.update.artifact = Artifact::Failed {
-                    error: err.clone(),
-                    attempts,
-                    retry_at: Instant::now() + retry_delay(attempts),
-                };
-                self.logf(
-                    "app",
-                    &mesh_text::format(
-                        mesh_text::id::ENGINE_LOG_DOWNLOAD_FAILED,
-                        &[&version, &attempts, &err],
-                    ),
-                );
-            }
+            Err(err) if current => self.note_download_failure(err),
             Err(_) => {}
         }
         self.advance_update();
     }
 
-    /// 把安装交给启动器，然后退出。
+    /// 把已提交的包交给启动器。返回 `Ok` 表示安装事务已被接收，调用方随即退出。
+    ///
+    /// 这里只回答「启动器有没有被拉起来」：拉不起来就是明确失败，工件与授权由调用方
+    /// 保留重试；Windows 上客户端派生启动器之后立刻退出，安装是否真的成功由启动器
+    /// 自己的确认与日志回答，客户端不再持有交接材料。
     fn handoff(&mut self, path: &Path, version: &str, sha256: &str) -> Result<(), String> {
         if cfg!(windows) {
             let launcher = self
@@ -596,15 +660,15 @@ impl Engine {
                 "app",
                 &mesh_text::format(mesh_text::id::ENGINE_LOG_INSTALL_STARTED, &[&version]),
             );
-            // 必须先把启动器拉起来再退出，否则新版本装不上（F7）。
-            self.shutdown.run_and_exit(0);
+            // 启动器已经起来了，退出由调用方做（必须先拉起再退出，否则装不上，F7）。
+            return Ok(());
         }
         // Linux：客户端只负责把包放到安装根，解包与启动交给常驻启动器；正常退出即可。
         self.logf(
             "app",
             &mesh_text::format(mesh_text::id::ENGINE_LOG_HANDOFF_LAUNCHER, &[&version]),
         );
-        self.shutdown.run_and_exit(0);
+        Ok(())
     }
 
     /// 按控制面公布的摘要替换安装根里的启动器（下载与替换放后台）。

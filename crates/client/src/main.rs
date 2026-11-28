@@ -154,7 +154,13 @@ fn serve(
     // 启动确认就是这一次提交：启动器在等 `bin/current` 变成正在跑的这个槽。
     // 时机不能只看「引擎与面板已就位」——进程形态本身（托盘）也得立起来，否则
     // 更新已提交、客户端随即退出，下一次登录同样失败，而新版本已经被当成能跑的了。
-    let ready = boot_ready(root, program_dir, options.boot_check.as_deref());
+    //
+    // 兼容标记的路径在这里定死：形状由 CLI 入口校验，拼出来的路径必须落在安装根内。
+    let marker = match options.boot_check.as_deref() {
+        Some(token) => Some(boot_marker(root, token)?),
+        None => None,
+    };
+    let ready = boot_ready(root, program_dir, marker);
 
     if desktop {
         return desktop_main(&panel, root, version, cell, tx, shutdown, ready);
@@ -166,26 +172,39 @@ fn serve(
     headless::run(Arc::clone(cell), &log_path, ready)
 }
 
+/// 旧启动器的一次性启动标记：`.boot-ok-<标记>`。**下一版随兼容入口删除。**
+///
+/// 标记的形状由 CLI 入口定死（1–8 位小写十六进制）；这里再确认拼出来的路径正好
+/// 落在安装根下——写标记的进程通常以高权限运行，拼路径的地方不能只信赖上游。
+fn boot_marker(root: &Path, token: &str) -> Result<PathBuf, String> {
+    let path = root.join(format!(".boot-ok-{token}"));
+    if path.parent() != Some(root) {
+        return Err(mesh_text::format(
+            mesh_text::id::CLIENT_ERROR_BOOT_CHECK_INVALID,
+            &[&token],
+        ));
+    }
+    Ok(path)
+}
+
 /// boot_ready 返回「这一版算成功启动」的回调：把正在跑的这个槽提交为 `bin/current`。
 /// 它只生效一次，可以重复调用。
 fn boot_ready(
     root: &Path,
     program_dir: &Path,
-    marker: Option<&str>,
+    marker: Option<PathBuf>,
 ) -> Box<dyn Fn() + Send + Sync> {
     let root = root.to_path_buf();
     let program_dir = program_dir.to_path_buf();
     // 一次性兼容：旧启动器（还没有 `bin/current` 的那一版）靠 `.boot-ok-<标记>` 判断
     // 新版本能不能跑起来，看不到就回滚。**下一版删除。**
-    let marker = marker.map(str::to_string);
     let done = AtomicBool::new(false);
     Box::new(move || {
         if done.swap(true, Ordering::SeqCst) {
             return;
         }
-        if let Some(token) = marker.as_deref() {
-            let path = root.join(format!(".boot-ok-{token}"));
-            if let Err(err) = std::fs::write(&path, b"") {
+        if let Some(path) = marker.as_deref() {
+            if let Err(err) = std::fs::write(path, b"") {
                 platform::say_err(&format!("{APP_TITLE}: {}: {err}", path.display()));
             }
         }
@@ -288,4 +307,24 @@ fn resolve_root(given: Option<&Path>, exe: &Path) -> Result<PathBuf, String> {
         };
     }
     Ok(layout::find_root(exe))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 兼容标记只能落在安装根下：路径由外部给的标记拼成，拼出来的结果不能离开根。
+    #[test]
+    fn a_boot_marker_token_cannot_leave_the_install_root() {
+        let root =
+            std::env::temp_dir().join(format!("mesh-client-boot-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let marker = boot_marker(&root, "1a2b3c4d").unwrap();
+        assert_eq!(marker, root.join(".boot-ok-1a2b3c4d"));
+        assert_eq!(marker.parent(), Some(root.as_path()));
+        assert!(boot_marker(&root, "a/b").is_err());
+        assert!(boot_marker(&root, "../escape").is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }

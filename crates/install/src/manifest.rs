@@ -1,7 +1,15 @@
 use crate::{layout, signing, Error};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+
+/// 清单的字节上限：包里的 version.json 与已安装槽里的 version.json 用同一个数字。
+///
+/// 正常清单是一小段 JSON（约 1 KiB）；64 KiB 已经说明它不是出包脚本写出来的。
+/// 启动器读包时用它，日常选槽读已安装清单时也用它——同一份事实只有一处上限。
+pub const MANIFEST_BYTES: u64 = 64 << 10;
 
 /// `bin/<槽>/version.json`：版本号、槽位、平台加每个文件的 sha256，整体由发布私钥签名。
 ///
@@ -112,14 +120,21 @@ impl Manifest {
 /// [`Error::ManifestRead`]，好让上层用 `?` 往上抛；只关心版本号本身的地方
 /// （比如只想知道版本号的地方）用它自己的宽松处理。
 pub fn read(path: &Path) -> Result<Manifest, Error> {
-    let text = std::fs::read_to_string(path).map_err(|err| Error::ManifestRead {
-        path: path.to_path_buf(),
-        reason: err.to_string(),
-    })?;
-    Manifest::parse(&text).map_err(|reason| Error::ManifestRead {
+    let read_error = |reason: String| Error::ManifestRead {
         path: path.to_path_buf(),
         reason,
-    })
+    };
+    // 多读一个字节就够了：超过上限的清单没有解析价值，读整个文件等于把安装根
+    // 的存亡交给它。
+    let file = File::open(path).map_err(|err| read_error(err.to_string()))?;
+    let mut text = String::new();
+    file.take(MANIFEST_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|err| read_error(err.to_string()))?;
+    if text.len() as u64 > MANIFEST_BYTES {
+        return Err(read_error(format!("清单超过上限 {MANIFEST_BYTES} 字节")));
+    }
+    Manifest::parse(&text).map_err(read_error)
 }
 
 /// 平台是 `GOOS/GOARCH`：小写字母数字加一个斜杠。
@@ -290,6 +305,36 @@ mod tests {
         let path = dir.join("version.json");
         std::fs::write(&path, complete()).unwrap();
         assert_eq!(read(&path).unwrap().version, "2026.11.26-13");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 已安装槽里的清单同样受 64 KiB 上限：日常选槽读到的是一个外部文件。
+    #[test]
+    fn read_refuses_a_manifest_over_the_byte_budget() {
+        let dir = temp_dir("manifest-oversized");
+        let path = dir.join("version.json");
+        let mut text = complete();
+        text.push_str(&" ".repeat(MANIFEST_BYTES as usize));
+        std::fs::write(&path, &text).unwrap();
+
+        let err = read(&path).unwrap_err();
+
+        assert!(matches!(err, Error::ManifestRead { .. }));
+        assert!(err.to_string().contains("超过上限"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 上限本身不拒绝：64 KiB 的清单只在形状上荒谬，字节数没有超。
+    #[test]
+    fn read_accepts_a_manifest_at_the_byte_budget() {
+        let dir = temp_dir("manifest-at-limit");
+        let path = dir.join("version.json");
+        let mut text = complete();
+        let padding = MANIFEST_BYTES as usize - text.len();
+        text.push_str(&" ".repeat(padding));
+        std::fs::write(&path, &text).unwrap();
+
+        assert_eq!(read(&path).unwrap().version(), "2026.11.26-13");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

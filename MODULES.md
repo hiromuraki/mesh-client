@@ -282,7 +282,7 @@ pub fn logs(path: &Path, n: usize) -> Vec<Line>;      // 纯函数，读文件
 pub fn events(path: &Path, n: usize) -> Vec<Line>;
 ```
 
-**拥有的状态**：全部。`status`、`last_error`、`cfg`、`core_running`/`core_pid`/`core_cred_id`、`local_ip`、`stun`、`core_version`、`identity`、`update{phase,version,notes,url,sha256,path,sum,err}`、`auth_fails`、`revive_attempt`/`core_started_at`、`autostart_on`、`launcher_sum`/`launcher_tried`/`auto_tried`。**没有一个被 `Mutex` 保护**，因为只有引擎线程读写；对外只发布只读副本（`Published`）。
+**拥有的状态**：全部。`status`、`last_error`、`cfg`、`core_running`/`core_pid`/`core_cred_id`、`local_ip`、`stun`、`core_version`、`identity`、`update`（`UpdateState`：`offer`、`task`、`artifact`、`attempts`、`intent`）、`auth_fails`、`revive_attempt`/`core_started_at`、`autostart_on`、`launcher_sum`/`launcher_tried`/`auto_tried`。**没有一个被 `Mutex` 保护**，因为只有引擎线程读写；对外只发布只读副本（`Published`）。
 
 `beat` 是心跳线程的输入：`config_hash` 现读现算（与 Go 相同，外部改坏 `config.toml` 也能被发现）、`credential_id` 取 `core_cred_id`、`app_version` 固定。**`credential_id` 只在引擎线程写**（写点是 `Cmd::Core(Started)` 与停止事件），心跳线程只读——这就是 F1 的修法，不能让别的线程绕过去。`rpc` 同理：`Some` 表示本代 core 在跑，面板据此决定要不要发查询，`None` 就返回空节点表（与 Go 的 `Dashboard` 在 core 未运行时直接返回一致）。`core_gen` 是引擎给每代 core 分配、只增的代次（`0` 表示还没有 core 进过），与 `rpc` 一起标识「哪个 core 实例」：重启后即使复用同一个回环端口，代次也不同。
 

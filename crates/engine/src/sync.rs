@@ -76,9 +76,10 @@ impl Engine {
 
     /// 应用一份配置。
     ///
-    /// 文件内容不同才重写；写完由 `ensure_core` 按规格决定换不换进程。服务端给的
-    /// `configHash` 不参与判断：字节相同就是同一份配置，摘要算法换过也不必让已经
-    /// 跑对的设备抖一下。
+    /// 文件内容不同才重写（先停旧进程，再原子写）。换不换进程由调用方的
+    /// `ensure_core_or_report` 按规格决定：这里是写事实，不是收敛点，所以不自己
+    /// 再算一遍规格。服务端给的 `configHash` 不参与判断：字节相同就是同一份配置，
+    /// 摘要算法换过也不必让已经跑对的设备抖一下。
     pub(crate) fn apply_locked(&mut self, config: &ClientConfig, toml: &str) -> Result<(), String> {
         self.client = Some(config.clone());
         if self.store.read_config().ok().flatten().as_deref() != Some(toml) {
@@ -98,11 +99,13 @@ impl Engine {
                 ),
             );
         }
-        self.ensure_core_or_report();
         Ok(())
     }
 
-    /// 应用心跳带回来的配置。服务端只在哈希变化时才下发，所以这里不必再比一次。
+    /// 应用心跳带回来的配置。
+    ///
+    /// 只有响应确实带配置正文时才走这里（入口条件在 `Engine::on_beat`）：服务端只在
+    /// 上报的哈希对不上时才下发，所以这里不必再比一次。
     pub(crate) fn apply_remote(&mut self, heartbeat: &remote::Heartbeat) {
         let toml = match heartbeat.config_toml() {
             Ok(toml) => toml,
@@ -114,13 +117,6 @@ impl Engine {
                 return;
             }
         };
-        if toml.is_empty() {
-            self.logf(
-                "app",
-                mesh_text::get(mesh_text::id::ENGINE_LOG_CONFIG_CHANGED_WITHOUT_BODY),
-            );
-            return;
-        }
         let Some(config) = self.client.clone() else {
             return;
         };
@@ -133,6 +129,10 @@ impl Engine {
     }
 
     /// 处理 401，返回是否已经清空设备身份。
+    ///
+    /// 只有 401 会走到这里（`Engine::on_heartbeat` 的分类）：其余状态码——包括服务端
+    /// nonce 缓存饱和（5xx）——都不是身份问题，走控制面失败退避，既不计这里的次数，
+    /// 也不清本地身份。
     ///
     /// 服务端只在“设备身份被删除”时明确回 `revoked`，其余校验失败一律回
     /// `unauthorized`（不区分时钟偏差、nonce 冲突与签名错误）。所以：
@@ -206,7 +206,12 @@ impl Engine {
                 &mesh_text::format(mesh_text::id::ENGINE_LOG_CLEAR_DEVICE_FAILED, &[&err]),
             );
         }
-        let _ = self.stop_core();
+        // 旧数据面必须停下：停不掉不是静默成功——stop_core 已经记了一行，这里按重拉
+        // 档位再试。身份已经作废，没有心跳可等，重试只能靠这条期限。
+        if self.stop_core().is_err() {
+            let attempt = self.on_start_failed_attempt();
+            self.schedule_revive(attempt);
+        }
         // 本地凭据这时已经作废（服务端删设备是先撤销凭据再删记录），留着只是把一份
         // 再也用不上的私钥继续放在磁盘上。
         let _ = self.store.remove_credential();

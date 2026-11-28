@@ -5,7 +5,7 @@
 
 use crate::log::Log;
 use crate::run::{AuthMode, Cmd, Config, CoreRun, CoreSpec, Engine, Notice};
-use crate::update::{Artifact, Intent, Offer, UpdateState};
+use crate::update::{Artifact, DownloadTask, Intent, Offer, UpdateState, MAX_DOWNLOAD_ATTEMPTS};
 use crate::views::{Published, StateCell};
 use crate::Shutdown;
 use mesh_core::Cmd as CoreCmd;
@@ -14,7 +14,7 @@ use mesh_state::{ClientConfig, Credential, Store};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -36,6 +36,8 @@ pub(crate) struct Harness {
     #[cfg_attr(windows, allow(dead_code))]
     pub notices: Receiver<Notice>,
     pub dir: PathBuf,
+    /// 假 core 的 Stop 是否成功：模拟「确认不了旧数据面停下」。
+    stop_ok: Arc<AtomicBool>,
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -58,6 +60,8 @@ fn harness(tag: &str) -> Harness {
     let (self_tx, inbox) = channel();
     let (core_tx, commands) = channel();
     let (record_tx, record_rx) = channel();
+    let stop_ok = Arc::new(AtomicBool::new(true));
+    let stop_flag = Arc::clone(&stop_ok);
     std::thread::spawn(move || loop {
         match commands.recv() {
             Ok(CoreCmd::Start(spec)) => {
@@ -67,7 +71,12 @@ fn harness(tag: &str) -> Harness {
             }
             Ok(CoreCmd::Stop { reply }) => {
                 let _ = record_tx.send(Recorded::Stop);
-                let _ = reply.send(Ok(()));
+                let result = if stop_flag.load(Ordering::SeqCst) {
+                    Ok(())
+                } else {
+                    Err("core 停不下来".to_string())
+                };
+                let _ = reply.send(result);
             }
             Err(_) => return,
         }
@@ -129,6 +138,7 @@ fn harness(tag: &str) -> Harness {
         core: record_rx,
         notices: notice_rx,
         dir,
+        stop_ok,
     }
 }
 
@@ -137,6 +147,11 @@ impl Harness {
         self.core
             .recv_timeout(Duration::from_secs(5))
             .expect("假 core 没有收到命令")
+    }
+
+    /// 让假 core 的 Stop 失败或恢复成功。
+    fn set_stop_ok(&self, ok: bool) {
+        self.stop_ok.store(ok, Ordering::SeqCst);
     }
 
     fn expect_no_core(&self) {
@@ -337,6 +352,42 @@ fn a_successful_request_resets_the_auth_failure_counter() {
     assert_eq!(client.device_id, "dev-1");
 }
 
+/// 5xx 是服务端自己的临时状况，不是身份失效：按控制面失败退避重试，既不累加
+/// 认证失败次数，也不清本地身份（nonce 缓存饱和也走这一支）。
+#[test]
+fn a_server_error_is_retried_without_touching_the_identity() {
+    let mut harness = harness("server-error");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config);
+    api(&mut harness);
+    for attempt in 1..=5u64 {
+        harness.engine.control.gen = attempt;
+        harness.engine.on_heartbeat(
+            attempt,
+            Err(remote::Error::Api {
+                status: 503,
+                code: "unavailable".to_string(),
+                message: "nonce cache full".to_string(),
+            }),
+        );
+    }
+    let client = harness.engine.store.load_client().unwrap().unwrap();
+    assert_eq!(client.device_id, "dev-1", "5xx 不能清掉身份");
+    assert_eq!(harness.engine.auth_fails, 0, "5xx 不计认证失败");
+    assert_eq!(harness.engine.control.failures, 5, "5xx 按控制面失败退避");
+    assert!(
+        harness.engine.control.due.is_some(),
+        "5xx 要继续重试，不能停在无期限"
+    );
+    assert_eq!(harness.published().status, "degraded");
+
+    // 服务端恢复（204）就回到正常节拍，身份与计数都还是那份。
+    harness.engine.control.gen = 6;
+    harness.engine.on_heartbeat(6, Ok(None));
+    assert_eq!(harness.engine.control.failures, 0);
+    assert!(harness.engine.last_hb > 0);
+}
+
 // ------------------------------------------------------------ 凭据上报（F8）
 
 #[test]
@@ -430,6 +481,8 @@ fn a_new_config_is_written_and_the_core_started() {
     save_cred(&harness, "cred-1");
     let toml = "hostname = \"laptop\"\nipv4 = \"10.126.126.100/24\"\n";
     harness.engine.apply_locked(&config, toml).unwrap();
+    // 写配置只写事实，换不换进程由规格入口决定（唯一收敛点）。
+    harness.engine.ensure_core_or_report();
     assert_eq!(
         harness.engine.store.read_config().unwrap().as_deref(),
         Some(toml)
@@ -468,6 +521,69 @@ fn an_unchanged_config_neither_rewrites_nor_restarts() {
         harness.engine.store.read_config().unwrap().as_deref(),
         Some(toml)
     );
+}
+
+/// 正常无变化的心跳没有配置正文：那不是「配置变化却没带正文」的异常，也不该
+/// 在这里多算一遍规格。
+#[test]
+fn a_heartbeat_without_a_config_body_is_not_a_config_change() {
+    let mut harness = harness("beat-no-body");
+    let config = saved_client(&harness);
+    let toml = "hostname = \"laptop\"\nipv4 = \"10.0.0.1/24\"\n";
+    harness.engine.store.write_config(toml).unwrap();
+    save_cred(&harness, "cred-1");
+    harness.engine.client = Some(config);
+    harness.engine.core = Some(applied_core(&harness));
+    api(&mut harness);
+    harness.engine.control.gen = 1;
+
+    // 只带发布信息、没有 configB64：与 204 一样，没有配置要应用。
+    harness.engine.on_heartbeat(
+        1,
+        Ok(Some(remote::Heartbeat {
+            config_hash: "stale".to_string(),
+            ..remote::Heartbeat::default()
+        })),
+    );
+
+    harness.expect_no_core();
+    assert_eq!(
+        harness.engine.store.read_config().unwrap().as_deref(),
+        Some(toml),
+        "空正文不该覆盖磁盘上的配置"
+    );
+    let log = std::fs::read_to_string(harness.dir.join("log").join("client.log")).unwrap();
+    let without_body = mesh_text::get(mesh_text::id::ENGINE_LOG_CONFIG_CHANGED_WITHOUT_BODY);
+    assert!(!log.contains(without_body), "正常空响应不该记异常：{log}");
+}
+
+/// 带正文的心跳：配置落盘，并由最后那一个规格入口换进程。
+#[test]
+fn a_heartbeat_with_a_config_body_is_applied() {
+    let mut harness = harness("beat-body");
+    let config = saved_client_named(&harness, "laptop");
+    harness.engine.client = Some(config);
+    save_cred(&harness, "cred-1");
+    api(&mut harness);
+    harness.engine.control.gen = 1;
+    let body = "aG9zdG5hbWUgPSAibGFwdG9wIgppcHY0ID0gIjEwLjAuMC4xLzI0Igo=";
+    harness.engine.on_heartbeat(
+        1,
+        Ok(Some(remote::Heartbeat {
+            config_hash: "h1".to_string(),
+            config_b64: body.to_string(),
+            ..remote::Heartbeat::default()
+        })),
+    );
+    assert_eq!(
+        harness.engine.store.read_config().unwrap().as_deref(),
+        Some("hostname = \"laptop\"\nipv4 = \"10.0.0.1/24\"\n")
+    );
+    match harness.next_core() {
+        Recorded::Start(spec) => assert_eq!(spec.hostname, "laptop"),
+        _ => panic!("配置到齐就该起 core"),
+    }
+    harness.expect_no_core();
 }
 
 #[test]
@@ -523,6 +639,7 @@ fn an_unchanged_config_still_starts_a_core_that_is_not_running() {
     harness.engine.store.write_config(toml).unwrap();
     save_cred(&harness, "cred-1");
     harness.engine.apply_locked(&config, toml).unwrap();
+    harness.engine.ensure_core_or_report();
     assert!(matches!(harness.next_core(), Recorded::Start(_)));
 }
 
@@ -539,6 +656,7 @@ fn a_changed_config_stops_the_old_core_before_starting_the_new_one() {
     harness.engine.core = Some(running_core());
     let toml = "hostname = \"new\"\nipv4 = \"10.126.126.100/24\"\n";
     harness.engine.apply_locked(&config, toml).unwrap();
+    harness.engine.ensure_core_or_report();
     assert!(matches!(harness.next_core(), Recorded::Stop), "先停旧的");
     match harness.next_core() {
         Recorded::Start(spec) => assert_eq!(spec.hostname, "new"),
@@ -951,21 +1069,23 @@ fn staged_offer(harness: &Harness, version: &str, sha: &str) -> (UpdateState, Pa
         }),
         task: None,
         artifact: Artifact::Staged(part.clone()),
+        attempts: 0,
         intent: None,
     };
     (state, part)
 }
 
-fn failed_artifact(attempts: u32, retry_in: i64) -> Artifact {
-    Artifact::Failed {
+/// 让当前 offer 停在「已经连续失败 `attempts` 次、下一次重试在 `retry_in` 秒之后」。
+fn fail_update(harness: &mut Harness, attempts: u32, retry_in: i64) {
+    harness.engine.update.attempts = attempts;
+    harness.engine.update.artifact = Artifact::Failed {
         error: "下载中断".to_string(),
-        attempts,
         retry_at: if retry_in >= 0 {
             Instant::now() + Duration::from_secs(retry_in as u64)
         } else {
             Instant::now() - Duration::from_secs((-retry_in) as u64)
         },
-    }
+    };
 }
 
 #[test]
@@ -996,7 +1116,7 @@ fn a_failure_is_kept_until_the_backoff_expires() {
     // 有意图才在两种平台上都走「准备工件」这条路：Unix 无意图时不预取。
     harness.engine.update.intent = Some(Intent::Manual);
     harness.engine.update.task = None;
-    harness.engine.update.artifact = failed_artifact(1, 30);
+    fail_update(&mut harness, 1, 30);
     // 退避还没到：心跳既不能把失败态抹掉，也不能抢着重下。
     harness
         .engine
@@ -1015,7 +1135,7 @@ fn a_failed_download_is_retried_once_the_backoff_expires() {
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
     harness.engine.update.task = None;
-    harness.engine.update.artifact = failed_artifact(1, -1);
+    fail_update(&mut harness, 1, -1);
     // 走「有意图 → try_apply → 工件失败 → prepare 重下」这条两种平台都有的路径：
     // 没有意图时 Unix 不预取（见 prepare 的平台判据），只靠心跳推不动重下。
     harness.engine.update.intent = Some(Intent::Manual);
@@ -1056,7 +1176,7 @@ fn downloading_gives_up_after_the_attempt_limit() {
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
     harness.engine.update.task = None;
-    harness.engine.update.artifact = failed_artifact(5, -1);
+    fail_update(&mut harness, MAX_DOWNLOAD_ATTEMPTS, -1);
     // 意图摆上，判的才是次数上限本身，而不是「Unix 无意图不预取」。
     harness.engine.update.intent = Some(Intent::Manual);
     harness.engine.advance_update();
@@ -1107,7 +1227,7 @@ fn a_new_version_resets_the_failure() {
     harness
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
-    harness.engine.update.artifact = failed_artifact(3, 60);
+    fail_update(&mut harness, 3, 60);
     harness
         .engine
         .offer_update(Some(&update_info("2026.11.26-3")));
@@ -1119,33 +1239,99 @@ fn a_new_version_resets_the_failure() {
         matches!(harness.engine.update.artifact, Artifact::None),
         "换版本要清掉上一份的失败"
     );
+    assert_eq!(
+        harness.engine.update.attempts, 0,
+        "换版本要清掉上一份的失败次数"
+    );
 }
 
-/// 服务端每轮心跳都带完整的一份，「这份我已经验过」由版本与摘要判：同一份不再
-/// 下载，策略字段照样跟着最新下发值走。
+/// 服务端每轮心跳都带完整的一份，「这份我已经验过」由版本与摘要判：同一工件不再
+/// 下载，但地址、说明与授权都按最新下发值刷新——发布方搬迁了地址，客户端还按旧
+/// 地址重试就永远下不到。已暂存件与在途任务不受影响。
 #[test]
-fn the_same_offer_is_not_downloaded_again() {
+fn the_same_artifact_refreshes_the_offer_without_dropping_the_local_package() {
     let mut harness = harness("same-offer");
     api(&mut harness);
-    let (state, _) = staged_offer(&harness, "2026.11.26-2", &digest(0xab));
+    let (mut state, part) = staged_offer(&harness, "2026.11.26-2", &digest(0xab));
+    // 这一份已经自动试过一次：同工件刷新不该让它再自动装一遍。
+    state.offer.as_mut().unwrap().auto_tried = true;
     harness.engine.update = state;
-    harness
-        .engine
-        .offer_update(Some(&update_info("2026.11.26-2")));
+    harness.engine.update.attempts = 2;
+    let mut info = update_info("2026.11.26-2");
+    info.url = "http://10.0.0.9/moved.tar.zst".to_string();
+    info.notes = "新说明".to_string();
+    info.auto_update = true;
+    harness.engine.offer_update(Some(&info));
     harness.engine.advance_update();
 
     let update = &harness.engine.update;
     assert_eq!(update.phase(), crate::update::Phase::Ready);
-    assert_eq!(update.offer.as_ref().unwrap().version, "2026.11.26-2");
-    assert_eq!(update.offer.as_ref().unwrap().notes, "旧说明");
-    assert!(!update.offer.as_ref().unwrap().auto);
-    assert!(matches!(update.artifact, Artifact::Staged(_)));
-    assert!(update.task.is_none());
-    // 策略字段随下发值更新，但不会因此重下或重置进度。
-    let mut allowed = update_info("2026.11.26-2");
-    allowed.auto_update = true;
-    harness.engine.offer_update(Some(&allowed));
-    assert!(harness.engine.update.offer.as_ref().unwrap().auto);
+    let offer = update.offer.as_ref().unwrap();
+    assert_eq!(offer.version, "2026.11.26-2");
+    assert_eq!(offer.url, "http://10.0.0.9/moved.tar.zst", "地址要跟着换");
+    assert_eq!(offer.notes, "新说明");
+    assert!(offer.auto);
+    assert!(
+        matches!(&update.artifact, Artifact::Staged(staged) if staged == &part),
+        "已暂存件不动"
+    );
+    assert!(part.is_file(), "已校验的字节还在");
+    assert!(update.task.is_none(), "同一份不再下载");
+    assert_eq!(update.attempts, 2, "同一份的失败次数不该被心跳清零");
+
+    // 在途任务同样不受影响：它按版本与摘要认这一份，与地址无关。
+    let in_flight = DownloadTask {
+        gen: 7,
+        version: "2026.11.26-2".to_string(),
+        sha256: digest(0xab),
+    };
+    harness.engine.update.task = Some(in_flight.clone());
+    harness.engine.offer_update(Some(&info));
+    assert_eq!(harness.engine.update.task.as_ref(), Some(&in_flight));
+}
+
+/// 连续下载失败：次数跨「起任务 → 失败 → 重试」累加，到上限就停下来等人处理。
+#[test]
+fn consecutive_download_failures_accumulate_until_the_limit() {
+    let mut harness = harness("update-accumulate");
+    // 不装 api：任务由测试直接投递完成消息，不起后台线程。
+    harness
+        .engine
+        .offer_update(Some(&update_info("2026.11.26-2")));
+    // Unix 无意图不预取：把意图摆上，两种平台才走同一条准备路径。
+    harness.engine.update.intent = Some(Intent::Manual);
+    for attempt in 1..=MAX_DOWNLOAD_ATTEMPTS {
+        let task = DownloadTask {
+            gen: attempt as u64,
+            version: "2026.11.26-2".to_string(),
+            sha256: digest(0xab),
+        };
+        harness.engine.update.task = Some(task.clone());
+        harness
+            .engine
+            .on_download(task, Err("连接被拒绝".to_string()));
+        assert_eq!(
+            harness.engine.update.attempts, attempt,
+            "失败次数要累加，不能每次回到 1"
+        );
+        assert_eq!(
+            harness.engine.update.phase(),
+            crate::update::Phase::Failed,
+            "第 {attempt} 次失败之后停在失败态"
+        );
+    }
+
+    // 退避已过（那是另一条轴）：次数用完就不再起任务。
+    if let Artifact::Failed { retry_at, .. } = &mut harness.engine.update.artifact {
+        *retry_at = Instant::now() - Duration::from_secs(1);
+    }
+    api(&mut harness);
+    harness.engine.advance_update();
+    assert!(
+        harness.engine.update.task.is_none(),
+        "次数用完就该停下来等人处理"
+    );
+    assert_eq!(harness.engine.update.phase(), crate::update::Phase::Failed);
 }
 
 #[test]
@@ -1334,6 +1520,83 @@ fn a_downloaded_package_is_not_committed_without_an_intent() {
     );
 }
 
+/// 交接没被接收：已就绪的包与授权都留着，失败可见；下一轮只重试交接——不重下，
+/// 也不消耗自动尝试标记。
+#[cfg(windows)]
+#[test]
+fn a_failed_handoff_keeps_the_package_and_the_authorization() {
+    let mut harness = harness("handoff-fails");
+    let sha = digest(0xab);
+    let (mut state, part) = staged_offer(&harness, "2026.11.26-2", &sha);
+    state.intent = Some(Intent::Auto);
+    let offer = state.offer.as_mut().unwrap();
+    offer.auto = true;
+    offer.auto_tried = true;
+    harness.engine.update = state;
+
+    // 安装根里没有启动器：安装事务无法被接收。
+    harness.engine.advance_update();
+
+    let pending = harness.dir.join("update.tar.zst");
+    {
+        let update = &harness.engine.update;
+        assert!(
+            matches!(update.artifact, Artifact::Committed { .. }),
+            "工件已就绪是另一件事"
+        );
+        assert!(!part.exists(), "包已提交到固定路径");
+        assert!(pending.is_file(), "已就绪的包要留着，不能丢");
+        assert_eq!(update.intent, Some(Intent::Auto), "授权不因交接失败而丢");
+        assert!(
+            !update.offer.as_ref().unwrap().auto_tried,
+            "自动尝试标记不被消耗"
+        );
+        assert!(
+            update.error().contains("启动器"),
+            "失败要可见：{}",
+            update.error()
+        );
+        assert_eq!(update.phase(), crate::update::Phase::Failed);
+    }
+
+    // 下一轮心跳只重试交接：不重下，包还在。
+    harness.engine.advance_update();
+    assert!(matches!(
+        harness.engine.update.artifact,
+        Artifact::Committed { .. }
+    ));
+    assert!(harness.engine.update.task.is_none(), "不重新下载");
+    assert!(pending.is_file());
+}
+
+/// 启动器替换还没结束：客户端包交接延期——这一轮要拉起的正是那个正在被换掉的文件。
+#[test]
+fn a_client_handoff_waits_for_the_launcher_replacement_in_flight() {
+    let mut harness = harness("handoff-deferred");
+    let sha = digest(0xab);
+    let (mut state, part) = staged_offer(&harness, "2026.11.26-2", &sha);
+    state.intent = Some(Intent::Manual);
+    harness.engine.update = state;
+    harness.engine.launcher.task = Some(DownloadTask {
+        gen: 9,
+        version: "2026.11.26-3".to_string(),
+        sha256: digest(0xcd),
+    });
+
+    harness.engine.advance_update();
+
+    assert!(matches!(
+        &harness.engine.update.artifact,
+        Artifact::Staged(staged) if staged == &part
+    ));
+    assert!(part.is_file(), "延期不是失败：暂存件留着");
+    assert!(
+        !harness.dir.join("update.tar.zst").exists(),
+        "交接没被接收就不该有安装信号"
+    );
+    assert_eq!(harness.engine.update.intent, Some(Intent::Manual));
+}
+
 #[test]
 fn a_launcher_replacement_blocked_by_the_install_root_is_retried() {
     let mut harness = harness("launcher-retry");
@@ -1486,7 +1749,7 @@ fn a_failed_download_is_retried_when_the_same_offer_comes_back() {
     harness
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
-    harness.engine.update.artifact = failed_artifact(1, -1);
+    fail_update(&mut harness, 1, -1);
     harness
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
@@ -1739,7 +2002,7 @@ fn a_missing_package_is_downloaded_again_when_the_user_asks_to_apply() {
         .engine
         .offer_update(Some(&update_info("2026.11.26-2")));
     harness.engine.api = Some(Arc::clone(&api));
-    harness.engine.update.artifact = failed_artifact(1, 30);
+    fail_update(&mut harness, 1, 30);
     let result = harness.engine.apply_update();
     assert!(result.is_ok(), "点重试要重新下一份，而不是报“包不在本地”");
     assert_eq!(
@@ -1957,12 +2220,57 @@ fn a_failed_generation_cleanup_keeps_the_old_identity() {
     assert_eq!(client.server_url, "http://127.0.0.1:9", "旧身份不能被换掉");
 }
 
+/// 换绑的中途失败：旧数据面先停下了，清理却没做成。这是一次明确失败，不是半换绑：
+/// 旧一代的身份与配置原样留着，下一轮心跳仍按同一份身份收敛。
+#[test]
+fn a_failed_generation_cleanup_stops_the_old_data_plane_first() {
+    let mut harness = harness("switch-cleanup-fails-core");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config);
+    harness
+        .engine
+        .store
+        .write_config("ipv4 = \"10.0.0.1/24\"\n")
+        .unwrap();
+    save_cred(&harness, "cred-old");
+    harness.engine.core = Some(applied_core(&harness));
+    // config.toml 换成目录：remove_file 会失败（Windows 与 Unix 都如此）。
+    std::fs::remove_file(harness.engine.store.config_path()).unwrap();
+    std::fs::create_dir_all(harness.engine.store.config_path()).unwrap();
+
+    let err = harness
+        .engine
+        .save_settings(crate::SettingsInput {
+            server_url: "http://127.0.0.1:8".to_string(),
+            token: String::new(),
+            hostname: String::new(),
+        })
+        .unwrap_err();
+    assert!(err.contains("config.toml"), "err = {err}");
+    assert!(
+        matches!(harness.next_core(), Recorded::Stop),
+        "清理之前先停旧数据面"
+    );
+    assert!(harness.engine.core.is_none());
+    assert_eq!(
+        harness
+            .engine
+            .store
+            .load_client()
+            .unwrap()
+            .unwrap()
+            .server_url,
+        "http://127.0.0.1:1",
+        "旧身份不能被换掉"
+    );
+}
+
 /// 换代次的中断点：旧一代的配置与凭据已经删掉、新身份还没写入。
 ///
 /// 这时本地只该得到「旧身份 + 没有配置」这一个确定状态：不拿旧文件起 core，
-/// 下一轮心跳按同一份身份重新要配置。
+/// 已经在跑的那一代也必须停下——删文件只决定下一次读哪份配置，不决定那个进程会退。
 #[test]
-fn an_interrupted_generation_switch_yields_no_core() {
+fn an_interrupted_generation_switch_stops_the_running_core() {
     let mut harness = harness("switch-interrupted");
     let config = saved_client(&harness);
     harness.engine.client = Some(config);
@@ -1983,7 +2291,101 @@ fn an_interrupted_generation_switch_yields_no_core() {
         "没有配置就没有可应用的规格"
     );
     harness.engine.ensure_core().unwrap();
+    assert!(
+        matches!(harness.next_core(), Recorded::Stop),
+        "没有期望规格就不该有运行实例"
+    );
+    assert!(harness.engine.core.is_none());
     harness.expect_no_core();
+}
+
+/// 换绑：控制面地址变了就是另一代。旧数据面必须先停下，新控制面还没下发配置时
+/// 什么都不启动，旧一代的配置、凭据与认证失败计数一起作废。
+#[test]
+fn rebinding_to_another_control_plane_stops_the_running_core() {
+    let mut harness = harness("rebind-stop");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config);
+    harness
+        .engine
+        .store
+        .write_config("ipv4 = \"10.0.0.1/24\"\n")
+        .unwrap();
+    save_cred(&harness, "cred-old");
+    harness.engine.core = Some(applied_core(&harness));
+    harness.engine.auth_fails = 2;
+
+    harness
+        .engine
+        .save_settings(crate::SettingsInput {
+            server_url: "http://127.0.0.1:2".to_string(),
+            token: String::new(),
+            hostname: String::new(),
+        })
+        .unwrap();
+
+    assert!(
+        matches!(harness.next_core(), Recorded::Stop),
+        "换绑必须停掉旧数据面"
+    );
+    // 新控制面还没下发配置：不能用旧配置的规格再起一个进程。
+    harness.expect_no_core();
+    assert!(harness.engine.core.is_none());
+    assert!(
+        harness.engine.store.read_config().unwrap().is_none(),
+        "上一代控制面的配置必须作废"
+    );
+    assert!(
+        harness.engine.store.load_credential().unwrap().is_none(),
+        "上一代控制面的凭据必须作废"
+    );
+    assert_eq!(
+        harness
+            .engine
+            .store
+            .load_client()
+            .unwrap()
+            .unwrap()
+            .server_url,
+        "http://127.0.0.1:2"
+    );
+    assert_eq!(harness.engine.auth_fails, 0, "认证失败计数属于上一代");
+}
+
+/// 旧数据面停不掉：失败必须可见，并且按重拉档位有界重试；停下之后实例才消失。
+#[test]
+fn a_core_that_cannot_be_stopped_stays_visible_and_is_retried() {
+    let mut harness = harness("stop-fails");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config);
+    harness
+        .engine
+        .store
+        .write_config("ipv4 = \"10.0.0.1/24\"\n")
+        .unwrap();
+    save_cred(&harness, "cred-1");
+    harness.engine.core = Some(applied_core(&harness));
+    harness.engine.store.remove_config().unwrap();
+    harness.engine.store.remove_credential().unwrap();
+    harness.set_stop_ok(false);
+
+    harness.engine.ensure_core_or_report();
+    assert!(matches!(harness.next_core(), Recorded::Stop));
+    assert!(harness.engine.core.is_some(), "停不掉就不能当它停了");
+    assert!(harness.engine.core_running(), "core 还在跑，界面不能谎报");
+    assert!(harness.engine.revive.is_some(), "停不掉要有界重试");
+    assert_eq!(harness.published().status, "error", "失败要可见");
+
+    // 到点重试：这次停得掉，实例消失，重试期限不再排。
+    harness.set_stop_ok(true);
+    harness.engine.revive = Some(crate::run::Revive {
+        attempt: 1,
+        due: Instant::now(),
+    });
+    harness.engine.on_deadline();
+    assert!(matches!(harness.next_core(), Recorded::Stop));
+    assert!(harness.engine.core.is_none());
+    assert!(harness.engine.revive.is_none(), "收敛之后不该再排重试");
 }
 
 #[test]

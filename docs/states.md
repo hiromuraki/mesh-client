@@ -33,12 +33,12 @@ stateDiagram-v2
 1. `bin/current` 是唯一的持久安装状态。一行文本，值只能是两个槽名之一，首尾空白忽略。
 2. 槽名固定为 `alice`、`bob`，永不含版本号：Windows 的防火墙与杀软规则按程序路径建立，路径集合必须恒定；历史教训是用日期命名槽位，规则只增不减。
 3. 槽有效：`version.json` 验签通过（`MESH4`、`slot = client`、本机平台、文件集合与逐文件摘要），且目录里没有清单之外的文件。没有有效清单即半包。
-4. 候选槽 = 非当前槽，不需要任何记录。手动安装先按「修复」判出当前槽（若可能），目标取当前槽之外的另一个；两个槽都无效、连当前槽都判不出来时，目标固定为 `alice`，与首次安装一致。
+4. 候选槽 = 非当前槽，不需要任何记录。手动安装先按「修复」判出当前槽（若可能），目标取当前槽之外的另一个；两个槽都无效、连当前槽都判不出来时，目标固定为 `alice`，与首次安装一致，并删掉遗留的 `current`。安装前再判一条不变量：`current` 不得已经等于本次候选槽——撞上就拒绝安装，不猜。
 5. 提交权归客户端。提交时点就是启动就绪的时点：引擎与面板就位后调用 `ready`，桌面版还要求托盘真的立起来（更新已提交而进程随即退出时，下一轮登录同样失败），headless 在面板起来之后调用。`current_exe()` 的父目录名按 ASCII 小写比较，只认 `alice` / `bob` 两个值；原子写（临时文件 + 改名），幂等。父目录不是槽名（例如从别处手工运行）就什么都不做。
-6. 启动器从不提交，只在 `current` 缺失、值非法、或指向的槽无效时补写一次；那是修复，不是提交。
+6. 启动器从不提交，只在 `current` 缺失、值非法、或指向的槽无效时补写一次；那是修复，不是提交。修复写失败即这一次流程失败：确认判据的前提正是「拉起之前 `current` 不等于该槽」，指针修不出来时那次观察没有意义。
 7. 选槽顺序：`current` 有效就用它；否则在有效槽里取目录名字典序最大的（`bob` 优先于 `alice`）；若那个槽无效则取另一个；两个都无效即没有可启动版本（首次安装或需要人工）。依据是名字的字典序，不是目录时间，也不是清单里的版本号——这一刻的诉求是确定性、不需要解包；选错也能从日志看出选了谁。
-8. 启动确认：拉起之后等 `current` 变成正在跑的那个槽即为成功；60 秒内没变或子进程退出即为失败。
-9. 失败时不改 `current`、不删候选槽。失败按版本计次（沿用 `Failures` 的 `LIMIT`），同一版本连续失败到上限就跳过它：「起不来」不一定是版本的问题（网络、凭据过期、TUN 冲突、UAC 没点同意），计数必须按版本记，不能按槽记。候选槽的 `version.json` 读不出或验不过时另走一条：丢弃候选槽、删除 `update.tar.zst`、记一条日志，不计次。
+8. 启动确认：拉起之后等 `current` 变成正在跑的那个槽即为成功；60 秒内没变或子进程退出即为失败。这个判据只在「拉起之前 `current` 不等于该槽」时成立，见第 4 条。
+9. 失败时不改 `current`、不删候选槽。候选启动的结局按三种形状收尾：进程没创建出来、确认失败且已确认候选退出，都按版本计次；确认失败但停不掉候选时不计数、也不回退到旧槽——那个进程可能还活着，计数与回退都会把它当成没在跑。失败按版本计次（沿用 `Failures` 的 `LIMIT`），同一版本连续失败到上限就跳过它：「起不来」不一定是版本的问题（网络、凭据过期、TUN 冲突、UAC 没点同意），计数必须按版本记，不能按槽记。候选槽的 `version.json` 读不出或验不过时另走一条：丢弃候选槽、删除 `update.tar.zst`、记一条日志，不计次。
 10. 清理时机：只有一处触发——确认成功之后删旧槽（此刻 `current` 已指向新槽）。选槽时不删任何槽：启动器分不清「上一次提交留下的旧槽」与「这一次刚装好、还没确认的候选槽」，按「另一个槽有效就删」会抹掉刚失败的那次安装。旧布局残留（`bin.old/`、`bin.stale/`、`install.state`）启动时顺手清掉。不在确认成功那一瞬删：那一刻客户端刚写完 `current`，删东西只会制造竞态。客户端可能晚于 60 秒才写 `current`，启动器若在确认过程中先删候选，就会出现 `current` 指向一个不存在的槽；Windows 上运行中的 exe 删不掉、Linux 上能 unlink，这种平台差异会把竞态变成只在 Linux 上出现的砖。
 
 两把锁回答两个问题，互不替代：
@@ -104,7 +104,7 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
   A["入口：普通启动 / --file / --url / 常驻监督"] --> B["own：取 install.lock，拿不到即失败"]
-  B --> B2["选槽之前：current 与另一个槽都有效则删另一个槽，并清旧布局残留"]
+  B --> B2["清旧布局残留；选槽本身不删任何槽"]
   B2 --> C["读 bin/current；缺失、非法或指向的槽无效时按选槽顺序选一个并补写（修复）"]
   C --> D{"有待装的包？"}
   D -- 是 --> E["--file / --url 由参数给，常驻监督看 update.tar.zst；不比当前槽新就丢弃"]
@@ -117,7 +117,7 @@ flowchart TD
   I --> J["等 bin/current 变成该槽名，上限 60s"]
   J -- 看到变化 --> K["清掉该版本的失败计数；删掉旧槽"]
   J -- 进程提前退出或超时 --> L["先停掉候选槽并确认它退出"]
-  L -- 停不下来 --> M["不动 current，保留候选槽，下一轮接着判"]
+  L -- 停不下来 --> M["不动 current，保留候选槽与进程事实，不回退、不宣告完成"]
   L -- 已退出 --> H
   H --> N["普通启动不动文件；安装失败只保留候选槽"]
 ```
@@ -276,13 +276,14 @@ stateDiagram-v2
 
 ## 6. 更新模型
 
-自更新把四个事实分开表达，每个只有一个落点；界面上的 `Phase`（`Idle` / `Downloading` / `Ready` / `Failed`）是它们的投影，不是另一份状态。服务端每轮心跳都带完整的一份 `appUpdate`；「是不是同一份」由客户端按版本与摘要判断，与响应形状、下载进度都无关。线格式见 [契约/updates.md](../../docs/contract/updates.md)，交接约定见 [契约/client.md](../../docs/contract/client.md)「客户端如何装」。
+自更新把四个事实与一个计数器分开表达，每个只有一个落点；界面上的 `Phase`（`Idle` / `Downloading` / `Ready` / `Failed`）是它们的投影，不是另一份状态。服务端每轮心跳都带完整的一份 `appUpdate`；「是不是同一份」由客户端按版本与摘要判断，与响应形状、下载进度都无关。线格式见 [契约/updates.md](../../docs/contract/updates.md)，交接约定见 [契约/client.md](../../docs/contract/client.md)「客户端如何装」。
 
 | 轴 | 类型 | 取值 | 谁改它 |
 | --- | --- | --- | --- |
-| offer | `Option<Offer>` | 没有；有（`version`、`sha256`、`auto`、`auto_tried`） | 心跳的 `Engine::offer_update`、`start_offer`、`withdraw` |
+| offer | `Option<Offer>` | 没有；有（`version`、`sha256`、`url`、`notes`、`auto`、`auto_tried`） | 心跳的 `Engine::offer_update`、`start_offer`、`withdraw` |
 | task | `Option<DownloadTask>` | 没有；在跑（`gen`、`version`、`sha256`） | `prepare` 起任务，`on_download` 落任务 |
-| artifact | `Artifact` | `None`；`Staged(.part 路径)`；`Failed{error, attempts, retry_at}` | `on_download`、`try_apply`、`prepare` |
+| artifact | `Artifact` | `None`；`Staged(.part 路径)`；`Committed{最近一次交接失败原因}`；`Failed{error, retry_at}` | `on_download`、`try_apply`、`prepare`、`discard_artifact` |
+| attempts | `u32` | 本份 offer 连续下载失败了几次 | `note_download_failure` 加一；手动重试与换 offer 清零 |
 | intent | `Option<Intent>` | 没有；`Manual`；`Auto` | 用户点安装、自动策略；offer 变化或交接完成时清空 |
 
 ```mermaid
@@ -291,29 +292,32 @@ stateDiagram-v2
     state "有 offer，无工件" as Offered
     state "下载中（task 非空）" as Downloading
     state "已暂存（artifact = Staged）" as Staged
+    state "已提交、等交接（artifact = Committed）" as Committed
     state "准备失败（artifact = Failed）" as Failed
-    state "已交接（改名成 update.tar.zst）" as Handed
     [*] --> NoOffer
     NoOffer --> Offered: 心跳带来完整 appUpdate，版本与签名都过
     Offered --> Downloading: prepare 起一个任务（Windows 预取，或已有授权）
     Downloading --> Staged: 下载完成，摘要与签名都过
-    Downloading --> Failed: 下载或校验失败
-    Failed --> Downloading: 退避到点自动重试；用户点安装则立即重下
-    Staged --> Handed: 有意图且拿到安装根写权
+    Downloading --> Failed: 下载或校验失败，attempts 加一
+    Failed --> Downloading: 退避到点；用户点安装则清零后立即重下
+    Staged --> Committed: 有意图且拿到安装根写权，改名成 update.tar.zst
     Staged --> Staged: 拿不到写权，延期（不重下）
+    Committed --> Committed: 启动器没接收：保留工件与原因，只重试交接
+    Committed --> [*]: 启动器接收，进程退出
     Staged --> Offered: 换 offer，旧暂存件删除
     Staged --> NoOffer: 撤回，旧暂存件删除
+    Committed --> Offered: 换 offer，未被接收的固定包删除
+    Committed --> NoOffer: 撤回，同上
     Downloading --> Offered: 换 offer，在跑任务作废
     Downloading --> NoOffer: 撤回，在跑任务作废
-    Handed --> [*]: 进程退出，安装交给启动器
 ```
 
 | 当前 | 事件 | 迁移 | 落地动作 |
 | --- | --- | --- | --- |
 | 无 offer | 心跳带完整 `appUpdate`，版本与签名都过 | → 有 offer，`intent` 与 `artifact` 清空 | 删上一份暂存件（内容不再被授权）；Windows 立即预取，Linux 等授权 |
-| 有 offer | 心跳带来同一份（版本与摘要都相同） | 不变 | 只更新 `auto`，不重下、不动进度 |
-| 有 offer | 心跳撤回（响应里没有 `appUpdate`） | → 无 offer | 删暂存件、清意图；在跑任务留着，回来时自弃 |
-| 有 offer | 再次完整下发（换版本或同版本重发） | 旧 offer → 新 offer | 删旧暂存件、清意图；在跑任务留着 |
+| 有 offer | 心跳带来同一份（版本与摘要都相同） | 不变 | 刷新 `url`、`notes`、`auto`；不重下、不动进度、`attempts` 不清零 |
+| 有 offer | 心跳撤回（响应里没有 `appUpdate`） | → 无 offer | 删暂存件与被驳回的固定包、清意图与计数；在跑任务留着，回来时自弃 |
+| 有 offer | 再次完整下发（换版本或同版本重发） | 旧 offer → 新 offer | 删旧暂存件与未被接收的固定包、清意图、`attempts` 归零；在跑任务留着 |
 | 有 offer、无工件 | 策略允许且这一份没试过 | 记 `intent = Auto` | 无（自动意图每份只记一次） |
 | 有 offer、无工件 | 没有意图，且平台是 Windows | 起任务 | 预取到 `.part`：只暂存，不算授权 |
 | 有 offer、有意图 | 需要字节 | 起任务 | 写 `<root>/update.tar.zst.part`，同一时刻最多一个任务 |
@@ -321,10 +325,13 @@ stateDiagram-v2
 | 下载中 | 完成时 offer 已换或已撤回 | → 新 offer，或 → 无 offer | 删掉这条任务自己的 `.part` |
 | 下载中 | 失败、仍是当前 offer | → `Failed` | `attempts` 加一，`retry_at` 按退避推后 |
 | `Failed` | 退避到点，下一轮心跳 | → 下载中 | 重下；累计 5 次后停手等人 |
-| `Staged` + 有意图 | 拿到安装根写权 | → 交接 | 改名成 `<root>/update.tar.zst`，`intent` 与 `artifact` 清空，进程退出 |
+| `Staged` + 有意图 | 拿到安装根写权 | → `Committed` | 改名成 `<root>/update.tar.zst`；工件仍归引擎，等启动器接收 |
 | `Staged` + 有意图 | 拿不到写权 | 不变 | 只记日志，下一轮心跳再试，已校验的字节不重下 |
+| `Staged` + 有意图 | 启动器替换任务还在跑 | 不变 | 延期交接，避免两件事同时抢安装根 |
+| `Committed` | 启动器接收 | 清空 `intent` 与 `artifact`，进程退出 | 安装事务从此拥有那份包 |
+| `Committed` | 交接失败（启动器不在、创建失败） | 仍是 `Committed`，带上失败原因 | 保留工件与授权、把 `auto_tried` 放回去，下一轮只重试交接，不重下 |
 | 无 offer | 用户点安装 | 拒绝 | 无 |
-| `Failed` | 用户点安装 | → 下载中 | 清掉失败记录与退避，立即重下 |
+| `Failed` | 用户点安装 | → 下载中 | 清掉失败次数与退避，立即重下 |
 
 启动器槽位单独维护，因为它不随客户端包 offer 重建：
 
@@ -352,14 +359,14 @@ stateDiagram-v2
 
 不变量：
 
-1. 四个轴互不代理：任何「可以交接」都由 `artifact == Staged` 与 `intent` 同时成立表达。
+1. 四个轴互不代理：任何「可以交接」都由 `artifact == Staged` 与 `intent` 同时成立表达；`attempts` 只是计数，不表达能否安装。
 2. 任务单飞：`task` 非空时不新起下载——`.part` 只有一个，两个线程写只会互相截断。
-3. 暂存不是信号：固定名 `update.tar.zst` 只在持安装根写权提交的那一刻出现，此前工件一直叫 `.part`。
+3. 暂存不是信号：固定名 `update.tar.zst` 只在持安装根写权提交的那一刻出现，此前工件一直叫 `.part`；出现之后它归引擎直到启动器接收，引擎可以删它（撤回或换 offer），启动器接收后就再也不碰。
 4. 只有被授权的交接才提交：`Auto` 在交接前重新校验当前策略，策略已关就放弃；`Manual` 只看 offer 还在不在。
 5. 锁争用只延期：拿不到写权时暂存件原样留着，下一轮心跳重试，已校验的字节不重下。
 6. 结果按代次与 offer 双重判定：任务代次不等，或当前 offer 的版本与摘要变了，这条结果连文件都不留。
 7. 意图随 offer 变化一起清空，因此意图天然只指向当前 offer，不需要另存一份身份副本。
-8. 失败退避按次数翻倍、上限 10 分钟，累计 `MAX_DOWNLOAD_ATTEMPTS` 次后停手等人处理。
+8. 失败次数住在 offer 上，起任务不清零：退避按次数翻倍、上限 10 分钟，累计 `MAX_DOWNLOAD_ATTEMPTS` 次后停手等人处理。只有手动重试与换 offer 归零。
 9. 启动器替换同一份只试一次：`Deferred` 是唯一会把 `tried` 放回的结论。
 
 | 项 | 常量 | 值 |

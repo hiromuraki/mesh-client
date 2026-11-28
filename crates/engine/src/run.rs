@@ -588,6 +588,9 @@ impl Engine {
                 self.on_beat(api, heartbeat.unwrap_or_default());
             }
             Err(err) => {
+                // 只有 401 可能是身份问题：服务端明确回 revoked，或连续校验失败。
+                // 5xx（包括服务端 nonce 缓存饱和）是服务端自己的临时状况，走下面的
+                // 控制面失败退避——既不计身份失败次数，也不清本地身份。
                 if matches!(err, remote::Error::Unauthorized { .. }) {
                     self.control.failures = self.control.failures.saturating_add(1);
                     if self.handle_auth_rejected(&err) {
@@ -619,18 +622,23 @@ impl Engine {
         self.offer_update(heartbeat.app_update.as_ref());
         // 启动器单独一路：控制面每次都带，客户端自己比摘要；下载放后台跑。
         self.apply_launcher(&api, heartbeat.launcher.as_ref());
-        if !heartbeat.config_hash.is_empty() && heartbeat.config_hash != self.hash() {
-            self.logf(
-                "app",
-                mesh_text::get(mesh_text::id::ENGINE_LOG_CONFIG_CHANGED_SYNC),
-            );
+        // 配置只有一个入口条件：响应确实带正文。204、只带发布信息或只带凭据的响应
+        // 没有配置可应用——那三者都是正常心跳，不是「配置变化却没带正文」。
+        if !heartbeat.config_b64.is_empty() {
+            if heartbeat.config_hash != self.hash() {
+                self.logf(
+                    "app",
+                    mesh_text::get(mesh_text::id::ENGINE_LOG_CONFIG_CHANGED_SYNC),
+                );
+            }
+            self.apply_remote(&heartbeat);
         }
-        self.apply_remote(&heartbeat);
         // 自启状态只在启动、用户改动和这里刷新：快照两秒一次，不可能每次都去起进程。
         self.refresh_autostart();
         // 心跳是节拍：自动安装、被推迟的提交与失败的下载都在这里推进。
         self.advance_update();
-        // 心跳通了、core 却没在跑：按当前规格补启动（缺凭据也要等下一轮心跳）。
+        // 规格比较与状态汇合只留这一个最终入口：上面每一步只写事实，换不换 core
+        // 由这里按「期望规格 == 运行实例规格」定（缺凭据也要等下一轮心跳）。
         self.ensure_core_or_report();
     }
 
@@ -740,8 +748,8 @@ impl Engine {
         self.revive_attempt
     }
 
-    /// 启动失败（core 根本没起来）也要放大档位：Go 的 `reviveCore` 每失败一次就
-    /// `attempt++`，否则“每次都在 1 秒重试”会变成每秒拉起一个进程。
+    /// 一次收敛失败（起不来，或旧实例停不掉）同样放大档位：Go 的 `reviveCore` 每失败
+    /// 一次就 `attempt++`，否则“每次都在 1 秒重试”会变成每秒拉起一个进程。
     pub(crate) fn on_start_failed_attempt(&mut self) -> u32 {
         self.revive_attempt = self.revive_attempt.saturating_add(1).max(1);
         self.revive_attempt
@@ -786,8 +794,11 @@ impl Engine {
     }
 
     /// 没有身份可用：控制面不再有期限，等设置页或下一次注册。
+    ///
+    /// 认证失败计数属于刚被丢掉的那一代身份，跟着一起清：下一份身份从零开始记。
     pub(crate) fn unbind(&mut self) {
         self.client = None;
+        self.reset_auth_fails();
         self.fault.clear();
         self.control.gen = self.control.gen.wrapping_add(1);
         self.control.failures = 0;
@@ -1032,23 +1043,44 @@ impl Engine {
     /// 让运行实例与期望规格一致：相同不重复拉起，不同就换进程。
     ///
     /// 这是“要不要换 core”的唯一判据；配置同步、改名、凭据轮换与重新绑定都汇到这里。
+    /// 规则是完整的：**没有期望规格**（删了配置、清了身份、换绑之后还没拿到新配置）
+    /// 同样要求没有运行实例。删文件只决定下一次读哪份配置，不决定那个已经连着旧网络
+    /// 的进程会退——旧数据面与当前身份的关系不能只由磁盘清理保证。
     pub(crate) fn ensure_core(&mut self) -> Result<(), String> {
-        let Some(spec) = self.desired_spec()? else {
+        let spec = self.desired_spec().map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&err])
+        })?;
+        let Some(spec) = spec else {
+            if let Err(err) = self.stop_core() {
+                // 停不掉：失败要可见（stop_core 已记一行），并按重拉档位再试——
+                // 控制面不可达时没有心跳可等，重试只能靠这条期限。
+                let attempt = self.on_start_failed_attempt();
+                self.schedule_revive(attempt);
+                return Err(mesh_text::format(
+                    mesh_text::id::ENGINE_LOG_STOP_CORE_FAILED,
+                    &[&err],
+                ));
+            }
             return Ok(());
         };
         if self.core.as_ref().map(|core| &core.spec) == Some(&spec) {
             return Ok(());
         }
-        self.stop_core()?;
+        self.stop_core().map_err(|err| {
+            mesh_text::format(mesh_text::id::ENGINE_LOG_STOP_CORE_FAILED, &[&err])
+        })?;
         self.start_core(spec)
+            .map_err(|err| mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&err]))
     }
 
-    /// 启动失败只记成一次确定失败，不向上抛：core 是数据面，控制面不可达不该让它跟着停。
+    /// 收敛失败只记成一次确定失败，不向上抛：core 是数据面，控制面不可达不该让它跟着停。
+    ///
+    /// 失败原因由 `ensure_core` 自己写成完整的一句（启动失败与停止失败各有各的
+    /// 说法），这里只负责让它可见。
     pub(crate) fn ensure_core_or_report(&mut self) {
         if let Err(err) = self.ensure_core() {
-            let msg = mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&err]);
-            self.fault = msg.clone();
-            self.logf("app", &msg);
+            self.fault = err.clone();
+            self.logf("app", &err);
         }
     }
 

@@ -88,16 +88,20 @@ impl Engine {
 
     /// 把身份写盘并交给事件循环。
     ///
-    /// 换代次（控制面地址或设备 id 变了）时先让旧一代的 `config.toml` 与
-    /// `credential.json` 从可读位置消失，再原子写入新 `client.json`：任何中断点之后，
-    /// 本地只可能读到旧一代、空、或新一代，不会出现「新身份配旧配置」。删除失败就是
-    /// 这次保存失败——宁可让用户重试，也不留一代混合数据。
+    /// 换代次（控制面地址或设备 id 变了）时先确认旧数据面停下，再让旧一代的
+    /// `config.toml` 与 `credential.json` 从可读位置消失，最后原子写入新
+    /// `client.json`：任何中断点之后，本地只可能读到旧一代、空、或新一代，不会出现
+    /// 「新身份配旧配置」。删除或停止失败就是这次保存失败——宁可让用户重试，也不留
+    /// 一代混合数据，更不留一个还在旧网络上跑着的进程。
     fn bind(
         &mut self,
         config: ClientConfig,
         previous: Option<&ClientConfig>,
     ) -> Result<(), String> {
         if generation_changed(previous, &config) {
+            // 停旧数据面是换绑的第一步：下面删的是「下一次启动读哪份配置」，
+            // 不是「已经连着旧网络的那个进程」。停不掉就整个换绑失败，旧一代原样留着。
+            self.stop_core()?;
             self.store.remove_config().map_err(|err| {
                 mesh_text::format(mesh_text::id::ENGINE_TEXT_DELETE_CONFIG_FAILED, &[&err])
             })?;
@@ -109,6 +113,9 @@ impl Engine {
             })?;
             // 旧一代的发布授权随旧一代一起作废；删除失败时它还在，下一轮心跳照常。
             self.clear_stale_update();
+            // 认证失败计数记的是「这一代身份被拒绝了几次」：换一代就从零开始，
+            // 否则上一代控制面的 401 会记到新身份头上，凑满 3 次就清掉刚换好的身份。
+            self.reset_auth_fails();
         }
         self.store.save_client(&config).map_err(|err| {
             mesh_text::format(mesh_text::id::ENGINE_TEXT_SAVE_SETTINGS_FAILED, &[&err])
