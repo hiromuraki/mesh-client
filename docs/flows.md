@@ -1,6 +1,6 @@
 # 客户端流程图
 
-依据 `client/`（Rust）的当前实现绘制：启动器在 `crates/launcher`，客户端在 `crates/client`。图中常量均取自代码：心跳 30s、请求超时 20s、core 就绪 25s、停止 core 5s、core 重拉退避 1s→30s、连接退避 10s→60s、面板端口 11020（最多顺延 20 个）、更新包下载 20 分钟、更新包上限 200MB、启动确认 60s、启动器等旧进程退出 60s。
+依据 `client/`（Rust）的当前实现绘制：启动器在 `crates/launcher`，客户端在 `crates/client`。图中常量均取自代码：心跳 30s、请求超时 20s、core 就绪 25s、停止 core 5s、core 重拉固定 10s 间隔（8 次一轮，之后挂起 10 分钟）、连接退避 10s→60s、面板端口 11020（最多顺延 20 个）、更新包下载 20 分钟、更新包上限 200MB、启动确认 60s、启动器等旧进程退出 60s。
 
 安装目录布局、槽位与提交规则见 [contract/updates.md](../../docs/contract/updates.md)。
 

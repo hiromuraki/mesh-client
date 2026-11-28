@@ -13,7 +13,6 @@ import {
   nextSort,
   pathText,
   releaseVersion,
-  routeText,
   sortNodes,
   statusText,
   TOPOLOGY_UNKNOWN_HINT,
@@ -376,12 +375,7 @@ async function runApplyUpdate(): Promise<void> {
                     {{ copied === (localRow?.ip || snapshot?.localIp || "") ? "已复制" : localRow?.ip || snapshot?.localIp || "—" }}
                   </button>
                 </td>
-                <td class="col-route">
-                  <span class="route">
-                    <span class="tag me">本机</span>
-                    <span class="route-text">不参与延迟统计</span>
-                  </span>
-                </td>
+                <td class="col-route"><span class="tag me">本机</span></td>
                 <td class="col-proto">{{ joinOrDash(localRow?.tunnels) }}</td>
                 <td class="col-nat" :title="'本机 STUN 判定（UDP）'">{{ localRow?.natType || snapshot?.natTypeUdp || "—" }}</td>
                 <td class="col-ver">{{ localRow ? releaseVersion(localRow.version) : snapshot?.coreVersion || "—" }}</td>
@@ -400,13 +394,7 @@ async function runApplyUpdate(): Promise<void> {
                     {{ copied === node.ip ? "已复制" : node.ip }}
                   </button>
                 </td>
-                <td class="col-route">
-                  <span class="route">
-                    <span class="tag" :class="node.pathKind">{{ pathText(node.pathKind) }}</span>
-                    <span class="route-text" :title="routeText(node)">{{ routeText(node) }}</span>
-                    <span v-if="node.hops > 1" class="hops">{{ node.hops }} 跳</span>
-                  </span>
-                </td>
+                <td class="col-route"><span class="tag" :class="node.pathKind">{{ pathText(node.pathKind) }}</span></td>
                 <td class="col-proto">{{ joinOrDash(node.tunnels) }}</td>
                 <td class="col-nat">{{ node.natType || "—" }}</td>
                 <td class="col-ver" :title="node.version">{{ releaseVersion(node.version) }}</td>
@@ -506,8 +494,10 @@ h1.online{color:var(--green)}
 h1.degraded{color:var(--orange)}
 h1.error{color:var(--red)}
 .chip{padding:1px 8px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:11px}
-.addr{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.addr i{width:2px;height:2px;border-radius:50%;background:var(--faint);flex:0 0 auto}
+/* 状态行里的「地址 · 主机名」。选择器限定在 .status 内：表格的地址列也用 .addr，
+   若在这里写光秃秃的 .addr，列会被改成 flex、列宽多出的一段就成了死空隙。 */
+.status .addr{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status .addr i{width:2px;height:2px;border-radius:50%;background:var(--faint);flex:0 0 auto}
 .actions{display:flex;gap:8px;flex:0 0 auto}
 
 /* 指标行：四格由竖线分隔，没有卡片也没有底色。 */
@@ -570,9 +560,6 @@ tbody tr.self:hover{background:transparent}
 .ip:hover{background:var(--line-soft);color:var(--ink)}
 .ip.copied{color:var(--green)}
 
-.route{display:flex;align-items:center;gap:7px;max-width:420px;min-width:0}
-.route-text{font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.hops{flex:0 0 auto;font-size:10.5px;color:var(--faint)}
 .col-proto,.col-nat,.col-ver{font-size:11.5px;color:var(--muted);white-space:nowrap}
 .col-ver{width:96px}
 

@@ -36,11 +36,18 @@ const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// 一分钟而不是几秒：崩溃循环里的 core 往往能就绪、再在半分钟到一分钟内倒掉
 /// （网卡创建失败约 15 秒）。判据太短等于每次崩溃都算成功，退避永远回到第一档。
 pub(crate) const CORE_HEALTHY_LIFETIME: Duration = Duration::from_secs(60);
-/// 重拉 core 的退避上限（1s 起步翻倍，最多 30s）。
-const REVIVE_BACKOFF_MAX: Duration = Duration::from_secs(30);
-/// 自动重拉的次数上限。8 次配 1/2/4/8/16/30/30/30 的退避约两分钟：够等过一次
-/// 瞬时的设备/服务抖动，又不至于让无提示的循环一直转下去。
+/// 两次重拉之间固定的间隔。
+///
+/// 不做指数退避：这类故障（网卡建不出来、旧实例停不掉）能不能好取决于下一次尝试，
+/// 退避只把两次尝试越拉越开，反而错过自愈的那一次。
+pub(crate) const REVIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// 一轮自动重拉的次数上限。8 次配 10 秒间隔、每次 core 大约跑 15 秒，一轮约三分钟。
 pub(crate) const MAX_REVIVE_ATTEMPTS: u32 = 8;
+/// 一轮用完挂起多久再开始下一轮。
+///
+/// 实测 Windows 的 wintun 设备从 PnP 的 Error 态恢复要七分钟以上，比一轮长得多；
+/// 挂起期间不刷日志，到点自动再来一轮，不需要人守着。
+pub(crate) const REVIVE_COOLDOWN: Duration = Duration::from_secs(10 * 60);
 /// 等 core 停止回复的上限。core 内部另有 5s 软停 + 3s 强杀的预算。
 const STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 /// STUN 结果的刷新间隔。
@@ -218,11 +225,14 @@ pub(crate) struct Engine {
     pub(crate) revive_attempt: u32,
     pub(crate) next_gen: u64,
     pub(crate) revive: Option<Revive>,
-    /// 重拉次数用完之后的停手标记。
+    /// 一轮重拉用完之后的挂起标记。
     ///
-    /// 与 `revive == None` 不是一回事：没有期限也可能只是还没排。停手之后心跳、
-    /// 启动与重拉都不能再把 core 拉起来，唯一出口是 `Cmd::Reconnect`。
+    /// 与 `revive == None` 不是一回事：没有期限也可能只是还没排。挂起期间心跳、
+    /// 启动与重拉都不能把 core 拉起来；到 `halted_until` 自动再来一轮，`Cmd::Reconnect`
+    /// 则立刻重来。
     pub(crate) core_halted: bool,
+    /// 挂起的结束时刻，只在 `core_halted` 为真时有意义。
+    pub(crate) halted_until: Option<Instant>,
     /// core 输出的最后一行（错误行优先），停手时的 fault 文案用它说清真正的原因。
     pub(crate) core_tail: Arc<coreline::CoreTail>,
 
@@ -349,6 +359,7 @@ pub fn spawn(
         next_gen: 0,
         revive: None,
         core_halted: false,
+        halted_until: None,
         core_tail,
         auth_fails: 0,
         update: update::UpdateState::default(),
@@ -450,9 +461,16 @@ impl Engine {
     pub(crate) fn next_deadline(&self) -> Option<Duration> {
         let control = self.control.due;
         let revive = self.revive.as_ref().map(|revive| revive.due);
+        // 挂起也是一种期限：到点要有人把这一轮重新排上。
+        let cooldown = if self.core_halted {
+            self.halted_until
+        } else {
+            None
+        };
         control
             .into_iter()
             .chain(revive)
+            .chain(cooldown)
             .min()
             .map(|due| due.saturating_duration_since(Instant::now()))
     }
@@ -460,6 +478,9 @@ impl Engine {
     /// 到点了：两边各自看自己的期限，互不影响。
     pub(crate) fn on_deadline(&mut self) {
         let now = Instant::now();
+        if self.core_halted && self.halted_until.is_some_and(|at| at <= now) {
+            self.resume_after_cooldown();
+        }
         if self.revive.as_ref().is_some_and(|revive| revive.due <= now) {
             self.revive_core();
         }
@@ -740,16 +761,18 @@ impl Engine {
         }
     }
 
-    /// 排一次重拉；次数用完就停手，把原因写进 fault 并记一行日志。
+    /// 排一次重拉；一轮次数用完就挂起，到点自己再来一轮。
     ///
-    /// 停手不是“恢复了”：core 没在跑，故障也还在。继续按 30s 重拉只是把同一段失败
-    /// 一遍遍刷进日志，而界面永远停在“正在重启”。到这里就结束自动重试，等人来。
+    /// 挂起不是“恢复了”：core 没在跑，故障也还在。变的只是节奏——从 10 秒一次改成
+    /// 10 分钟一轮，日志不再刷，人也不必守着。Windows 上这种 PnP 半残的网卡要七分钟
+    /// 到几十分钟才自己好，一轮的时间窗本来就不该指望覆盖它。
     pub(crate) fn schedule_revive(&mut self, attempt: u32) {
         let attempt = attempt.max(1);
         if attempt > MAX_REVIVE_ATTEMPTS {
             self.revive = None;
             self.revive_attempt = MAX_REVIVE_ATTEMPTS;
             self.core_halted = true;
+            self.halted_until = Some(Instant::now() + REVIVE_COOLDOWN);
             let msg = self.crash_loop_message();
             self.fault = msg.clone();
             self.logf("app", &msg);
@@ -757,7 +780,29 @@ impl Engine {
         }
         self.revive = Some(Revive {
             attempt,
-            due: Instant::now() + revive_backoff(attempt),
+            due: Instant::now() + REVIVE_INTERVAL,
+        });
+    }
+
+    /// 挂起到点：清掉挂起标记，立刻开始下一轮。
+    ///
+    /// 故障文案也一起清掉——那句话说的是“已停止自动重拉”，而新一轮正在跑，留着它
+    /// 界面会永远停在失败上。真正的原因仍由 core 自己的输出回答。
+    fn resume_after_cooldown(&mut self) {
+        self.core_halted = false;
+        self.halted_until = None;
+        self.revive_attempt = 0;
+        self.fault.clear();
+        self.logf(
+            "app",
+            &mesh_text::format(
+                mesh_text::id::ENGINE_LOG_CORE_RETRY_ROUND,
+                &[&(REVIVE_COOLDOWN.as_secs() / 60)],
+            ),
+        );
+        self.revive = Some(Revive {
+            attempt: 1,
+            due: Instant::now(),
         });
     }
 
@@ -771,7 +816,11 @@ impl Engine {
         });
         mesh_text::format(
             mesh_text::id::ENGINE_TEXT_CORE_CRASH_LOOP,
-            &[&MAX_REVIVE_ATTEMPTS, &detail],
+            &[
+                &MAX_REVIVE_ATTEMPTS,
+                &detail,
+                &(REVIVE_COOLDOWN.as_secs() / 60),
+            ],
         )
     }
 
@@ -837,7 +886,7 @@ impl Engine {
     /// 开始新的一轮控制面同步：在途结果作废，下一次心跳立刻发生。
     ///
     /// core 的重拉档位也跟着归零：换绑与“重新连接”都是用户在做一次新的开始，
-    /// 上一代身份留下的停手标记不该延续到新的一轮上，否则引擎会一直拒绝启动 core。
+    /// 上一代身份留下的挂起标记不该延续到新的一轮上，否则引擎会一直拒绝启动 core。
     pub(crate) fn rebind(&mut self) {
         self.control.gen = self.control.gen.wrapping_add(1);
         self.control.failures = 0;
@@ -845,14 +894,18 @@ impl Engine {
         self.last_hb = 0;
         self.revive_attempt = 0;
         self.core_halted = false;
+        self.halted_until = None;
     }
 
-    /// 手动重连：清掉停手时写下的失败，立刻再排一次重拉。
+    /// 手动重连：清掉挂起时写下的失败，立刻再排一次重拉。
     ///
-    /// “重新连接”是崩溃循环之后唯一的恢复入口：用户按下它时网卡与权限通常已经修好，
-    /// 没有理由再等一个心跳周期或一段退避。
+    /// 用户按下它时网卡与权限通常已经修好，没有理由再等一轮间隔，更没有理由等挂起
+    /// 到点：这里连次数也一起归零，新一轮从头算。
     pub(crate) fn revive_now(&mut self) {
         self.fault.clear();
+        self.core_halted = false;
+        self.halted_until = None;
+        self.revive_attempt = 0;
         self.revive = Some(Revive {
             attempt: 1,
             due: Instant::now(),
@@ -1304,17 +1357,6 @@ pub(crate) fn connect_backoff(failures: u32) -> Duration {
     wait.min(CONNECT_BACKOFF_MAX)
 }
 
-/// 重拉 core 的退避：1s 起步翻倍，最多 30s。
-pub(crate) fn revive_backoff(attempt: u32) -> Duration {
-    let mut wait = Duration::from_secs(1);
-    let mut step = 1;
-    while step < attempt && wait < REVIVE_BACKOFF_MAX {
-        wait *= 2;
-        step += 1;
-    }
-    wait.min(REVIVE_BACKOFF_MAX)
-}
-
 /// `config_hash`：`sha256(toml)` 的前 16 位十六进制。
 pub(crate) fn config_digest(toml: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -1348,18 +1390,12 @@ mod backoff_tests {
     }
 
     #[test]
-    fn revive_backoff_doubles_and_caps() {
-        assert_eq!(revive_backoff(1), Duration::from_secs(1));
-        assert_eq!(revive_backoff(2), Duration::from_secs(2));
-        assert_eq!(revive_backoff(3), Duration::from_secs(4));
-        let mut previous = Duration::ZERO;
-        for attempt in 1..=10 {
-            let wait = revive_backoff(attempt);
-            assert!(wait >= previous);
-            assert!(wait <= REVIVE_BACKOFF_MAX);
-            previous = wait;
-        }
-        assert_eq!(previous, REVIVE_BACKOFF_MAX);
+    fn a_revive_round_stays_shorter_than_the_cooldown() {
+        // 一轮要短到不拖住用户改完配置之后的等待；挂起要长到能盖住一次 PnP 自愈
+        // （实测七分钟以上）。两者反过来就没有意义了。
+        let round = REVIVE_INTERVAL * MAX_REVIVE_ATTEMPTS;
+        assert!(round < REVIVE_COOLDOWN);
+        assert!(REVIVE_COOLDOWN <= Duration::from_secs(30 * 60));
     }
 
     #[test]

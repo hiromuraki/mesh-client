@@ -116,6 +116,7 @@ fn harness(tag: &str) -> Harness {
         next_gen: 0,
         revive: None,
         core_halted: false,
+        halted_until: None,
         core_tail: Arc::new(CoreTail::default()),
         auth_fails: 0,
         update: Default::default(),
@@ -806,13 +807,12 @@ fn a_short_lived_core_grows_the_revive_backoff() {
     assert_eq!(harness.engine.on_start_failed_attempt(), 2);
 }
 
-/// 连续短命 core：档位单调上升，退避逐档放大。这是「15 秒崩一次、1 秒后重拉」
-/// 那个现场的直接判据——崩溃之前的 core 活不过一分钟，就不能算这次重启成功。
+/// 连续短命 core：档位单调上升，间隔始终固定。这是「15 秒崩一次」那个现场的直接
+/// 判据——崩溃之前的 core 活不过一分钟，就不能算这次重启成功。
 #[test]
-fn consecutive_short_lived_cores_grow_the_backoff_to_the_cap() {
+fn consecutive_short_lived_cores_keep_a_fixed_interval() {
     let mut harness = harness("revive-growth");
     harness.engine.last_core_started_at = Some(Instant::now());
-    let mut previous = Duration::ZERO;
     for attempt in 1..=MAX_REVIVE_ATTEMPTS {
         harness.engine.core = Some(running_core());
         let scheduled_at = Instant::now();
@@ -830,26 +830,16 @@ fn consecutive_short_lived_cores_grow_the_backoff_to_the_cap() {
             .as_ref()
             .expect("到上限之前每次崩溃都要排重拉");
         assert_eq!(revive.attempt, attempt);
-        let expected = crate::run::revive_backoff(attempt);
         let wait = revive.due.saturating_duration_since(scheduled_at);
+        let interval = crate::run::REVIVE_INTERVAL;
         assert!(
-            wait >= expected && wait < expected + Duration::from_secs(1),
-            "第 {attempt} 次应退避 {expected:?}，实际 {wait:?}"
+            wait >= interval && wait < interval + Duration::from_secs(1),
+            "第 {attempt} 次应等固定间隔 {interval:?}，实际 {wait:?}"
         );
-        assert!(
-            expected >= previous,
-            "退避不应变小：{expected:?} < {previous:?}"
-        );
-        previous = expected;
     }
-    assert_eq!(
-        crate::run::revive_backoff(MAX_REVIVE_ATTEMPTS),
-        Duration::from_secs(30),
-        "最后一档应封顶在 30 秒"
-    );
 }
 
-/// 到上限就停手：不再排重拉，fault 说清次数与 core 自己留下的错误，界面进 error。
+/// 到上限就挂起：不再排重拉，fault 说清次数与 core 自己留下的错误，界面进 error。
 #[test]
 fn a_crash_loop_stops_at_the_limit_and_reports_the_last_core_line() {
     let mut harness = harness("crash-loop");
@@ -877,7 +867,11 @@ fn a_crash_loop_stops_at_the_limit_and_reports_the_last_core_line() {
         err: Some("退出码 1".to_string()),
     });
     assert!(harness.engine.revive.is_none(), "到上限后不能再排重拉");
-    assert!(harness.engine.core_halted, "停手标记必须立起来");
+    assert!(harness.engine.core_halted, "挂起标记必须立起来");
+    assert!(
+        harness.engine.halted_until.is_some(),
+        "挂起必须有结束时刻，否则没人会来叫醒它"
+    );
     let fault = harness.engine.fault.clone();
     assert!(
         fault.contains(&MAX_REVIVE_ATTEMPTS.to_string()),
@@ -899,7 +893,40 @@ fn a_crash_loop_stops_at_the_limit_and_reports_the_last_core_line() {
     harness.expect_no_core();
 }
 
-/// core 一行输出都没有时文案也要成句：不能留下一个空的“已停止自动重拉：”槽。
+/// 挂起到点自己再来一轮：不清标记会永远停在那里，清得太早又会回到崩溃循环。
+#[test]
+fn the_cooldown_ends_with_a_fresh_round() {
+    let mut harness = harness("cooldown");
+    harness.engine.last_core_started_at = Some(Instant::now());
+    for _ in 0..=MAX_REVIVE_ATTEMPTS {
+        harness.engine.core = Some(running_core());
+        harness.engine.on_core_event(mesh_core::Event::Exited {
+            gen: 1,
+            err: Some("退出码 1".to_string()),
+        });
+    }
+    assert!(harness.engine.core_halted);
+    harness.engine.control.due = None;
+
+    // 没到点：不许自己恢复。
+    harness.engine.on_deadline();
+    assert!(harness.engine.core_halted, "没到点不该自己恢复");
+    assert!(harness.engine.revive.is_none());
+
+    // 到点了：清标记、清故障、从第一档重来。
+    harness.engine.halted_until = Some(Instant::now());
+    harness.engine.on_deadline();
+    assert!(!harness.engine.core_halted);
+    assert!(
+        harness.engine.fault.is_empty(),
+        "新一轮在跑，界面不该停在“已停止自动重拉”"
+    );
+    assert_eq!(harness.engine.revive_attempt, 0);
+    let revive = harness.engine.revive.as_ref().expect("到点要立刻排一次");
+    assert_eq!(revive.attempt, 1);
+}
+
+/// core 一行输出都没有时文案也要成句：不能留下一个空的“暂停自动重拉：”槽。
 #[test]
 fn a_crash_loop_without_core_output_still_reads_as_one_sentence() {
     let mut harness = harness("crash-loop-silent");

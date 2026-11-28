@@ -237,7 +237,7 @@ engine.text.clear_device_failed = 清空设备身份失败：{0}
 engine.text.clock_skew = 本机时间与服务端相差 {0} 秒，签名请求被拒（401）；请校准本机时间后重试
 engine.text.config_decode_failed = 配置解码失败：{0}
 engine.text.connect_server_failed = 连接服务端失败：{0}
-engine.text.core_crash_loop = core 连续启动失败（{0} 次），已停止自动重拉：{1}；请检查网卡与权限后点「重新连接」
+engine.text.core_crash_loop = core 连续启动失败（{0} 次），暂停自动重拉：{1}；{2} 分钟后自动再试一轮，也可以现在点「重新连接」
 engine.text.core_no_output = core 没有留下输出
 engine.text.core_not_running = core 未运行
 engine.text.core_not_running_restarting = core 未运行，正在重新启动
@@ -301,6 +301,7 @@ engine.log.connect_failed = 连接失败：{0}
 engine.log.connected_server = 已连接服务端 {0}
 engine.log.core_exited = core 已退出{0}，准备重新拉起
 engine.log.core_ready = core 已就绪 pid={0} ip={1}
+engine.log.core_retry_round = 挂起 {0} 分钟结束，重新开始拉起 core
 engine.log.core_revived = core 已重新拉起
 engine.log.core_start_failed = 启动 core 失败：{0}
 engine.log.core_start_failed_attempt = core 启动失败（第 {0} 次）：{1}

@@ -239,7 +239,7 @@ engine.text.clear_device_failed = Failed to clear the device identity: {0}
 engine.text.clock_skew = The local clock differs from the server by {0} seconds and the signed request was rejected (401); calibrate the local time and retry
 engine.text.config_decode_failed = Failed to decode the configuration: {0}
 engine.text.connect_server_failed = Failed to connect to the server: {0}
-engine.text.core_crash_loop = core failed to start {0} times in a row; automatic restarts stopped: {1}. Check the network adapter and permissions, then click "Reconnect"
+engine.text.core_crash_loop = core failed to start {0} times in a row; automatic restarts paused: {1}. Another round starts in {2} minutes, or click "Reconnect" now
 engine.text.core_no_output = core left no output
 engine.text.core_not_running = core is not running
 engine.text.core_not_running_restarting = core is not running; restarting it
@@ -303,6 +303,7 @@ engine.log.connect_failed = Connection failed: {0}
 engine.log.connected_server = Connected to the server {0}
 engine.log.core_exited = core has exited{0}; restarting it
 engine.log.core_ready = core is ready pid={0} ip={1}
+engine.log.core_retry_round = Cooldown of {0} minutes is over; starting another round of core restarts
 engine.log.core_revived = core has been restarted
 engine.log.core_start_failed = Failed to start core: {0}
 engine.log.core_start_failed_attempt = Failed to start core (attempt {0}): {1}
