@@ -184,18 +184,22 @@ impl Client {
         -> Result<Option<Heartbeat>, Error>;  // None == 204
     pub fn download(&self, url: &str, dst: &Path, limit: u64, timeout: Duration)
         -> Result<u64, Error>;
+    pub fn credential_secret(&self, heartbeat: &Heartbeat) -> Result<String, Error>;
+        // 优先解 credential_sealed；解不开即报错，不回落明文
 }
 pub enum Error {
     Unauthorized { code: String, server_time: Option<SystemTime> },  // 引擎按 code/偏差分支
     Api { status: u16, code: String, message: String },
-    Transport(...), Decode(...),
+    Transport(...), Decode(...), Sealed(...),
 }
-pub struct Heartbeat { config_hash, config_b64, app_update, launcher, credential, credential_id, credential_expiry }
+pub struct Heartbeat { config_hash, config_b64, app_update, launcher, credential, credential_sealed, credential_id, credential_expiry }
 ```
 
 **拥有的状态**：无。签名原文（`MESH2\n<method>\n<path>\n...`）在 `signing_string` 里现拼，字段顺序写死并有单测。
 
 **发布签名**：`signing` 子模块只是 `pub use mesh_install::signing::*` 的转出口，实现在 `mesh-install`（启动器也要验）。引擎经 `remote::signing::*` 调，与搬家前同名。
+
+**凭据封装**：`sealed` 子模块解心跳下发的 `credentialSealed`——X25519 临时密钥 + BLAKE2b 派生 + XChaCha20-Poly1305，收件人用设备自己的 Ed25519 身份私钥换算。格式与 Go 侧 `app/seal.go` 逐字节相同，有一对固定向量钉住两端（Go 封、Rust 解）。放在这里而不是 `mesh-state`：它是线上格式，`state` 只管磁盘。
 
 **依赖**：`mesh-install`（`platform::id()`）。
 
@@ -505,7 +509,7 @@ Go 里 `quit`（停资源 + 通知主循环）与 `stop`（只停资源）是两
 |---|---|---|
 | `mesh-install` | `Error { ManifestRead, Io, AlreadyRunning }` | 清单读不出来（版本号非法也归在这里）、普通 IO、锁被占。`AlreadyRunning` 必须独立成变体：上层要据此走「唤起已有实例」或「下一轮再提交」而不是报错 |
 | `mesh-state` | `Error { Io, Parse, KeyLength }` | 文件读写与格式；`client.key` 长度异常直接失败，不重建 |
-| `mesh-remote` | `Error { Unauthorized{code,server_time}, Api{status,code,message}, Transport, Decode }` | `Unauthorized` 带 `code` 与 `Date` 偏差，因为引擎要分三支：`revoked` / 时钟偏差 / 其它 |
+| `mesh-remote` | `Error { Unauthorized{code,server_time}, Api{status,code,message}, Transport, Decode, Sealed }` | `Unauthorized` 带 `code` 与 `Date` 偏差，因为引擎要分三支：`revoked` / 时钟偏差 / 其它；`Sealed` 是凭据解封失败，引擎据此既不写盘也不回落明文 |
 | `mesh-etrpc` | `Error { Connect, Frame, Protocol{field}, Rpc(String), Timeout }` | `Rpc(String)` 已在 crate 内把 `error.Error` 的 oneof 翻成一句话 |
 | `mesh-core` | 不出现在 API 上 | 失败一律折成 `Event::StartFailed{reason}` / `Exited{err}`：「core 起不来」对引擎是一个状态，不是一个要向上传播的错误 |
 | `mesh-engine` | 后台路径不返回 `Result` | 失败写进 `status`/`last_error`（与 Go 的 `setStatus`/`degrade` 一致）；只有「用户动作」返回 `Result<Snapshot, String>` |
@@ -592,7 +596,7 @@ strip = true
 | `text` | 无（零依赖地板） |
 | `install` | `mesh-text`、`fs4`（跨平台 `LockFileEx`/`flock`）、`serde`、`serde_json`、`thiserror`、`ed25519-dalek`、`hex`、`sha2`（后三只给 `signing`） |
 | `state` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`toml`、`ed25519-dalek`、`rand`、`base64` |
-| `remote` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`sha2`、`hex`、`base64`、`ed25519-dalek`、`rand`、`ureq`（windows 加 `native-tls`，unix 加 `tls`） |
+| `remote` | `mesh-install`、`mesh-text`、`serde`、`serde_json`、`sha2`、`hex`、`base64`、`ed25519-dalek`、`x25519-dalek`、`blake2`、`chacha20poly1305`、`rand`、`ureq`（windows 加 `native-tls`，unix 加 `tls`） |
 | `etrpc` | `mesh-text`、`thiserror`（其余是 `std::net` + `std::io`） |
 | `core` | `mesh-etrpc`、`mesh-text`、`thiserror`；windows: `windows-sys`（`Win32_Foundation`、`Win32_System_JobObjects`、`Win32_System_Threading`）；unix: `libc` |
 | `engine` | `mesh-install`、`mesh-state`、`mesh-remote`、`mesh-core`、`mesh-etrpc`、`serde`、`serde_json`、`sha2`、`hex`、`thiserror`、`rand`；不需要 windows-sys（自启只写 UTF-16 文件 + 起 `schtasks.exe`，隐藏窗口用 `CommandExt::creation_flags`）；dev: `ed25519-dalek`（给测试 offer 签名） |

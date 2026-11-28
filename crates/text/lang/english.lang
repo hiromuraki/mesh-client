@@ -66,6 +66,7 @@ remote.error.config_not_utf8 = Configuration is not UTF-8: {0}
 remote.error.create_file = Failed to create {0}: {1}
 remote.error.decode = Failed to parse the response: {0}
 remote.error.read_response = Failed to read the response: {0}
+remote.error.sealed = Failed to open the sealed credential: {0}
 remote.error.transport = Transport failed: {0}
 remote.error.write_file = Failed to write {0}: {1}
 state.error.credential_cipher_not_base64 = Credential ciphertext is not base64: {0}

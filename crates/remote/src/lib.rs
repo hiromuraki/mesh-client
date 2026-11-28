@@ -7,6 +7,7 @@
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
 
+mod sealed;
 pub mod signing;
 use mesh_install::platform;
 use serde::de::DeserializeOwned;
@@ -25,6 +26,9 @@ const MAX_ERROR_BODY: u64 = 4096;
 
 const BASE64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
+
+/// 凭据私钥的长度：base64 之前的 32 字节 X25519 私钥。
+const CREDENTIAL_SECRET_LEN: usize = 32;
 
 /// 设备面 HTTP 的错误。
 ///
@@ -54,6 +58,9 @@ pub enum Error {
     Transport(String),
     #[error("{}", mesh_text::format(mesh_text::id::REMOTE_ERROR_DECODE, &[.0]))]
     Decode(String),
+    /// 凭据封装解不开。里面是技术原因，只进日志。
+    #[error("{}", mesh_text::format(mesh_text::id::REMOTE_ERROR_SEALED, &[.0]))]
+    Sealed(String),
 }
 
 impl Error {
@@ -194,6 +201,24 @@ impl Client {
         Ok(written)
     }
 
+    /// 心跳带的凭据私钥（base64）。带了封装的就必须用封装的那一份。
+    ///
+    /// 解不开就是这一次下发作废，不回落到明文字段：能改响应字节的一方正是这条
+    /// 封装要防的人，回落等于把封装变成可选的装饰。
+    pub fn credential_secret(&self, heartbeat: &Heartbeat) -> Result<String, Error> {
+        if heartbeat.credential_sealed.is_empty() {
+            return Ok(heartbeat.credential.clone());
+        }
+        let secret = sealed::open(&self.key, &heartbeat.credential_sealed)?;
+        if secret.len() != CREDENTIAL_SECRET_LEN {
+            return Err(Error::Sealed(format!(
+                "credential is {} bytes, want {CREDENTIAL_SECRET_LEN}",
+                secret.len()
+            )));
+        }
+        Ok(BASE64.encode(secret))
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
@@ -253,7 +278,11 @@ pub struct Heartbeat {
     pub app_update: Option<UpdateInfo>,
     pub launcher: Option<LauncherInfo>,
     /// 凭据私钥只在下发的那一次响应里出现，之后服务端只剩 id。
+    ///
+    /// 它同时以两种形式回来：封给设备公钥的 credential_sealed（新客户端只认
+    /// 这一份），和过渡期的明文 credential（旧客户端只认它）。
     pub credential: String,
+    pub credential_sealed: String,
     pub credential_id: String,
     pub credential_expiry: i64,
 }
@@ -688,5 +717,74 @@ mod tests {
         // 超限必须报错：宁可重下一遍，也不能把半截包当成功。
         assert!(client.download(&url, &dst, 3, timeout()).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 控制面用种子 `00..1f` 封出来的那封信封（`sealed.rs` 的用例里也有它）。
+    const SEALED: &str = "ZDA2HMrT/31vujoZvinzIrjif+cWRPdzTK3sTaRJKiHKeXaBiQwzIQ4jdKtUBpSODCvi6rC3reGWyCeygVPeZ/7X5GzdRqvt6LMwDEQ7jBg=";
+
+    fn seed_client() -> Client {
+        let mut seed = [0u8; 32];
+        for (index, byte) in seed.iter_mut().enumerate() {
+            *byte = index as u8;
+        }
+        Client::new("http://10.0.0.1:8089", "dev", SigningKey::from_bytes(&seed))
+    }
+
+    #[test]
+    fn a_sealed_credential_wins_over_the_plaintext_one() {
+        let heartbeat = Heartbeat {
+            credential: "cGxhaW50ZXh0".to_string(),
+            credential_sealed: SEALED.to_string(),
+            credential_id: "cred-1".to_string(),
+            ..Heartbeat::default()
+        };
+        let secret = seed_client().credential_secret(&heartbeat).unwrap();
+        assert_eq!(
+            BASE64.decode(secret).unwrap(),
+            b"0123456789abcdef0123456789abcdef",
+            "封装的明文就是凭据私钥本身"
+        );
+    }
+
+    #[test]
+    fn a_broken_sealed_credential_never_falls_back_to_the_plaintext() {
+        for broken in ["", "not base64", "AAAA"] {
+            let heartbeat = Heartbeat {
+                credential: "cGxhaW50ZXh0".to_string(),
+                credential_sealed: broken.to_string(),
+                credential_id: "cred-1".to_string(),
+                ..Heartbeat::default()
+            };
+            // 空串是「服务端没封」这一种，按明文处理；其余一律失败。
+            let secret = seed_client().credential_secret(&heartbeat);
+            if broken.is_empty() {
+                assert_eq!(secret.unwrap(), "cGxhaW50ZXh0");
+            } else {
+                assert!(
+                    matches!(secret, Err(Error::Sealed(_))),
+                    "封装的凭据坏了却回落了明文：{secret:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_sealed_credential_of_the_wrong_length_is_refused() {
+        // 另一台设备的密钥解不开这封，所以只能证明长度校验在解封之后也生效：
+        // 这里用另一个种子对同一封信封解封，必须失败而不是给出短明文。
+        let heartbeat = Heartbeat {
+            credential_sealed: SEALED.to_string(),
+            credential_id: "cred-1".to_string(),
+            ..Heartbeat::default()
+        };
+        let other = Client::new(
+            "http://10.0.0.1:8089",
+            "dev",
+            SigningKey::from_bytes(&[3u8; 32]),
+        );
+        assert!(matches!(
+            other.credential_secret(&heartbeat),
+            Err(Error::Sealed(_))
+        ));
     }
 }

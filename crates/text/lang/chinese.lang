@@ -64,6 +64,7 @@ remote.error.config_not_utf8 = 配置不是 UTF-8：{0}
 remote.error.create_file = 创建 {0} 失败：{1}
 remote.error.decode = 响应解析失败：{0}
 remote.error.read_response = 读响应失败：{0}
+remote.error.sealed = 凭据解封失败：{0}
 remote.error.transport = 传输失败：{0}
 remote.error.write_file = 写入 {0} 失败：{1}
 state.error.credential_cipher_not_base64 = 凭据密文不是 base64：{0}

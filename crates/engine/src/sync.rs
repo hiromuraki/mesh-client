@@ -298,8 +298,28 @@ impl Engine {
     ///
     /// 服务端只在签发的那一刻带私钥，其余时候只有 id；同 id 的重复下发直接忽略。
     /// 落盘之后不需要在这里重启 core：`ensure_core` 会看到凭据 id 变了，换进程。
-    pub(crate) fn save_credential(&mut self, heartbeat: &remote::Heartbeat) -> bool {
-        if heartbeat.credential.is_empty() || heartbeat.credential_id.is_empty() {
+    ///
+    /// 私钥优先取封装的那一份（[remote::Client::credential_secret]）：解不开就这一
+    /// 轮作废，不写盘、不回落到明文字段，下一轮心跳会再封一份。
+    pub(crate) fn save_credential(
+        &mut self,
+        api: &remote::Client,
+        heartbeat: &remote::Heartbeat,
+    ) -> bool {
+        if heartbeat.credential_id.is_empty() {
+            return false;
+        }
+        let secret = match api.credential_secret(heartbeat) {
+            Ok(secret) => secret,
+            Err(err) => {
+                let msg =
+                    mesh_text::format(mesh_text::id::ENGINE_LOG_SAVE_CREDENTIAL_FAILED, &[&err]);
+                self.logf("app", &msg);
+                self.last_error = msg;
+                return false;
+            }
+        };
+        if secret.is_empty() {
             return false;
         }
         if let Ok(Some(current)) = self.store.load_credential() {
@@ -309,7 +329,7 @@ impl Engine {
         }
         let credential = mesh_state::Credential {
             id: heartbeat.credential_id.clone(),
-            secret: heartbeat.credential.clone(),
+            secret,
             expires_at: heartbeat.credential_expiry,
             protect: String::new(),
         };

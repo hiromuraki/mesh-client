@@ -538,6 +538,38 @@ fn the_panel_shows_the_credential_expiry_from_the_heartbeat() {
     );
 }
 
+/// 封装坏了就这一轮作废：不写盘，也不回落到响应里的明文字段——能改响应字节的
+/// 一方正是这条封装要防的人，回落等于把封装变成可选的装饰。
+#[test]
+fn a_broken_sealed_credential_is_not_taken_from_the_plaintext() {
+    let mut harness = harness("sealed-broken");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config);
+    api(&mut harness);
+    harness.engine.control.gen = 1;
+
+    harness.engine.on_heartbeat(
+        1,
+        Ok(Some(remote::Heartbeat {
+            credential: "Y3JlZC0x".to_string(),
+            credential_sealed: "AAAA".to_string(),
+            credential_id: "cred-9".to_string(),
+            credential_expiry: 1_798_000_000,
+            ..remote::Heartbeat::default()
+        })),
+    );
+
+    assert!(
+        harness.engine.store.load_credential().unwrap().is_none(),
+        "坏掉的封装回落到了明文凭据"
+    );
+    assert!(
+        harness.engine.last_error.contains("解封"),
+        "错误提示没有说明是解封失败：{}",
+        harness.engine.last_error
+    );
+}
+
 // ------------------------------------------------------------ 配置下发与 core 启停
 
 #[test]

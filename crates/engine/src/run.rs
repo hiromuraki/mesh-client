@@ -609,7 +609,7 @@ impl Engine {
     /// 一次成功心跳的响应处理。首次心跳与之后每一轮走同一段，没有“首轮”分支。
     fn on_beat(&mut self, api: Arc<remote::Client>, heartbeat: remote::Heartbeat) {
         // 凭据先落盘：core 只在下一次启动时读到它，`ensure_core` 会因为规格变化换进程。
-        if self.save_credential(&heartbeat) {
+        if self.save_credential(&api, &heartbeat) {
             self.logf(
                 "app",
                 mesh_text::get(mesh_text::id::ENGINE_LOG_CREDENTIAL_RECEIVED_RESTART),

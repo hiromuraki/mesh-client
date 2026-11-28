@@ -38,6 +38,12 @@ hex = "0.4"
 base64 = "0.22"
 ed25519-dalek = "2"
 rand = "0.8"
+# 凭据封装（contract/device-api.md「凭据封装」）：X25519 + BLAKE2b 派生 +
+# XChaCha20-Poly1305。控制面用同样的原语封（Go 的 x/crypto），两端都不能换。
+# x25519-dalek 只用到自由函数 x25519()，不需要 StaticSecret 那个 feature。
+x25519-dalek = "2"
+blake2 = "0.10"
+chacha20poly1305 = "0.10"
 thiserror = "1"
 fs4 = "0.12"
 # 只解析响应的 Date 头（判断本机时钟偏差）。RFC 7231 的三种日期格式都认，
