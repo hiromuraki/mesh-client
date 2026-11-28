@@ -258,8 +258,9 @@ pub fn spawn(events: Sender<Event>, on_line: impl Fn(&str) + Send + 'static) -> 
 ```rust
 pub struct Config { pub root: PathBuf, pub self_version: String, pub hostname: String,
                     pub auto_update_disabled: bool }
-pub fn spawn(cfg: Config, inbox: Receiver<Cmd>, cell: Arc<StateCell>,
-             notices: Sender<Notice>, shutdown: Arc<Shutdown>) -> JoinHandle<()>;
+pub fn spawn(cfg: Config, cell: Arc<StateCell>, notices: Sender<Notice>,
+             shutdown: Arc<Shutdown>) -> Result<(Sender<Cmd>, JoinHandle<()>), StartupBlocked>;
+pub struct StartupBlocked { pub report: String, pub reason: String }   // 安装目录检查拦下启动
 
 pub enum Cmd {
     Heartbeat(Result<Option<Heartbeat>, remote::Error>),   // 心跳线程只负责取样，判断都在引擎

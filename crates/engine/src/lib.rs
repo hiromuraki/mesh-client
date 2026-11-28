@@ -17,6 +17,7 @@ mod log;
 mod redact;
 mod run;
 mod settings;
+mod startup;
 mod sync;
 mod update;
 mod views;
@@ -26,6 +27,7 @@ mod tests;
 
 pub use log::{events, logs, Line, Log};
 pub use run::{spawn, Cmd, Config, Notice, SettingsInput, Status};
+pub use startup::StartupBlocked;
 pub use views::{BeatInput, Published, Snapshot, StateCell};
 
 use std::sync::atomic::{AtomicBool, Ordering};

@@ -9,8 +9,9 @@
 use crate::autostart;
 use crate::clock;
 use crate::log::Log;
+use crate::startup::StartupBlocked;
 use crate::views::{Snapshot, StateCell};
-use crate::{coreline, sync, update, Reply, Shutdown};
+use crate::{coreline, startup, sync, update, Reply, Shutdown};
 use mesh_install::layout;
 use mesh_remote as remote;
 use mesh_state::hints::{parse_hints, ConfigHints};
@@ -241,12 +242,15 @@ pub(crate) struct Engine {
 /// `Sender<Cmd>`，所以这里自己建 channel 并把发送端交出去（调用方只拿 Sender）。
 ///
 /// 同步注册一步收尾：`Shutdown::run_and_exit` 时先停 core。
+///
+/// 安装目录安全检查不通过时返回 [`StartupBlocked`]：ERROR 日志已由闸门写入，
+/// 此时没有拉起任何线程，调用方负责让进程以非零退出码结束。
 pub fn spawn(
     config: Config,
     cell: Arc<StateCell>,
     notices: Sender<Notice>,
     shutdown: Arc<Shutdown>,
-) -> (Sender<Cmd>, JoinHandle<()>) {
+) -> Result<(Sender<Cmd>, JoinHandle<()>), StartupBlocked> {
     let (tx, inbox) = channel();
     // 打不开 `config/` 就没法做任何事，也不该假装能跑：这里直接让进程死掉，
     // 由启动器按「启动确认失败」回滚（桌面端还会弹一次错误框）。
@@ -263,22 +267,14 @@ pub fn spawn(
         ),
     };
     let log = Arc::new(log);
-    // 安装根只留 Administrators 与 SYSTEM 可写：不收紧时任何本地账户都能替换
-    // `mesh.exe`，而自启任务会以最高权限拉起它。失败不拦启动，但要留痕。
-    if let Err(err) = mesh_state::harden_install_root(&config.root) {
-        log.add(
-            "app",
-            &mesh_text::format(mesh_text::id::ENGINE_LOG_HARDEN_FAILED, &[&err]),
-        );
-    }
-    // 收紧 `config/` 权限失败同样只记一条：密钥文件可能仍带着继承来的宽权限，
-    // 而用户看不到任何异常。
-    if let Some(err) = store.harden_error() {
-        log.add(
-            "app",
-            &mesh_text::format(mesh_text::id::ENGINE_LOG_HARDEN_FAILED, &[&err]),
-        );
-    }
+    // 安装根与 `config/` 的权限决定谁能替换下一次以提权身份启动的可执行文件。
+    // 收紧或校验不通过时闸门已经写过 ERROR 日志，这里直接终止启动，不拉起 core。
+    startup::check(
+        &config.root,
+        &config.program_dir,
+        store.harden_error(),
+        &log,
+    )?;
 
     // core 事件包成 Cmd::Core 投回引擎；core 输出的每一行先去掉时间戳、打码再落盘。
     let inbox_tx = tx.clone();
@@ -351,7 +347,7 @@ pub fn spawn(
         .name("mesh-engine".to_string())
         .spawn(move || engine.run())
         .expect("启动引擎线程失败");
-    (tx, handle)
+    Ok((tx, handle))
 }
 
 /// `pump` 的结果。

@@ -8,6 +8,8 @@
 //! 所以这里的 serde 结构体不写 `rename_all`：字段名就是磁盘上的名字。
 
 pub mod hints;
+#[cfg(unix)]
+pub mod permissions;
 
 #[cfg(windows)]
 mod win;
@@ -29,7 +31,7 @@ fn harden_dir(_dir: &Path) -> io::Result<()> {
 ///
 /// 由客户端在启动时调一次，**不在 [`Store::open`] 里**：安装根收紧之后当前用户
 /// 就不再能往它下面写东西，而 `Store::open` 也被测试用来造临时目录——
-/// 那会把测试自己的 `log/` 一起锁死。
+/// 那会把测试自己的 `log/` 一起锁死。调用方在失败时终止启动（引擎的启动闸门）。
 pub fn harden_install_root(root: &Path) -> io::Result<()> {
     harden_root(root)
 }
@@ -154,7 +156,7 @@ pub struct Store {
     root: PathBuf,
     keys: Mutex<Keys>,
     /// 收紧 `config/` 权限失败的原因；`None` 表示收紧成功（或不在 Windows 上）。
-    /// 失败不阻止启动——起不来比留一个旧 ACE 更糟——但必须有人把它说出来。
+    /// 由引擎在启动闸门里读取：非空即终止启动，不能带着旧的宽 ACE 跑。
     harden_error: Option<String>,
 }
 
@@ -173,11 +175,12 @@ impl Store {
         let dir = root.join(layout::CONFIG);
         fs::create_dir_all(&dir).map_err(|err| Error::io(&dir, err))?;
         // 目录一建好就收权限，赶在写任何密钥之前：继承来的 ACL 可能对本地所有账户
-        // 开放，晚一步就等于先把私钥暴露过一次。安装根也一起收：它决定谁能替换
-        // `mesh.exe`，而自启任务会以最高权限拉起那个文件。
+        // 开放，晚一步就等于先把私钥暴露过一次。安装根由引擎的启动闸门单独收紧：
+        // 它决定谁能替换 `mesh.exe`，而自启任务会以最高权限拉起那个文件。
         //
-        // 收紧失败（FAT32、网络盘、子项被别的账户占着）只记原因不返回错误：客户端
-        // 因为「加固没做完」而起不来，用户看到的只是「打不开」，反而更容易去乱删文件。
+        // 收紧失败（FAT32、网络盘、子项被别的账户占着）只把原因带出去，不在这里
+        // 返回错误：`Store::open` 也被测试用来造临时目录，不能因为权限处理就失败。
+        // 生产启动路径由引擎的启动闸门读取这个原因并终止进程。
         let harden_error = harden_dir(&dir).err().map(|err| err.to_string());
         Ok(Store {
             root: root.to_path_buf(),

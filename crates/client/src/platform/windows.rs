@@ -15,7 +15,9 @@ use windows_sys::Win32::Foundation::BOOL;
 use windows_sys::Win32::System::Console::{
     AttachConsole, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, MB_ICONERROR, MB_SETFOREGROUND, MB_SYSTEMMODAL,
+};
 
 /// 父控制台的写句柄。attach_console 成功之后所有输出都走它。
 static CONSOLE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
@@ -89,6 +91,30 @@ pub(crate) fn notify_error(text: &str) {
             body.as_ptr(),
             title.as_ptr(),
             MB_ICONERROR,
+        );
+    }
+}
+
+/// 安装目录检查拦下启动：专用提示，说明本次不启动的原因与建议。
+///
+/// 用 `MB_SYSTEMMODAL | MB_SETFOREGROUND`：双击启动时没有控制台，普通错误框
+/// 可能落在别的窗口后面，用户看到的仍是「双击没反应」。
+pub(crate) fn notify_startup_blocked(reason: &str) {
+    let title = wide(mesh_text::get(
+        mesh_text::id::CLIENT_NOTICE_STARTUP_BLOCKED_TITLE,
+    ));
+    let body = format!(
+        "{}\n\n{}",
+        mesh_text::format(mesh_text::id::CLIENT_NOTICE_STARTUP_BLOCKED, &[&reason]),
+        mesh_text::get(mesh_text::id::CLIENT_NOTICE_STARTUP_BLOCKED_ADVICE),
+    );
+    let body = wide(&body);
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_ICONERROR | MB_SYSTEMMODAL | MB_SETFOREGROUND,
         );
     }
 }

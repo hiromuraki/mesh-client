@@ -202,6 +202,34 @@ fn fake_core() -> PathBuf {
     panic!("找不到假 core {name}：先跑 `cargo build --examples -p mesh-core`");
 }
 
+/// 造一个能过启动闸门权限校验的槽：root/bin 与两个可执行文件。
+///
+/// Windows 的闸门只收紧 ACL，Unix 的闸门还看属主与 mode；这个测试直接调用
+/// 生产入口 `spawn`，所以两边都要满足。
+fn install_for_spawn(dir: &Path) -> PathBuf {
+    let slot = dir.join("bin");
+    std::fs::create_dir_all(&slot).unwrap();
+    for name in [
+        mesh_install::platform::client_exe(),
+        mesh_install::platform::core_name(),
+    ] {
+        let path = slot.join(name);
+        std::fs::write(&path, b"").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    slot
+}
+
 fn saved_client(harness: &Harness) -> ClientConfig {
     saved_client_named(harness, "")
 }
@@ -787,13 +815,14 @@ fn a_stale_stun_result_is_ignored() {
 #[test]
 fn the_engine_thread_starts_publishes_and_exits() {
     let dir = temp_dir("spawn");
+    let program_dir = install_for_spawn(&dir);
     let cell = Arc::new(StateCell::new(Published::default()));
     let (notice_tx, _notice_rx) = channel();
     let shutdown = Shutdown::new();
     let (tx, handle) = crate::spawn(
         Config {
             root: dir.clone(),
-            program_dir: dir.join("bin"),
+            program_dir,
             self_version: "2026.11.26-9".to_string(),
             hostname: "test-host".to_string(),
             auto_update_disabled: false,
@@ -801,7 +830,8 @@ fn the_engine_thread_starts_publishes_and_exits() {
         Arc::clone(&cell),
         notice_tx,
         Arc::clone(&shutdown),
-    );
+    )
+    .expect("合法的安装目录应放行");
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         let published = cell.get();

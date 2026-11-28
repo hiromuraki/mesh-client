@@ -27,6 +27,37 @@ use std::sync::Arc;
 
 pub(crate) const APP_TITLE: &str = "Mesh Client";
 
+/// 启动失败。
+///
+/// `startup_reason` 非空表示安装目录安全检查拦下了这次启动：引擎已经写过 ERROR
+/// 日志，桌面形态要用专门的原生提示，而不是通用的错误框。
+struct Failure {
+    message: String,
+    startup_reason: Option<String>,
+}
+
+impl Failure {
+    fn plain(message: impl Into<String>) -> Failure {
+        Failure {
+            message: message.into(),
+            startup_reason: None,
+        }
+    }
+
+    fn startup(blocked: mesh_engine::StartupBlocked) -> Failure {
+        Failure {
+            message: blocked.report,
+            startup_reason: Some(blocked.reason),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Failure {
+        Failure::plain(message)
+    }
+}
+
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let options = match cli::parse(&argv) {
@@ -48,17 +79,20 @@ fn main() -> ExitCode {
     }
     match run(options, desktop) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(message) => {
-            platform::say_err(&format!("{APP_TITLE}: {message}"));
+        Err(failure) => {
+            platform::say_err(&format!("{APP_TITLE}: {}", failure.message));
             if desktop {
-                platform::notify_error(&message);
+                match failure.startup_reason.as_deref() {
+                    Some(reason) => platform::notify_startup_blocked(reason),
+                    None => platform::notify_error(&failure.message),
+                }
             }
             ExitCode::FAILURE
         }
     }
 }
 
-fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
+fn run(options: cli::Options, desktop: bool) -> Result<(), Failure> {
     // 先取自身路径：安装根由它推出，版本也来自它所在的那个槽。
     let exe = std::env::current_exe()
         .map_err(|err| mesh_text::format(mesh_text::id::CLIENT_ERROR_EXE_PATH, &[&err]))?;
@@ -85,9 +119,10 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
             return instance::wake_existing(
                 &root.join(layout::CONFIG).join("ui.json"),
                 platform::open_browser,
-            );
+            )
+            .map_err(Failure::from);
         }
-        Err(err) => return Err(err.to_string()),
+        Err(err) => return Err(err.to_string().into()),
     };
 
     let shutdown = Shutdown::new();
@@ -101,7 +136,8 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
         auto_update_disabled: options.disable_auto_update,
     };
     let (tx, _engine) =
-        mesh_engine::spawn(config, Arc::clone(&cell), notice_tx, Arc::clone(&shutdown));
+        mesh_engine::spawn(config, Arc::clone(&cell), notice_tx, Arc::clone(&shutdown))
+            .map_err(Failure::startup)?;
     if desktop {
         platform::spawn_notice_thread(notice_rx);
     } else {
@@ -118,7 +154,8 @@ fn run(options: cli::Options, desktop: bool) -> Result<(), String> {
         &cell,
         &tx,
         &shutdown,
-    );
+    )
+    .map_err(Failure::from);
     // 两种结局都要收尾。Unix 上 core 在自己的会话里，进程直接退会留下一个占着
     // 虚拟 IP 的孤儿——headless 收到 SIGTERM 后 serve 是正常返回的，只在失败路径
     // 收尾会让每次 systemctl stop 都漏掉 core。

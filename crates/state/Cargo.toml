@@ -14,6 +14,10 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(unix)'.dependencies]
+# 有效用户 ID 只有 libc 能给；安装目录校验要拿它比对文件属主。
+libc = { workspace = true }
+
 [dependencies]
 mesh-text = { workspace = true }
 # mesh-install 提供 atomic_replace：本地文件要么是旧的、要么是新的，不能写一半。

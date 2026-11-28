@@ -28,6 +28,9 @@ pub(crate) fn emit_out_raw(bytes: &[u8]) {
 /// headless 上错误已经写到 stderr，不需要额外的提示。
 pub(crate) fn notify_error(_text: &str) {}
 
+/// 安装目录检查只在 Windows 桌面弹框；Unix 的 stderr 已经写明原因。
+pub(crate) fn notify_startup_blocked(_reason: &str) {}
+
 /// 只有 Windows 版有托盘菜单（Go 的 opendir_other.go 同）。
 pub(crate) fn open_browser(_url: &str) -> Result<(), String> {
     Err(mesh_text::get(mesh_text::id::CLIENT_TEXT_NO_TRAY).to_string())
