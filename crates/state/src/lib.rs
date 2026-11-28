@@ -127,10 +127,6 @@ pub struct ClientConfig {
     pub server_url: String,
     pub hostname: String,
     pub created_at: i64,
-    /// 过渡期：旧协议（签名第 4 行是 `device_id`）用的句柄。控制面切到公钥协议之后
-    /// 这一段随 PENDING 一起删除；新协议不读它，没有就是空串。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub device_id: String,
 }
 
 /// `config/credential.json`：控制面签发的凭据，取代 `secure.key` 成为这个节点
@@ -585,12 +581,11 @@ mod tests {
             server_url: "http://10.126.126.1:8088".into(),
             hostname: "laptop".into(),
             created_at: 1795541874,
-            device_id: String::new(),
         };
         store.save_client(&config).unwrap();
         assert_eq!(store.load_client().unwrap(), Some(config.clone()));
         let text = fs::read_to_string(store.client_path()).unwrap();
-        // 磁盘格式是 snake_case；过渡期的 device_id 为空时不落盘。
+        // 磁盘格式是 snake_case，且只有这三个键。
         assert!(text.contains("\"server_url\""));
         assert!(text.contains("\"hostname\""));
         assert!(text.contains("\"created_at\""));

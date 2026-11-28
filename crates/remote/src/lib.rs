@@ -142,85 +142,6 @@ impl Client {
         decode(response, MAX_HEARTBEAT_BODY).map(Some)
     }
 
-    /// 过渡期：旧协议的认领（`POST /api/v1/register`）。设备在切换前从未认领过、
-    /// 又碰上还没换掉的控制面时用它把槽位绑上；切换完成后随 PENDING 删除。
-    pub fn register_legacy(
-        &self,
-        device_id: &str,
-        hostname: &str,
-        pubkey_b64: &str,
-        timeout: Duration,
-    ) -> Result<RegisterReply, Error> {
-        let timestamp = unix_now().to_string();
-        let nonce = random_hex(16)?;
-        let platform_id = platform::id();
-        let message = signing_string(
-            "POST",
-            "/api/v1/register",
-            device_id,
-            &timestamp,
-            &nonce,
-            platform_id,
-            "",
-            "",
-        );
-        let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
-        let body = serde_json::json!({
-            "deviceId": device_id,
-            "hostname": hostname,
-            "pubkey": pubkey_b64,
-            "timestamp": timestamp,
-            "nonce": nonce,
-            "signature": signature,
-            "platform": platform_id,
-        })
-        .to_string();
-        let response = post(&self.url("/api/v1/register"), &body, timeout)?;
-        decode(response, MAX_HEARTBEAT_BODY)
-    }
-
-    /// 过渡期：旧协议的一次心跳（签名第 4 行是 `device_id`）。控制面还在认
-    /// `deviceId` 句柄时用它，切换完成后这一段随 PENDING 一起删除。
-    pub fn heartbeat_legacy(
-        &self,
-        device_id: &str,
-        config_hash: &str,
-        app_version: &str,
-        credential_id: &str,
-        timeout: Duration,
-    ) -> Result<Option<Heartbeat>, Error> {
-        let timestamp = unix_now().to_string();
-        let nonce = random_hex(16)?;
-        let platform_id = platform::id();
-        let message = signing_string(
-            "POST",
-            "/api/v1/heartbeat",
-            device_id,
-            &timestamp,
-            &nonce,
-            platform_id,
-            config_hash,
-            app_version,
-        );
-        let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
-        let body = serde_json::json!({
-            "deviceId": device_id,
-            "appVersion": app_version,
-            "configHash": config_hash,
-            "credentialId": credential_id,
-            "timestamp": timestamp,
-            "nonce": nonce,
-            "signature": signature,
-            "platform": platform_id,
-        })
-        .to_string();
-        let response = post(&self.url("/api/v1/heartbeat"), &body, timeout)?;
-        if response.status() == 204 {
-            return Ok(None);
-        }
-        decode(response, MAX_HEARTBEAT_BODY).map(Some)
-    }
-
     /// 下载 `url` 到 `dst`，最多 `limit` 字节，返回实际写入字节数。
     ///
     /// 多读一个字节再判断：读满 `limit + 1` 说明响应被截断，不能把半截文件当成成功。
@@ -289,15 +210,6 @@ impl Client {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
-}
-
-/// 过渡期：旧协议注册（认领 `deviceId`）的响应。控制面切到公钥协议之后不再调用。
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct RegisterReply {
-    pub device_id: String,
-    pub config_toml: String,
-    pub config_hash: String,
 }
 
 /// 控制面单独发布的启动器（安装根目录里那个固定文件）。

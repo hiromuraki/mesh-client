@@ -88,7 +88,6 @@ fn harness(tag: &str) -> Harness {
     let cell = Arc::new(StateCell::new(Published::default()));
     let (notice_tx, notice_rx) = channel();
     let engine = Engine {
-        protocol: crate::run::Protocol::Pubkey,
         config: Config {
             root: dir.clone(),
             data: dir.clone(),
@@ -247,7 +246,6 @@ fn saved_client_named(harness: &Harness, hostname: &str) -> ClientConfig {
         server_url: "http://127.0.0.1:1".to_string(),
         hostname: hostname.to_string(),
         created_at: 1_700_000_000,
-        device_id: String::new(),
     };
     harness.engine.store.save_client(&config).unwrap();
     config
@@ -315,7 +313,6 @@ fn a_rejected_key_leaves_the_local_config_alone() {
     harness.engine.control.gen = 1;
     harness.engine.on_heartbeat(
         1,
-        crate::run::Protocol::Pubkey,
         Err(remote::Error::Unauthorized {
             code: "unauthorized".to_string(),
             server_time: None,
@@ -345,7 +342,6 @@ fn a_clock_skew_is_explained_and_keeps_the_config() {
         harness.engine.control.gen = gen;
         harness.engine.on_heartbeat(
             gen,
-            crate::run::Protocol::Pubkey,
             Err(remote::Error::Unauthorized {
                 code: "unauthorized".to_string(),
                 server_time: Some(server_time),
@@ -374,7 +370,6 @@ fn a_server_error_is_retried_without_touching_the_config() {
         harness.engine.control.gen = attempt;
         harness.engine.on_heartbeat(
             attempt,
-            crate::run::Protocol::Pubkey,
             Err(remote::Error::Api {
                 status: 503,
                 code: "unavailable".to_string(),
@@ -396,9 +391,7 @@ fn a_server_error_is_retried_without_touching_the_config() {
 
     // 服务端恢复（204）就回到正常节拍，身份与计数都还是那份。
     harness.engine.control.gen = 6;
-    harness
-        .engine
-        .on_heartbeat(6, crate::run::Protocol::Pubkey, Ok(None));
+    harness.engine.on_heartbeat(6, Ok(None));
     assert_eq!(harness.engine.control.failures, 0);
     assert!(harness.engine.last_hb > 0);
 }
@@ -521,7 +514,6 @@ fn an_unsealed_credential_is_not_written() {
 
     harness.engine.on_heartbeat(
         1,
-        crate::run::Protocol::Pubkey,
         Ok(Some(remote::Heartbeat {
             credential_id: "cred-9".to_string(),
             credential_expiry: 1_798_000_000,
@@ -534,46 +526,6 @@ fn an_unsealed_credential_is_not_written() {
         "没有封装的凭据不能写盘"
     );
     assert_eq!(harness.engine.last_error, "", "这不是错误，只是一次没下发");
-}
-
-/// 过渡期：控制面还在认 `deviceId` 时，心跳先撞一次 401，退回旧协议成功之后锁住它，
-/// 下一轮不再多撞一次。
-#[test]
-fn a_legacy_control_plane_is_reached_through_the_device_id_fallback() {
-    let stub = Stub::new(vec![
-        (401, br#"{"code":"unauthorized"}"#.to_vec()),
-        (204, Vec::new()),
-        (204, Vec::new()),
-    ]);
-    let mut harness = harness("legacy-fallback");
-    harness
-        .engine
-        .store
-        .save_client(&ClientConfig {
-            server_url: stub.url.clone(),
-            hostname: "laptop".to_string(),
-            created_at: 1,
-            device_id: "dev-1".to_string(),
-        })
-        .unwrap();
-    harness.engine.client = harness.engine.store.load_client().unwrap();
-
-    harness.engine.beat_now();
-    assert_eq!(
-        harness.engine.protocol,
-        crate::run::Protocol::DeviceId,
-        "旧协议说得通就锁住它"
-    );
-    assert!(harness.engine.last_hb > 0);
-
-    harness.engine.beat_now();
-    let requests = stub.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3, "第一次撞 401 退一次，第二次直接走旧协议");
-    let body = String::from_utf8_lossy(&requests[1].1);
-    assert!(
-        body.contains("\"deviceId\":\"dev-1\""),
-        "退回去的那次请求要带 deviceId: {body}"
-    );
 }
 
 // ------------------------------------------------------------ 配置下发与 core 启停
@@ -644,7 +596,6 @@ fn a_heartbeat_without_a_config_body_is_not_a_config_change() {
     // 只带发布信息、没有 configB64：与 204 一样，没有配置要应用。
     harness.engine.on_heartbeat(
         1,
-        crate::run::Protocol::Pubkey,
         Ok(Some(remote::Heartbeat {
             config_hash: "stale".to_string(),
             ..remote::Heartbeat::default()
@@ -674,7 +625,6 @@ fn a_heartbeat_with_a_config_body_is_applied() {
     let body = "aG9zdG5hbWUgPSAibGFwdG9wIgppcHY0ID0gIjEwLjAuMC4xLzI0Igo=";
     harness.engine.on_heartbeat(
         1,
-        crate::run::Protocol::Pubkey,
         Ok(Some(remote::Heartbeat {
             config_hash: "h1".to_string(),
             config_b64: body.to_string(),
@@ -1154,9 +1104,7 @@ fn a_heartbeat_without_a_running_core_starts_it() {
     save_cred(&harness, "cred-1");
     api(&mut harness);
     harness.engine.control.gen = 1;
-    harness
-        .engine
-        .on_heartbeat(1, crate::run::Protocol::Pubkey, Ok(None));
+    harness.engine.on_heartbeat(1, Ok(None));
     assert!(matches!(harness.next_core(), Recorded::Start(_)));
 }
 
@@ -1175,9 +1123,7 @@ fn a_successful_heartbeat_recovers_the_status() {
     harness.engine.core = Some(applied_core(&harness));
     harness.engine.fault = "上一次失败".to_string();
     harness.engine.control.gen = 1;
-    harness
-        .engine
-        .on_heartbeat(1, crate::run::Protocol::Pubkey, Ok(None));
+    harness.engine.on_heartbeat(1, Ok(None));
     let snapshot = harness.published();
     assert_eq!(snapshot.status, "online");
     assert_eq!(snapshot.last_error, "");
@@ -1193,7 +1139,6 @@ fn a_heartbeat_401_does_not_clear_the_identity_on_the_first_strike() {
     harness.engine.control.gen = 1;
     harness.engine.on_heartbeat(
         1,
-        crate::run::Protocol::Pubkey,
         Err(remote::Error::Unauthorized {
             code: "unauthorized".to_string(),
             server_time: None,
@@ -1225,9 +1170,7 @@ fn a_stale_heartbeat_result_is_ignored() {
     // 重连过一次：当前代次是 2，代次 1 的结果已经过期。
     harness.engine.control.gen = 2;
 
-    harness
-        .engine
-        .on_heartbeat(1, crate::run::Protocol::Pubkey, Ok(None));
+    harness.engine.on_heartbeat(1, Ok(None));
 
     let snapshot = harness.published();
     assert_eq!(snapshot.status, "error", "旧连接的心跳不能把状态改回去");
@@ -1237,9 +1180,7 @@ fn a_stale_heartbeat_result_is_ignored() {
     );
 
     // 当前代次照常生效。
-    harness
-        .engine
-        .on_heartbeat(2, crate::run::Protocol::Pubkey, Ok(None));
+    harness.engine.on_heartbeat(2, Ok(None));
     assert_eq!(harness.published().status, "online");
 }
 
@@ -1290,7 +1231,6 @@ fn the_first_and_periodic_heartbeats_share_one_response_handler() {
             server_url: stub.url.clone(),
             hostname: "laptop".to_string(),
             created_at: 1,
-            device_id: String::new(),
         })
         .unwrap();
     // 凭据节点要有一张凭据才能起 core：这一轮心跳只负责把配置带回来。
@@ -2438,7 +2378,6 @@ fn switching_the_control_plane_drops_the_previous_generation() {
             server_url: "http://127.0.0.1:9".to_string(),
             hostname: String::new(),
             created_at: 1,
-            device_id: String::new(),
         })
         .unwrap();
     harness
@@ -2487,7 +2426,6 @@ fn a_failed_generation_cleanup_keeps_the_old_config() {
             server_url: "http://127.0.0.1:9".to_string(),
             hostname: String::new(),
             created_at: 1,
-            device_id: String::new(),
         })
         .unwrap();
     // config.toml 是目录：remove_file 会失败（Windows 与 Unix 都如此）。
@@ -2682,7 +2620,6 @@ fn saving_the_same_control_plane_again_keeps_the_local_state() {
             server_url: stub.url.clone(),
             hostname: String::new(),
             created_at: 1,
-            device_id: String::new(),
         })
         .unwrap();
     harness
@@ -2731,7 +2668,6 @@ fn changing_the_device_name_replaces_the_core() {
         server_url: stub.url.clone(),
         hostname: "old".to_string(),
         created_at: 1_700_000_000,
-        device_id: String::new(),
     };
     harness.engine.store.save_client(&config).unwrap();
     harness

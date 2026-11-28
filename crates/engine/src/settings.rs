@@ -41,12 +41,9 @@ impl Engine {
             server_url,
             hostname,
             created_at: 0,
-            device_id: String::new(),
         };
         if let Some(current) = current.as_ref() {
             config.created_at = current.created_at;
-            // 过渡期：旧协议要的那个句柄跟着配置走，切换完成后一起删。
-            config.device_id = current.device_id.clone();
         }
         // created_at 是这份配置第一次生效的时刻，之后的每次保存不改它。
         if config.created_at == 0 {

@@ -83,8 +83,6 @@ pub enum Cmd {
     Heartbeat {
         /// 发这条结果的心跳代次。重连/换身份之后的旧结果由引擎丢掉。
         gen: u64,
-        /// 这条结果最终用的是哪条协议：成功就锁住它，免得每轮都先撞一次 401。
-        protocol: Protocol,
         result: Result<Option<remote::Heartbeat>, remote::Error>,
     },
     Core(mesh_core::Event),
@@ -148,24 +146,6 @@ pub(crate) struct Control {
 ///
 /// 期望规格与运行实例实际应用的规格相等就不换进程，不等就换：配置同步、改名、
 /// 凭据轮换与重新绑定都走这一条判据，不再各写一套“要不要重启”。
-/// 过渡期：与还没换掉的控制面说话的两条协议。公钥协议是目标，`DeviceId` 只是切换
-/// 期间的退路：控制面一旦换掉，那次 401 会让心跳翻转回来。删掉它时连
-/// `ClientConfig::device_id` 与 `remote::Client::heartbeat_legacy` 一起删。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    Pubkey,
-    DeviceId,
-}
-
-impl Protocol {
-    fn flip(self) -> Protocol {
-        match self {
-            Protocol::Pubkey => Protocol::DeviceId,
-            Protocol::DeviceId => Protocol::Pubkey,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoreSpec {
     /// 身份代次：控制面地址。换了地址就是另一个控制面下发的配置。
@@ -233,8 +213,6 @@ pub(crate) struct Engine {
     /// 下载与启动器替换用的连接；不参与任何“是否在线”的判断。
     pub(crate) api: Option<Arc<remote::Client>>,
     pub(crate) control: Control,
-    /// 过渡期：这一代用哪条协议说话。控制面换掉之后由一次 401 翻转过来并锁住。
-    pub(crate) protocol: Protocol,
     pub(crate) last_hb: i64,
     /// 最近一次失败的说明（界面上的错误行）。
     pub(crate) last_error: String,
@@ -374,7 +352,6 @@ pub fn spawn(
         client: None,
         api: None,
         control: Control::default(),
-        protocol: Protocol::Pubkey,
         last_hb: 0,
         last_error: String::new(),
         fault: String::new(),
@@ -516,11 +493,7 @@ impl Engine {
     /// 处理一条命令。
     pub(crate) fn handle(&mut self, cmd: Cmd) {
         match cmd {
-            Cmd::Heartbeat {
-                gen,
-                protocol,
-                result,
-            } => self.on_heartbeat(gen, protocol, result),
+            Cmd::Heartbeat { gen, result } => self.on_heartbeat(gen, result),
             Cmd::Core(event) => self.on_core_event(event),
             Cmd::Stun { gen, info } => {
                 // 只有仍在跑的那一代 core 的探测结果才算数。
@@ -588,12 +561,14 @@ impl Engine {
         let spawned = thread::Builder::new()
             .name("mesh-heartbeat".to_string())
             .spawn(move || {
-                let (protocol, result) = request.send(request.protocol);
-                let _ = tx.send(Cmd::Heartbeat {
-                    gen,
-                    protocol,
-                    result,
-                });
+                let result = request.api.heartbeat(
+                    &request.hostname,
+                    &request.hash,
+                    &request.app_version,
+                    &request.credential_id,
+                    HEARTBEAT_TIMEOUT,
+                );
+                let _ = tx.send(Cmd::Heartbeat { gen, result });
             });
         if let Err(err) = spawned {
             self.note_control_failure(&mesh_text::format(
@@ -620,8 +595,6 @@ impl Engine {
         self.api = Some(Arc::clone(&api));
         Some(BeatRequest {
             api,
-            device_id: config.device_id.clone(),
-            protocol: self.protocol,
             hostname: self.effective_hostname(&config),
             hash: self.hash(),
             app_version: self.config.self_version.clone(),
@@ -637,7 +610,6 @@ impl Engine {
     pub(crate) fn on_heartbeat(
         &mut self,
         gen: u64,
-        protocol: Protocol,
         result: Result<Option<remote::Heartbeat>, remote::Error>,
     ) {
         if gen != self.control.gen {
@@ -649,8 +621,6 @@ impl Engine {
         };
         match result {
             Ok(heartbeat) => {
-                // 这条协议说得通就锁住它：下一轮不再先撞一次 401。
-                self.protocol = protocol;
                 self.control.failures = 0;
                 self.last_hb = clock::unix_now();
                 self.control.due = Some(Instant::now() + HEARTBEAT_INTERVAL);
@@ -1334,59 +1304,24 @@ impl Engine {
         self.control.gen = self.control.gen.wrapping_add(1);
         let gen = self.control.gen;
         self.control.due = None;
-        let (protocol, result) = request.send(request.protocol);
-        self.on_heartbeat(gen, protocol, result);
+        let result = request.api.heartbeat(
+            &request.hostname,
+            &request.hash,
+            &request.app_version,
+            &request.credential_id,
+            HEARTBEAT_TIMEOUT,
+        );
+        self.on_heartbeat(gen, result);
     }
 }
 
 /// 一次心跳请求的取样结果。
 struct BeatRequest {
     api: Arc<remote::Client>,
-    /// 过渡期：旧协议要的句柄。空串表示这台设备从没走过旧协议，只能试公钥那条。
-    device_id: String,
-    protocol: Protocol,
     hostname: String,
     hash: String,
     app_version: String,
     credential_id: String,
-}
-
-impl BeatRequest {
-    /// 按一条协议发一次。先撞 401 再换另一条：切换期间总有一边说得通，而控制面
-    /// 换掉之后，那一次 401 正好把协议翻回来。
-    fn send(
-        &self,
-        protocol: Protocol,
-    ) -> (Protocol, Result<Option<remote::Heartbeat>, remote::Error>) {
-        let first = self.exchange(protocol);
-        if !matches!(first, Err(remote::Error::Unauthorized { .. })) {
-            return (protocol, first);
-        }
-        let other = protocol.flip();
-        if other == Protocol::DeviceId && self.device_id.is_empty() {
-            return (protocol, first);
-        }
-        (other, self.exchange(other))
-    }
-
-    fn exchange(&self, protocol: Protocol) -> Result<Option<remote::Heartbeat>, remote::Error> {
-        match protocol {
-            Protocol::Pubkey => self.api.heartbeat(
-                &self.hostname,
-                &self.hash,
-                &self.app_version,
-                &self.credential_id,
-                HEARTBEAT_TIMEOUT,
-            ),
-            Protocol::DeviceId => self.api.heartbeat_legacy(
-                &self.device_id,
-                &self.hash,
-                &self.app_version,
-                &self.credential_id,
-                HEARTBEAT_TIMEOUT,
-            ),
-        }
-    }
 }
 
 /// 一代 core 的代次：控制面地址。地址换了就是另一个控制面下发的配置。
