@@ -74,7 +74,7 @@ flowchart TD
 
 客户端只负责下载与交接；解包进候选槽、校验、拉起、等确认由启动器做；提交 `bin/current` 由客户端在启动成功时做。两个平台的差别只在交接方式：
 
-- **Linux**：包装到 `<安装根>/update.tar.zst` 后正常退出。常驻启动器（systemd 的 `ExecStart`）看到子进程退出就回到循环开头，读包里的 `version.json`，不比当前槽新就丢弃，否则清空候选槽、解包、校验、拉起。确认以 `current` 变成该槽为准；旧槽不在确认那一瞬删，留到下一次启动、选槽之前清理。失败则停掉候选、`current` 不动。
+- **Linux**：客户端先把整包摘要写到 `<安装根>/update.tar.zst.sha256`，再把包改名成 `update.tar.zst`，然后正常退出。常驻启动器（systemd 的 `ExecStart`）看到子进程退出就回到循环开头：先按摘要自算比对，不符就丢弃包与摘要、不碰候选槽；相符再读包里的 `version.json`，不比当前槽新就丢弃，否则清空候选槽、解包、校验、拉起。确认以 `current` 变成该槽为准；旧槽不在确认那一瞬删，留到下一次启动、选槽之前清理。失败则停掉候选、`current` 不动。
 - **Windows**：包已经在本地，客户端拉起 `mesh.exe --file <包> --wait-for <pid> --sha256 <摘要>` 后退出。启动器等旧进程退出（≤60s）、清空候选槽、解包、校验、拉起，等 `current` 变化；失败就停掉候选并把当前槽拉回来；旧槽同样留到下一次启动、选槽之前清理。
 
 ```mermaid
@@ -92,8 +92,8 @@ sequenceDiagram
     Note over E: 删除包，状态 error，记一次失败
   else 校验通过
     alt Linux
-      Note over E: 写到 <安装根>/update.tar.zst，停资源后正常退出
-      Note over L: 子进程退出 → 读包内 version.json<br/>不比当前槽新则丢弃
+      Note over E: 先落 update.tar.zst.sha256，再改名成 update.tar.zst<br/>停资源后正常退出
+      Note over L: 子进程退出 → 按摘要自算比对<br/>不符即丢弃；相符再读包内 version.json<br/>不比当前槽新则丢弃
       Note over L: 清空候选槽 → 解包 → 校验清单
       L->>N: 拉起候选槽的 mesh-client，等启动确认（≤60s）
       Note over E,L: 启动成功后客户端原子写 bin/current = 该槽名

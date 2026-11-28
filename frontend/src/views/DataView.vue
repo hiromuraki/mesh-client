@@ -81,11 +81,15 @@ const credential = computed(() => {
   if (!at) {
     return { text: "未知", warn: false, hint: "旧版本的凭据文件里没有记这一项，控制面下次签发时补上" };
   }
-  const expired = at <= Date.now() / 1000;
+  // 服务端给的是绝对到期时刻，剩余天数在这里现算；侧栏窄，先写天数再写时刻，
+  // 被截断时留下的是要看的那半句。
+  const now = Date.now() / 1000;
+  const days = Math.floor((at - now) / 86400);
+  const remaining = at <= now ? "已过期" : days > 0 ? `剩 ${days} 天` : "不到 1 天";
   return {
-    text: dateTime(at) + (expired ? " 已过期" : ""),
-    warn: expired,
-    hint: expired ? "凭据已过期，控制面下次签发时会换新" : "控制面给出的凭据过期时刻",
+    text: remaining + " · " + dateTime(at),
+    warn: at <= now,
+    hint: at <= now ? "凭据已过期，控制面下次签发时会换新" : "控制面给出的凭据过期时刻",
   };
 });
 

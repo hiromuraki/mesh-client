@@ -43,7 +43,7 @@ fn round(root: &Path) -> Result<Round, String> {
     // 整轮在所有权之内：选槽、装包、拉起并确认；确认之后放手再等客户端。
     let owner = install::own(root)?;
     let selected = owner.prepare()?;
-    // 待装包是唯一的安装信号：文件名固定，内容已经由客户端核过摘要。
+    // 待装包是唯一的安装信号：文件名固定；包旁边的摘要由 apply_pending 对着包现算比对。
     let installed = if root.join(layout::UPDATE_FILE).is_file() {
         owner.apply_pending(selected.as_ref())
     } else {

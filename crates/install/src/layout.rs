@@ -17,6 +17,10 @@ pub const SLOT_BOB: &str = "bob";
 pub const CURRENT: &str = "current";
 /// 下载好的更新包。文件本身就是“请安装”的信号。
 pub const UPDATE_FILE: &str = "update.tar.zst";
+/// 待装包的整包摘要，与包同生命周期：包被安装事务消费或丢弃时一起删。
+/// 它证明「盘上字节还是客户端验过的那一份」——客户端验的是发布签名盖住的摘要，
+/// 而启动器只看得到字节，所以这个数字得跟着包走过交接边界。
+pub const UPDATE_DIGEST: &str = "update.tar.zst.sha256";
 /// 按版本记的连续启动失败次数。启动器写，客户端读。
 pub const FAILURES: &str = ".update-failures.json";
 /// 单实例锁：同一份 `config/` 不能被两个客户端同时用。

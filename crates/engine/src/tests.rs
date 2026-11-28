@@ -500,6 +500,44 @@ fn a_formal_node_reports_an_empty_credential_id() {
     );
 }
 
+/// 面板上的「凭证过期」就是落盘那份凭据的到期时间：心跳下发的凭据带着它，
+/// 引擎落盘后重算身份摘要，快照跟着它走（前端据此显示剩余天数）。
+#[test]
+fn the_panel_shows_the_credential_expiry_from_the_heartbeat() {
+    let mut harness = harness("cred-expiry");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config);
+    harness
+        .engine
+        .store
+        .write_config("ipv4 = \"10.0.0.1/24\"\n")
+        .unwrap();
+    api(&mut harness);
+    harness.engine.control.gen = 1;
+
+    harness.engine.on_heartbeat(
+        1,
+        Ok(Some(remote::Heartbeat {
+            credential: "Y3JlZC0x".to_string(),
+            credential_id: "cred-9".to_string(),
+            credential_expiry: 1_798_000_000,
+            ..remote::Heartbeat::default()
+        })),
+    );
+
+    let stored = harness.engine.store.load_credential().unwrap().unwrap();
+    assert_eq!(
+        stored.expires_at, 1_798_000_000,
+        "到期时间要跟着凭据一起落盘"
+    );
+    let snapshot = harness.published();
+    assert_eq!(snapshot.auth_mode, "credential");
+    assert_eq!(
+        snapshot.credential_expiry, 1_798_000_000,
+        "面板显示的到期时间必须来自落盘的那份凭据"
+    );
+}
+
 // ------------------------------------------------------------ 配置下发与 core 启停
 
 #[test]
@@ -2533,10 +2571,57 @@ fn the_package_becomes_the_fixed_name_only_when_it_is_accepted() {
     assert_eq!(part.file_name().unwrap(), "update.tar.zst.part");
     assert_eq!(std::fs::read(&part).unwrap(), payload);
     assert!(!harness.dir.join("update.tar.zst").exists());
-    let path = crate::update::commit_package(&part, &harness.dir).unwrap();
+    let path = crate::update::commit_package(&part, &harness.dir, &want).unwrap();
     assert_eq!(path.file_name().unwrap(), "update.tar.zst");
     assert_eq!(std::fs::read(&path).unwrap(), payload);
     assert!(!harness.dir.join("update.tar.zst.part").exists());
+    // 摘要与包一起落盘：启动器靠它确认盘上的字节还是被授权的那一份。
+    #[cfg(unix)]
+    assert_eq!(
+        std::fs::read_to_string(harness.dir.join(mesh_install::layout::UPDATE_DIGEST))
+            .unwrap()
+            .trim(),
+        want
+    );
+}
+
+/// 撤回或换 offer 时，引擎自己放上去的包与摘要一起撤掉。
+#[cfg(unix)]
+#[test]
+fn dropping_the_committed_package_drops_its_digest() {
+    let mut harness = harness("update-withdraw");
+    let (mut state, _) = staged_offer(&harness, "2026.11.26-2", &digest(0xab));
+    let pending = harness.dir.join("update.tar.zst");
+    let sum = harness.dir.join(mesh_install::layout::UPDATE_DIGEST);
+    std::fs::write(&pending, b"package-bytes").unwrap();
+    std::fs::write(&sum, digest(0xab)).unwrap();
+    state.artifact = Artifact::Committed {
+        error: String::new(),
+    };
+    harness.engine.update = state;
+
+    harness.engine.clear_stale_update();
+
+    assert!(!pending.exists(), "不再被授权的包不能留成安装信号");
+    assert!(!sum.exists(), "摘要跟着包一起走");
+}
+
+/// 交接的命令行带的是客户端验过的那份整包摘要，启动器用它比对盘上的字节。
+#[cfg(windows)]
+#[test]
+fn the_handoff_carries_the_package_digest() {
+    let command =
+        crate::update::handoff_command(Path::new("mesh.exe"), Path::new("update.tar.zst"), "ab12");
+    let args: Vec<String> = command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let at = args
+        .iter()
+        .position(|arg| arg == "--sha256")
+        .expect("交接必须带摘要");
+    assert_eq!(args[at + 1], "ab12");
+    assert!(args.iter().any(|arg| arg == "--file"));
 }
 
 #[test]

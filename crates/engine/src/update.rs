@@ -149,10 +149,11 @@ impl UpdateState {
             Artifact::Staged(part) => {
                 let _ = std::fs::remove_file(part);
             }
-            // 交接没被接收时，固定路径上的包是引擎自己放的：撤回要把它一起撤掉，
-            // 否则下一轮安装事务会装一个已经不再被授权的版本。
+            // 交接没被接收时，固定路径上的包与它的摘要都是引擎自己放的：撤回要把
+            // 它们一起撤掉，否则下一轮安装事务会装一个已经不再被授权的版本。
             Artifact::Committed { .. } => {
                 let _ = std::fs::remove_file(root.join(layout::UPDATE_FILE));
+                let _ = std::fs::remove_file(root.join(layout::UPDATE_DIGEST));
             }
             Artifact::None | Artifact::Failed { .. } => {}
         }
@@ -434,7 +435,7 @@ impl Engine {
                 let Some(owner) = self.own_install_root() else {
                     return Ok(());
                 };
-                let committed = match commit_package(&part, &self.config.root) {
+                let committed = match commit_package(&part, &self.config.root, &sha256) {
                     Ok(path) => path,
                     Err(err) => {
                         drop(owner);
@@ -627,6 +628,10 @@ impl Engine {
     /// 这里只回答「启动器有没有被拉起来」：拉不起来就是明确失败，工件与授权由调用方
     /// 保留重试；Windows 上客户端派生启动器之后立刻退出，安装是否真的成功由启动器
     /// 自己的确认与日志回答，客户端不再持有交接材料。
+    ///
+    /// 交接要带上客户端验过的那份整包摘要：包内清单只证明内容自洽，摘要才证明盘上
+    /// 的字节还是被授权的那一份。Windows 走命令行；Unix 的摘要已经由
+    /// [`commit_package`] 落在包旁边。
     fn handoff(&mut self, path: &Path, version: &str, sha256: &str) -> Result<(), String> {
         if cfg!(windows) {
             let launcher = self
@@ -641,14 +646,7 @@ impl Engine {
                 self.logf("app", &msg);
                 return Err(msg);
             }
-            let mut command = std::process::Command::new(&launcher);
-            command
-                .arg("--file")
-                .arg(path)
-                .arg("--wait-for")
-                .arg(std::process::id().to_string())
-                .arg("--sha256")
-                .arg(sha256);
+            let mut command = handoff_command(&launcher, path, sha256);
             command.current_dir(&self.config.root);
             if let Err(err) = command.spawn() {
                 let msg =
@@ -663,7 +661,8 @@ impl Engine {
             // 启动器已经起来了，退出由调用方做（必须先拉起再退出，否则装不上，F7）。
             return Ok(());
         }
-        // Linux：客户端只负责把包放到安装根，解包与启动交给常驻启动器；正常退出即可。
+        // Linux：客户端只负责把包与它的摘要放到安装根，解包与启动交给常驻启动器；
+        // 正常退出即可。
         self.logf(
             "app",
             &mesh_text::format(mesh_text::id::ENGINE_LOG_HANDOFF_LAUNCHER, &[&version]),
@@ -836,6 +835,22 @@ impl Engine {
     }
 }
 
+/// 交接给启动器的命令行：包、旧进程号，以及客户端验过的那份整包摘要。
+///
+/// 摘要就是发布签名盖住的那个值：客户端已经验过签名，启动器只需要再证明一遍
+/// 「盘上的字节没换过」。
+pub(crate) fn handoff_command(launcher: &Path, path: &Path, sha256: &str) -> std::process::Command {
+    let mut command = std::process::Command::new(launcher);
+    command
+        .arg("--file")
+        .arg(path)
+        .arg("--wait-for")
+        .arg(std::process::id().to_string())
+        .arg("--sha256")
+        .arg(sha256);
+    command
+}
+
 /// 下载并校验更新包，落成 `<root>/update.tar.zst.part`。
 ///
 /// 返回的是暂存文件，**不是**固定路径：改名由引擎在确认这次交接确实被授权之后
@@ -884,13 +899,33 @@ fn acquire_install_root(root: &Path) -> Result<mesh_install::lock::Lock, String>
     )
 }
 
-/// 把校验过的暂存文件改成固定名：从这一刻起它才是「请安装」的信号。
+/// 把校验过的暂存文件连同它的整包摘要放到固定名：从这一刻起它才是「请安装」的信号。
+///
+/// Unix 上摘要先落盘、包后改名：包名本身就是信号，常驻启动器可能在这一瞬间已经
+/// 读走它——摘要晚到一次，那一份就只能按手动路径只验清单。Windows 的摘要走交接
+/// 命令行，这里不落文件。
 ///
 /// 调用方必须持有安装根写权。
-pub(crate) fn commit_package(part: &Path, root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn commit_package(part: &Path, root: &Path, sha256: &str) -> Result<PathBuf, String> {
+    #[cfg(unix)]
+    let sum = {
+        let sum = root.join(layout::UPDATE_DIGEST);
+        mesh_install::atomic_replace(&sum, sha256.as_bytes(), 0o644)
+            .map_err(|err| mesh_text::format(mesh_text::id::ENGINE_TEXT_PERSIST_FAILED, &[&err]))?;
+        sum
+    };
+    #[cfg(not(unix))]
+    let _ = sha256;
     let dst = root.join(layout::UPDATE_FILE);
-    std::fs::rename(part, &dst)
-        .map_err(|err| mesh_text::format(mesh_text::id::ENGINE_TEXT_PERSIST_FAILED, &[&err]))?;
+    if let Err(err) = std::fs::rename(part, &dst) {
+        // 包没成信号，摘要也不再属于任何一份：一起撤掉，别留下孤立的授权。
+        #[cfg(unix)]
+        let _ = std::fs::remove_file(&sum);
+        return Err(mesh_text::format(
+            mesh_text::id::ENGINE_TEXT_PERSIST_FAILED,
+            &[&err],
+        ));
+    }
     Ok(dst)
 }
 

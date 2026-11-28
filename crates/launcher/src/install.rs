@@ -339,24 +339,43 @@ impl Owner {
         reason
     }
 
-    /// apply_pending 消费待装包 `<root>/update.tar.zst`。
+    /// apply_pending 消费待装包 `<root>/update.tar.zst` 与它的摘要。
     ///
     /// 返回 `Some` 表示包装进了候选槽（下一次拉起它）；`None` 表示包被丢弃——不比
-    /// 当前新、失败次数已满、或包本身不可用。无论哪种结果，包都不再有用。
+    /// 当前新、失败次数已满、摘要不符、或包本身不可用。无论哪种结果，包与摘要都
+    /// 不再有用。
     ///
     /// 只有 Linux 的常驻启动器消费 `update.tar.zst`：Windows 的交接走 `--file`，
-    /// 包是命令参数而不是安装根里的固定文件。
+    /// 包是命令参数，摘要也在命令行上。
     #[cfg(unix)]
     pub(crate) fn apply_pending(&self, selected: Option<&Selected>) -> Option<Selected> {
         let pkg = self.root.join(UPDATE_FILE);
         if !pkg.is_file() {
             return None;
         }
+        let digest = self.root.join(layout::UPDATE_DIGEST);
         let target = candidate(selected);
         let current_version = selected.map(|slot| slot.version.as_str());
-        let outcome = self.install(&pkg, target, current_version, false);
+        // 摘要就是客户端验过发布签名的那一份：对不上说明盘上的字节已经不是被授权
+        // 的那一份，连候选槽都不该动。
+        let outcome = match pending_digest(&digest) {
+            Ok(None) => self.install(&pkg, target, current_version, false),
+            Ok(Some(want)) => match sha256_file(&pkg) {
+                Ok(got) if got.eq_ignore_ascii_case(&want) => {
+                    self.install(&pkg, target, current_version, false)
+                }
+                Ok(got) => Err(mesh_text::format(
+                    id::LAUNCHER_ERROR_DIGEST_MISMATCH,
+                    &[&got, &want],
+                )),
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(e),
+        };
         // 安装事务是唯一可以删待装包的：普通启动不碰它，否则 Linux 上的更新永远装不上。
+        // 摘要与包同生命周期：读到就一起删，别让下一份包继承上一份的摘要。
         remove_path(&pkg);
+        remove_path(&digest);
         match outcome {
             Ok(installed) => Some(installed),
             Err(e) => {
@@ -939,6 +958,22 @@ fn check_manifest(manifest: &Manifest, public_hex: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// 待装包的整包摘要：文件不在就是「没有摘要的手动路径」，只有包内清单可验。
+///
+/// 内容是客户端验过发布签名的那一份摘要。文件在但读不出来是明确的失败——写坏的
+/// 交接不该悄悄退化成只验清单；空文件同理，比对时必然不符。
+#[cfg(unix)]
+fn pending_digest(path: &Path) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text.trim().to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(mesh_text::format(
+            id::LAUNCHER_ERROR_READ_FILE,
+            &[&path.display(), &e],
+        )),
+    }
 }
 
 /// 一个槽是否有效：清单验签通过，且目录与清单是**同一个集合**。
@@ -1754,6 +1789,29 @@ mod tests {
         let _ = fs::remove_dir_all(&src);
     }
 
+    /// 交接给的摘要不符：拒绝发生在清空候选槽之前，用户给的包不删。
+    #[test]
+    fn a_manual_install_with_a_mismatched_digest_is_refused() {
+        let root = temp_root("install-manual-digest");
+        let src = temp_root("install-manual-digest-src");
+        let pkg = valid_package(&src, "2026.11.27-1", &required_entries());
+
+        let err = run(
+            &root,
+            Source::File(pkg.clone()),
+            Some("0".repeat(64)),
+            None,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(err.contains("摘要"), "拒绝原因要指向摘要：{err}");
+        assert!(!layout::slot_dir(&root, layout::SLOT_ALICE).exists());
+        assert!(pkg.is_file(), "用户给的包不能被删");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
     /// 清单是别的平台的：签名完全正确，只有 slot/platform 这一项不合本机。
     #[test]
     fn a_package_for_another_platform_is_refused_before_touching_the_candidate() {
@@ -2450,6 +2508,118 @@ mod tests {
         assert_eq!(count_failures(&root, "2026.11.27-2"), 1);
         assert_eq!(layout::read_current(&root), Some(layout::SLOT_ALICE));
         assert!(layout::slot_dir(&root, layout::SLOT_BOB).is_dir());
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 交接把摘要写成 `<root>/update.tar.zst.sha256`：对得上就装，读完连摘要一起删。
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_package_with_a_matching_digest_is_installed_and_clears_it() {
+        let root = temp_root("pending-digest");
+        let src = temp_root("pending-digest-src");
+        let key = test_key();
+        write_slot(
+            &root,
+            layout::SLOT_ALICE,
+            &key,
+            "2026.11.27-1",
+            &required_entries(),
+        );
+        set_current(&root, layout::SLOT_ALICE);
+        let pending = root.join(UPDATE_FILE);
+        fs::copy(
+            valid_package(&src, "2026.11.27-2", &required_entries()),
+            &pending,
+        )
+        .unwrap();
+        let digest = root.join(layout::UPDATE_DIGEST);
+        fs::write(&digest, format!("{}\n", sha256_file(&pending).unwrap())).unwrap();
+
+        let selected = owner(&root).prepare().unwrap().expect("alice 有效");
+        let installed = owner(&root)
+            .apply_pending(Some(&selected))
+            .expect("摘要相符就该装");
+
+        assert_eq!(installed.name, layout::SLOT_BOB);
+        assert_eq!(installed.version, "2026.11.27-2");
+        assert!(!pending.exists());
+        assert!(!digest.exists(), "摘要与包同生命周期");
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 摘要不符：盘上的字节已经不是客户端验过的那一份，包与摘要一起丢，候选槽不动。
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_package_with_a_mismatched_digest_is_discarded_before_the_candidate() {
+        let root = temp_root("pending-digest-mismatch");
+        let src = temp_root("pending-digest-mismatch-src");
+        let key = test_key();
+        write_slot(
+            &root,
+            layout::SLOT_ALICE,
+            &key,
+            "2026.11.27-1",
+            &required_entries(),
+        );
+        set_current(&root, layout::SLOT_ALICE);
+        let pending = root.join(UPDATE_FILE);
+        fs::copy(
+            valid_package(&src, "2026.11.27-2", &required_entries()),
+            &pending,
+        )
+        .unwrap();
+        // 与包一起走过交接的摘要对不上：包换过，或者摘要不是这一份的。
+        let digest = root.join(layout::UPDATE_DIGEST);
+        fs::write(&digest, format!("{}\n", "0".repeat(64))).unwrap();
+
+        let selected = owner(&root).prepare().unwrap().expect("alice 有效");
+        assert!(
+            owner(&root).apply_pending(Some(&selected)).is_none(),
+            "摘要不符的包装不上"
+        );
+
+        assert!(
+            !layout::slot_dir(&root, layout::SLOT_BOB).exists(),
+            "拒绝要发生在动候选槽之前"
+        );
+        assert!(!pending.exists(), "包不能被下一次安装捡走");
+        assert!(!digest.exists(), "摘要跟着包一起丢");
+        assert_eq!(layout::read_current(&root), Some(layout::SLOT_ALICE));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&src);
+    }
+
+    /// 没有摘要文件就是手动路径：只有包内清单可验，包照样装得上。
+    #[cfg(unix)]
+    #[test]
+    fn a_pending_package_without_a_digest_is_the_manual_path() {
+        let root = temp_root("pending-no-digest");
+        let src = temp_root("pending-no-digest-src");
+        let key = test_key();
+        write_slot(
+            &root,
+            layout::SLOT_ALICE,
+            &key,
+            "2026.11.27-1",
+            &required_entries(),
+        );
+        set_current(&root, layout::SLOT_ALICE);
+        let pending = root.join(UPDATE_FILE);
+        fs::copy(
+            valid_package(&src, "2026.11.27-2", &required_entries()),
+            &pending,
+        )
+        .unwrap();
+
+        let selected = owner(&root).prepare().unwrap().expect("alice 有效");
+        let installed = owner(&root)
+            .apply_pending(Some(&selected))
+            .expect("没有摘要就是手动路径");
+
+        assert_eq!(installed.name, layout::SLOT_BOB);
+        assert!(!pending.exists());
         let _ = fs::remove_dir_all(&root);
         let _ = fs::remove_dir_all(&src);
     }

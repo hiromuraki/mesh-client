@@ -319,7 +319,7 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.9 `mesh-launcher`（bin `mesh`）
 
-**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽），带 `--file`/`--url` 是 `Install`（装进候选槽）。改动安装根的动作全部在 `Owner` 之内：确认成功后删旧槽（选槽时不删任何槽）、解包、校验、拉起、等 `current` 确认。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
+**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽），带 `--file`/`--url` 是 `Install`（装进候选槽）。Linux 上还消费 `<安装根>/update.tar.zst` 与它的 `.sha256`：先比对摘要，再解包。改动安装根的动作全部在 `Owner` 之内：确认成功后删旧槽（选槽时不删任何槽）、解包、校验、拉起、等 `current` 确认。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
 
 **对外 API**：
 
