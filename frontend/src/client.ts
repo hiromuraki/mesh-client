@@ -30,16 +30,15 @@ export function clearActionError(): void {
 
 // 没有设备身份时自动跳到设置页；用户手动切过就不再打扰。
 let autoSwitch = true;
-let busy = false;
+// 在途的那一次请求：轮询与手动刷新都经过它，避免两个请求同时改写快照。
+let inflight: Promise<void> | null = null;
 // 引擎在 goroutine 里读本地配置，启动后的头一两帧 deviceId 必然为空，
 // 连续两次都空才认为是真的没配置，否则每次启动都会闪到设置页。
 let emptyStreak = 0;
 
 const status = computed<Status | "">(() => snapshot.value?.status ?? "");
 
-export async function refresh(): Promise<void> {
-  if (busy || restarting.value) return;
-  busy = true;
+async function fetchOnce(): Promise<void> {
   try {
     if (view.value === "data") {
       // 仪表盘右侧要挂一串最近事件，顺手一起取，省一次单独的往返。
@@ -59,9 +58,23 @@ export async function refresh(): Promise<void> {
     maybeSwitchToSettings();
   } catch (err) {
     pollError.value = "后端调用失败: " + errorMessage(err);
-  } finally {
-    busy = false;
   }
+}
+
+/**
+ * 拉一次数据。轮询撞上在途请求就并到那一次；手动刷新（`force`）排在它后面
+ * 再拉一次——点了「刷新」却因为 busy 什么都没发生，是用户看得见的失败。
+ */
+export function refresh(force = false): Promise<void> {
+  if (restarting.value) return Promise.resolve();
+  if (!inflight) {
+    inflight = fetchOnce().finally(() => {
+      inflight = null;
+    });
+    return inflight;
+  }
+  if (!force) return inflight;
+  return inflight.then(() => refresh(true));
 }
 
 function maybeSwitchToSettings(): void {

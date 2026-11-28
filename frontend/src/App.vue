@@ -15,7 +15,7 @@ const TABS: { id: View; label: string }[] = [
   { id: "settings", label: "设置" },
 ];
 
-const POLL_MS = 2000;
+const POLL_MS = 1000;
 let timer: number | undefined;
 
 function stopPolling(): void {

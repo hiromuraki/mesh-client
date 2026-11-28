@@ -1,21 +1,27 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import { applyUpdate, reconnect, select, setActionError, useClient } from "../client";
+import { applyUpdate, reconnect, refresh, select, setActionError, useClient } from "../client";
 import {
   clockTime,
   dateTime,
   errorMessage,
   joinOrDash,
+  latencyClass,
+  latencyNumber,
+  latencyRangeText,
   latencyText,
+  nextSort,
   pathText,
   releaseVersion,
   routeText,
+  sortNodes,
   statusText,
   TOPOLOGY_UNKNOWN_HINT,
   TOPOLOGY_UNKNOWN_NOTE,
   TOPOLOGY_UNKNOWN_TEXT,
 } from "../format";
 import type { NodeRow } from "../api/types";
+import type { NodeSort, NodeSortKey } from "../format";
 import TopologyView from "./TopologyView.vue";
 
 const { snapshot, nodes, logs, status, restarting } = useClient();
@@ -42,10 +48,12 @@ const latency = computed(() => {
     .filter((value): value is number => typeof value === "number" && Number.isFinite(value));
   if (!values.length) return null;
   const sum = values.reduce((total, value) => total + value, 0);
+  // 平均值不在这里取整：显示端的「一位小数」由 latencyNumber 统一负责，
+  // 中间先取整会把 6.877 变成 7，区间和均值就对不上了。
   return {
     min: Math.min(...values),
     max: Math.max(...values),
-    avg: Math.round(sum / values.length),
+    avg: sum / values.length,
   };
 });
 
@@ -139,12 +147,52 @@ async function copyIp(ip: string): Promise<void> {
   }
 }
 
-// 延迟条按最慢那个节点做归一，颜色沿用路径标签的语义。
+// 延迟条按最慢那个节点做归一，颜色只表达延迟（latencyClass）。
 function barWidth(node: NodeRow): number {
   const ms = node.latencyMs;
   const max = latency.value?.max ?? 0;
   if (ms === null || !Number.isFinite(ms) || max <= 0) return 0;
   return Math.max(6, Math.round((ms / max) * 100));
+}
+
+// 排序状态只活在这一个页面里：不排序时直接用 remote 的原顺序（core 给的顺序），
+// 不能先排一遍再按原顺序恢复，那样同值行的相对次序会被打乱。
+const sorting = ref<NodeSort | null>(null);
+const rows = computed(() =>
+  sorting.value ? sortNodes(remote.value, sorting.value.key, sorting.value.direction) : remote.value,
+);
+
+function toggleSort(key: NodeSortKey): void {
+  sorting.value = nextSort(sorting.value, key);
+}
+
+// 表头的可见指示：未排序是双向箭头，正序/倒序是单向箭头；同时给 th 一个 aria-sort。
+function sortMark(key: NodeSortKey): string {
+  if (sorting.value?.key !== key) return "↕";
+  return sorting.value.direction === "asc" ? "↑" : "↓";
+}
+
+function ariaSort(key: NodeSortKey): "ascending" | "descending" | "none" {
+  if (sorting.value?.key !== key) return "none";
+  return sorting.value.direction === "asc" ? "ascending" : "descending";
+}
+
+// 颜色类名加前缀：页面里已有一个 `.unknown`（拓扑未知整块），裸用 unknown 会
+// 让延迟格子继承它的 padding 与字号，把轨道撑成 28px 高。
+function latencyClassOf(node: NodeRow): string {
+  return "latency-" + latencyClass(node.latencyMs);
+}
+
+// 手动刷新：refresh(true) 会排在在途请求后面再拉一次，不等下一个 tick。
+const refreshing = ref(false);
+
+async function onRefresh(): Promise<void> {
+  refreshing.value = true;
+  try {
+    await refresh(true);
+  } finally {
+    refreshing.value = false;
+  }
 }
 
 async function onReconnect(): Promise<void> {
@@ -225,6 +273,7 @@ async function runApplyUpdate(): Promise<void> {
             </span>
           </div>
           <div class="actions">
+            <button type="button" :disabled="refreshing" title="立刻拉一次数据，不等下一次轮询" @click="onRefresh">刷新</button>
             <button type="button" @click="onReconnect">重新连接</button>
             <button type="button" :disabled="!snapshot?.localIp" @click="onCopy">复制地址</button>
             <button type="button" class="primary" @click="select('settings')">打开设置</button>
@@ -249,8 +298,8 @@ async function runApplyUpdate(): Promise<void> {
           </div>
           <div>
             <span class="k">平均延迟</span>
-            <span class="v">{{ latency ? latency.avg : "—" }}<small v-if="latency">ms</small></span>
-            <span class="n">{{ latency ? latency.min + " – " + latency.max + " ms" : known ? "暂无数据" : TOPOLOGY_UNKNOWN_NOTE }}</span>
+            <span class="v">{{ latency ? latencyNumber(latency.avg) : "—" }}<small v-if="latency">ms</small></span>
+            <span class="n">{{ latency ? latencyRangeText(latency.min, latency.max) : known ? "暂无数据" : TOPOLOGY_UNKNOWN_NOTE }}</span>
           </div>
         </section>
 
@@ -276,13 +325,41 @@ async function runApplyUpdate(): Promise<void> {
           <table v-else>
             <thead>
               <tr>
-                <th>节点</th>
-                <th class="addr">地址</th>
-                <th class="col-route">路径</th>
-                <th class="col-proto">协议</th>
-                <th class="col-nat">NAT</th>
-                <th class="col-ver">core 版本</th>
-                <th class="num">延迟</th>
+                <th :aria-sort="ariaSort('name')">
+                  <button type="button" class="sort" :class="{ active: sorting?.key === 'name' }" title="点击排序：正序 → 倒序 → 默认" @click="toggleSort('name')">
+                    节点<span class="arrow">{{ sortMark("name") }}</span>
+                  </button>
+                </th>
+                <th class="addr" :aria-sort="ariaSort('ip')">
+                  <button type="button" class="sort" :class="{ active: sorting?.key === 'ip' }" title="点击排序：正序 → 倒序 → 默认" @click="toggleSort('ip')">
+                    地址<span class="arrow">{{ sortMark("ip") }}</span>
+                  </button>
+                </th>
+                <th class="col-route" :aria-sort="ariaSort('route')">
+                  <button type="button" class="sort" :class="{ active: sorting?.key === 'route' }" title="点击排序：直连 → 中继 → 未知，再倒序" @click="toggleSort('route')">
+                    路径<span class="arrow">{{ sortMark("route") }}</span>
+                  </button>
+                </th>
+                <th class="col-proto" :aria-sort="ariaSort('proto')">
+                  <button type="button" class="sort" :class="{ active: sorting?.key === 'proto' }" title="点击排序：正序 → 倒序 → 默认" @click="toggleSort('proto')">
+                    协议<span class="arrow">{{ sortMark("proto") }}</span>
+                  </button>
+                </th>
+                <th class="col-nat" :aria-sort="ariaSort('nat')">
+                  <button type="button" class="sort" :class="{ active: sorting?.key === 'nat' }" title="点击排序：正序 → 倒序 → 默认" @click="toggleSort('nat')">
+                    NAT<span class="arrow">{{ sortMark("nat") }}</span>
+                  </button>
+                </th>
+                <th class="col-ver" :aria-sort="ariaSort('version')">
+                  <button type="button" class="sort" :class="{ active: sorting?.key === 'version' }" title="点击排序：按版本号数值段比较" @click="toggleSort('version')">
+                    core 版本<span class="arrow">{{ sortMark("version") }}</span>
+                  </button>
+                </th>
+                <th class="num" :aria-sort="ariaSort('latency')">
+                  <button type="button" class="sort" :class="{ active: sorting?.key === 'latency' }" title="点击排序：未知延迟始终排在最后" @click="toggleSort('latency')">
+                    延迟<span class="arrow">{{ sortMark("latency") }}</span>
+                  </button>
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -308,9 +385,9 @@ async function runApplyUpdate(): Promise<void> {
                 <td class="col-proto">{{ joinOrDash(localRow?.tunnels) }}</td>
                 <td class="col-nat" :title="'本机 STUN 判定（UDP）'">{{ localRow?.natType || snapshot?.natTypeUdp || "—" }}</td>
                 <td class="col-ver">{{ localRow ? releaseVersion(localRow.version) : snapshot?.coreVersion || "—" }}</td>
-                <td class="num"><span class="lat"><b>—</b></span></td>
+                <td class="num"><span class="lat"><b class="latency-unknown">—</b></span></td>
               </tr>
-              <tr v-for="node in remote" :key="node.ip">
+              <tr v-for="node in rows" :key="node.ip">
                 <td class="name">{{ node.hostname || node.ip }}</td>
                 <td class="addr">
                   <button
@@ -335,8 +412,8 @@ async function runApplyUpdate(): Promise<void> {
                 <td class="col-ver" :title="node.version">{{ releaseVersion(node.version) }}</td>
                 <td class="num">
                   <span class="lat">
-                    <b :class="node.pathKind">{{ latencyText(node.latencyMs) }}</b>
-                    <i class="bar"><i :class="node.pathKind" :style="{ width: barWidth(node) + '%' }" /></i>
+                    <b :class="latencyClassOf(node)">{{ latencyText(node.latencyMs) }}</b>
+                    <i class="bar"><i :class="latencyClassOf(node)" :style="{ width: barWidth(node) + '%' }" /></i>
                   </span>
                 </td>
               </tr>
@@ -402,7 +479,7 @@ async function runApplyUpdate(): Promise<void> {
             </li>
           </ul>
           <div v-if="!recent.length" class="empty">暂无事件。</div>
-          <footer>每 2 秒轮询 · 心跳 {{ clockTime(snapshot?.lastHeartbeat ?? 0) }}</footer>
+          <footer>每 1 秒轮询 · 心跳 {{ clockTime(snapshot?.lastHeartbeat ?? 0) }}</footer>
         </section>
       </aside>
     </div>
@@ -467,6 +544,13 @@ h1.error{color:var(--red)}
 table{width:100%;border-collapse:collapse;table-layout:auto}
 th{padding:0 12px 7px;font-size:11px;font-weight:400;color:var(--faint);text-align:left;white-space:nowrap}
 th.num{text-align:right}
+/* 表头整格是排序按钮：未排序给双向箭头，正序/倒序给单向箭头并高亮当前列；
+   三态循环见 format.ts 的 nextSort。 */
+th .sort{display:inline-flex;align-items:center;gap:3px;padding:0;border:0;background:transparent;color:inherit;font:inherit;font-size:11px;cursor:pointer}
+th .sort:hover{color:var(--ink)}
+th .sort.active{color:var(--ink);font-weight:500}
+th .sort .arrow{font-size:10px;line-height:1;color:var(--faint)}
+th .sort.active .arrow{color:var(--blue)}
 td{padding:9px 12px;vertical-align:middle}
 th:first-child,td:first-child{padding-left:0}
 th:last-child,td:last-child{padding-right:0}
@@ -492,14 +576,20 @@ tbody tr.self:hover{background:transparent}
 .col-proto,.col-nat,.col-ver{font-size:11.5px;color:var(--muted);white-space:nowrap}
 .col-ver{width:96px}
 
+/* 延迟的着色只按阈值（<50 绿、50–100 黄、≥100 红），与路径种类无关：
+   直连也可能慢、中继也可能快，两件事分别由数字颜色和「路径」列的标签表达。 */
 .lat{display:flex;flex-direction:column;align-items:flex-end;gap:4px}
-.lat b{font-size:12.5px;font-weight:500;color:var(--green)}
-.lat b.relay{color:var(--orange)}
-.lat b.route{color:var(--faint)}
-.bar{width:100%;height:2px;border-radius:1px;background:var(--line-soft);overflow:hidden}
-.bar i{display:block;height:100%;border-radius:1px;background:var(--green);transition:width .3s}
-.bar i.relay{background:var(--orange)}
-.bar i.route{background:var(--faint)}
+.lat b{font-size:12.5px;font-weight:500;color:var(--faint)}
+.lat b.latency-fast{color:var(--green)}
+.lat b.latency-medium{color:#a16207}
+.lat b.latency-slow{color:var(--red)}
+/* 轨道与填充同高同圆角：固定 4px 比原来的 2px 稳，奇数高度或非整数宽度下
+   也不会出现某些行看起来更粗。溢出裁掉，宽度仍按最大值归一。 */
+.bar{width:100%;height:4px;border-radius:2px;background:var(--line-soft);overflow:hidden}
+.bar i{display:block;height:100%;border-radius:2px;background:var(--faint);transition:width .3s}
+.bar i.latency-fast{background:var(--green)}
+.bar i.latency-medium{background:#a16207}
+.bar i.latency-slow{background:var(--red)}
 
 .tag{flex:0 0 auto;padding:1px 6px;border-radius:4px;font-size:10.5px;text-align:center;white-space:nowrap}
 .tag.direct{color:var(--green);background:#f1f8f3}

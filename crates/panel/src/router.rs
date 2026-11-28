@@ -19,8 +19,10 @@ use std::time::{Duration, Instant};
 
 /// 仪表盘查询 core 的超时（Go 的 4s）。
 const QUERY_TIMEOUT: Duration = Duration::from_secs(4);
-/// core 查询结果的缓存时长；浏览器 2 秒轮询一次，缓存正好覆盖一轮。
-const CACHE_TTL: Duration = Duration::from_secs(2);
+/// core 查询结果的缓存时长。它只用来合并同一瞬间的并发查询（多标签页、连点刷新、
+/// 一次刷新里的重入），不是给刷新频率封顶；因此必须短于前端 1 秒的轮询间隔，
+/// 否则相邻两拍会拿到同一份采样，「每秒刷新」就名不副实。
+const CACHE_TTL: Duration = Duration::from_millis(500);
 /// 设置页请求体上限（Go 的 64KiB）。
 const SETTINGS_LIMIT: usize = 64 << 10;
 /// 自启开关请求体上限（Go 的 4KiB）。
@@ -321,7 +323,7 @@ impl Router {
         })
     }
 
-    /// 查对等节点与路由表，结果按 core 实例缓存 2 秒（Go 的 queryCore）。两次查询各开
+    /// 查对等节点与路由表，结果按 core 实例缓存 CACHE_TTL（Go 的 queryCore）。两次查询各开
     /// 一个连接、并行跑，总耗时取最慢的那个。
     ///
     /// `None` 表示这一代 core 问不出来：查询失败与「拓扑确实是空的」是两件事。
@@ -557,6 +559,11 @@ mod tests {
         let at = Instant::now();
         let mut cache = Cache::default();
         cache.record(one, Some(one), at, Vec::new(), Vec::new());
+        // 缓存只是合并并发，不能盖住前端 1 秒轮询的下一拍。
+        assert!(
+            CACHE_TTL < Duration::from_secs(1),
+            "缓存时长必须短于轮询间隔"
+        );
         let almost = at + CACHE_TTL - Duration::from_millis(1);
         assert!(cache.get(one, almost).is_some());
         assert!(cache.get(one, at + CACHE_TTL).is_none());
