@@ -32,9 +32,15 @@ pub(crate) const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(20);
 /// 连接失败后的退避上限（Go：10s 起步，每次 ×1.5，最多 60s）。
 const CONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// core 活过这么久才算“这次启动成功”，否则继续放大重拉退避。
-pub(crate) const CORE_MIN_LIFETIME: Duration = Duration::from_secs(5);
+///
+/// 一分钟而不是几秒：崩溃循环里的 core 往往能就绪、再在半分钟到一分钟内倒掉
+/// （网卡创建失败约 15 秒）。判据太短等于每次崩溃都算成功，退避永远回到第一档。
+pub(crate) const CORE_HEALTHY_LIFETIME: Duration = Duration::from_secs(60);
 /// 重拉 core 的退避上限（1s 起步翻倍，最多 30s）。
 const REVIVE_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// 自动重拉的次数上限。8 次配 1/2/4/8/16/30/30/30 的退避约两分钟：够等过一次
+/// 瞬时的设备/服务抖动，又不至于让无提示的循环一直转下去。
+pub(crate) const MAX_REVIVE_ATTEMPTS: u32 = 8;
 /// 等 core 停止回复的上限。core 内部另有 5s 软停 + 3s 强杀的预算。
 const STOP_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
 /// STUN 结果的刷新间隔。
@@ -207,10 +213,18 @@ pub(crate) struct Engine {
     pub(crate) core: Option<CoreRun>,
     /// 上一代 core 就绪的时刻：重拉档位靠它判断“刚起来就死”。
     pub(crate) last_core_started_at: Option<Instant>,
-    /// 连续短命重启的档位（Go 的 `reviveAttempt`），上一代活够 5s 就回到 1。
+    /// 连续短命重启的档位（Go 的 `reviveAttempt`），上一代活够
+    /// `CORE_HEALTHY_LIFETIME` 就回到 1。
     pub(crate) revive_attempt: u32,
     pub(crate) next_gen: u64,
     pub(crate) revive: Option<Revive>,
+    /// 重拉次数用完之后的停手标记。
+    ///
+    /// 与 `revive == None` 不是一回事：没有期限也可能只是还没排。停手之后心跳、
+    /// 启动与重拉都不能再把 core 拉起来，唯一出口是 `Cmd::Reconnect`。
+    pub(crate) core_halted: bool,
+    /// core 输出的最后一行（错误行优先），停手时的 fault 文案用它说清真正的原因。
+    pub(crate) core_tail: Arc<coreline::CoreTail>,
 
     pub(crate) auth_fails: u32,
     pub(crate) update: update::UpdateState,
@@ -277,14 +291,21 @@ pub fn spawn(
     )?;
 
     // core 事件包成 Cmd::Core 投回引擎；core 输出的每一行先去掉时间戳、打码再落盘。
+    //
+    // 落盘之外还留一份最后一行：引擎看不到 core 的 stdout，崩溃循环停手时除了退出码
+    // 就只有这一句能说清“为什么起不来”，而它必须由这里顺手带出来。
     let inbox_tx = tx.clone();
     let log_for_core = Arc::clone(&log);
+    let core_tail = Arc::new(coreline::CoreTail::default());
+    let tail_for_core = Arc::clone(&core_tail);
     let core_tx = mesh_core::spawn(
         move |event| {
             let _ = inbox_tx.send(Cmd::Core(event));
         },
         move |line| {
-            log_for_core.add("core", &coreline::clean(line));
+            let cleaned = coreline::clean(line);
+            tail_for_core.observe(&cleaned);
+            log_for_core.add("core", &cleaned);
         },
     );
 
@@ -327,6 +348,8 @@ pub fn spawn(
         revive_attempt: 0,
         next_gen: 0,
         revive: None,
+        core_halted: false,
+        core_tail,
         auth_fails: 0,
         update: update::UpdateState::default(),
         next_task: 0,
@@ -495,6 +518,7 @@ impl Engine {
                     mesh_text::get(mesh_text::id::ENGINE_LOG_RECONNECT_MANUAL),
                 );
                 self.rebind();
+                self.revive_now();
             }
         }
     }
@@ -716,13 +740,39 @@ impl Engine {
         }
     }
 
-    /// 重拉 core 的退避：1s 起步翻倍，最多 30s。
+    /// 排一次重拉；次数用完就停手，把原因写进 fault 并记一行日志。
+    ///
+    /// 停手不是“恢复了”：core 没在跑，故障也还在。继续按 30s 重拉只是把同一段失败
+    /// 一遍遍刷进日志，而界面永远停在“正在重启”。到这里就结束自动重试，等人来。
     pub(crate) fn schedule_revive(&mut self, attempt: u32) {
         let attempt = attempt.max(1);
+        if attempt > MAX_REVIVE_ATTEMPTS {
+            self.revive = None;
+            self.revive_attempt = MAX_REVIVE_ATTEMPTS;
+            self.core_halted = true;
+            let msg = self.crash_loop_message();
+            self.fault = msg.clone();
+            self.logf("app", &msg);
+            return;
+        }
         self.revive = Some(Revive {
             attempt,
             due: Instant::now() + revive_backoff(attempt),
         });
+    }
+
+    /// 停手时那句完整的话：重拉次数 + core 自己最后留下的错误。
+    ///
+    /// 具体原因只有 core 知道（网卡、权限、驱动），客户端能做的就是把那一行原样带到
+    /// 用户眼前，而不是继续说“正在重启”。
+    fn crash_loop_message(&self) -> String {
+        let detail = self.core_tail.last().unwrap_or_else(|| {
+            mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_NO_OUTPUT).to_string()
+        });
+        mesh_text::format(
+            mesh_text::id::ENGINE_TEXT_CORE_CRASH_LOOP,
+            &[&MAX_REVIVE_ATTEMPTS, &detail],
+        )
     }
 
     /// 本次重拉该用第几档退避：上一代 core 活得够久才回到第一档。
@@ -730,10 +780,13 @@ impl Engine {
     /// 判据是 `last_core_started_at`（上一次**成功就绪**的时刻），不是“当前这一代”：
     /// 崩溃之后 `core` 已经被清空，拿当前代判断会把档位永远重置成 1——那正是
     /// “短命 core 把退避冲掉”的现场。
+    ///
+    /// 阈值是 `CORE_HEALTHY_LIFETIME`（60 秒）：能就绪、随后在半分钟内倒掉的 core
+    /// 仍然算这次重启失败，档位继续往上走，直到 `MAX_REVIVE_ATTEMPTS` 停手。
     pub(crate) fn next_revive_attempt(&mut self) -> u32 {
         let short_lived = self
             .last_core_started_at
-            .map(|at| at.elapsed() < CORE_MIN_LIFETIME)
+            .map(|at| at.elapsed() < CORE_HEALTHY_LIFETIME)
             .unwrap_or(false);
         self.revive_attempt = if short_lived {
             // 刚起来就死：档位只增不减，避免重启节奏被 core 自己的退出速度决定。
@@ -782,11 +835,28 @@ impl Engine {
     }
 
     /// 开始新的一轮控制面同步：在途结果作废，下一次心跳立刻发生。
+    ///
+    /// core 的重拉档位也跟着归零：换绑与“重新连接”都是用户在做一次新的开始，
+    /// 上一代身份留下的停手标记不该延续到新的一轮上，否则引擎会一直拒绝启动 core。
     pub(crate) fn rebind(&mut self) {
         self.control.gen = self.control.gen.wrapping_add(1);
         self.control.failures = 0;
         self.control.due = Some(Instant::now());
         self.last_hb = 0;
+        self.revive_attempt = 0;
+        self.core_halted = false;
+    }
+
+    /// 手动重连：清掉停手时写下的失败，立刻再排一次重拉。
+    ///
+    /// “重新连接”是崩溃循环之后唯一的恢复入口：用户按下它时网卡与权限通常已经修好，
+    /// 没有理由再等一个心跳周期或一段退避。
+    pub(crate) fn revive_now(&mut self) {
+        self.fault.clear();
+        self.revive = Some(Revive {
+            attempt: 1,
+            due: Instant::now(),
+        });
     }
 
     /// 没有身份可用：控制面不再有期限，等设置页或下一次注册。
@@ -897,7 +967,13 @@ impl Engine {
     }
 
     /// 两个平面都恢复了：上一次失败的原因不再成立。发布快照之前统一收口一次。
+    ///
+    /// 停手留下的 fault 不在此列：那里可能是“旧 core 停不掉”而 core 仍在跑，
+    /// 收口掉它会让界面在停止自动重拉之后又显示成正常。
     pub(crate) fn settle(&mut self) {
+        if self.core_halted {
+            return;
+        }
         if self.core_running() && self.control.failures == 0 && self.last_hb > 0 {
             self.fault.clear();
             self.last_error.clear();
@@ -1043,6 +1119,11 @@ impl Engine {
     /// 同样要求没有运行实例。删文件只决定下一次读哪份配置，不决定那个已经连着旧网络
     /// 的进程会退——旧数据面与当前身份的关系不能只由磁盘清理保证。
     pub(crate) fn ensure_core(&mut self) -> Result<(), String> {
+        // 停手之后到这里一律不启动：心跳、启动与重拉都走这条收敛，漏掉它
+        // “停止自动重拉”就只剩一条日志，下一轮心跳又会把 core 拉起来。
+        if self.core_halted {
+            return Ok(());
+        }
         let spec = self.desired_spec().map_err(|err| {
             mesh_text::format(mesh_text::id::ENGINE_LOG_CORE_START_FAILED, &[&err])
         })?;
@@ -1132,6 +1213,8 @@ impl Engine {
             rpc_addr,
             started_unix: 0,
         });
+        // 新的一代从空开始：上一代的最后一行不能拿来解释这一代的失败。
+        self.core_tail.clear();
         if self.core_tx.send(mesh_core::Cmd::Start(start)).is_err() {
             self.core = None;
             return Err(mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_THREAD_CLOSED).to_string());

@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
-    "test": "node --test src",
+    "test": "vitest run",
     "typecheck": "vue-tsc --noEmit",
     "preview": "vite preview"
   },
@@ -17,6 +17,7 @@
     "@vitejs/plugin-vue": "^6.0.11",
     "typescript": "6.0.3",
     "vite": "^8.3.8",
+    "vitest": "^5.1.2",
     "vue-tsc": "^3.3.14"
   }
 }

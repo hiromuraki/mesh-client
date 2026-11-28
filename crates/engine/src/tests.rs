@@ -3,8 +3,12 @@
 //! 不启动真的 easytier-core、不真的注册设备：这台机器上客户端要 UAC，而且测试应当
 //! 只验证“判断”本身。
 
+use crate::coreline::CoreTail;
 use crate::log::Log;
-use crate::run::{AuthMode, Cmd, Config, CoreRun, CoreSpec, Engine, Notice};
+use crate::run::{
+    AuthMode, Cmd, Config, CoreRun, CoreSpec, Engine, Notice, CORE_HEALTHY_LIFETIME,
+    MAX_REVIVE_ATTEMPTS,
+};
 use crate::update::{Artifact, DownloadTask, Intent, Offer, UpdateState, MAX_DOWNLOAD_ATTEMPTS};
 use crate::views::{Published, StateCell};
 use crate::Shutdown;
@@ -111,6 +115,8 @@ fn harness(tag: &str) -> Harness {
         revive_attempt: 0,
         next_gen: 0,
         revive: None,
+        core_halted: false,
+        core_tail: Arc::new(CoreTail::default()),
         auth_fails: 0,
         update: Default::default(),
         next_task: 0,
@@ -791,11 +797,163 @@ fn a_short_lived_core_grows_the_revive_backoff() {
     harness.engine.last_core_started_at = Some(Instant::now());
     assert_eq!(harness.engine.next_revive_attempt(), 2);
     assert_eq!(harness.engine.next_revive_attempt(), 3);
-    harness.engine.last_core_started_at = Some(Instant::now() - Duration::from_secs(60));
+    // 活过阈值就算这次启动成功，档位回到第一档。
+    harness.engine.last_core_started_at =
+        Some(Instant::now() - CORE_HEALTHY_LIFETIME - Duration::from_secs(1));
     assert_eq!(harness.engine.next_revive_attempt(), 1);
     harness.engine.revive_attempt = 0;
     assert_eq!(harness.engine.on_start_failed_attempt(), 1);
     assert_eq!(harness.engine.on_start_failed_attempt(), 2);
+}
+
+/// 连续短命 core：档位单调上升，退避逐档放大。这是「15 秒崩一次、1 秒后重拉」
+/// 那个现场的直接判据——崩溃之前的 core 活不过一分钟，就不能算这次重启成功。
+#[test]
+fn consecutive_short_lived_cores_grow_the_backoff_to_the_cap() {
+    let mut harness = harness("revive-growth");
+    harness.engine.last_core_started_at = Some(Instant::now());
+    let mut previous = Duration::ZERO;
+    for attempt in 1..=MAX_REVIVE_ATTEMPTS {
+        harness.engine.core = Some(running_core());
+        let scheduled_at = Instant::now();
+        harness.engine.on_core_event(mesh_core::Event::Exited {
+            gen: 1,
+            err: Some("退出码 1".to_string()),
+        });
+        assert_eq!(
+            harness.engine.revive_attempt, attempt,
+            "短命 core 的档位只能升不能回"
+        );
+        let revive = harness
+            .engine
+            .revive
+            .as_ref()
+            .expect("到上限之前每次崩溃都要排重拉");
+        assert_eq!(revive.attempt, attempt);
+        let expected = crate::run::revive_backoff(attempt);
+        let wait = revive.due.saturating_duration_since(scheduled_at);
+        assert!(
+            wait >= expected && wait < expected + Duration::from_secs(1),
+            "第 {attempt} 次应退避 {expected:?}，实际 {wait:?}"
+        );
+        assert!(
+            expected >= previous,
+            "退避不应变小：{expected:?} < {previous:?}"
+        );
+        previous = expected;
+    }
+    assert_eq!(
+        crate::run::revive_backoff(MAX_REVIVE_ATTEMPTS),
+        Duration::from_secs(30),
+        "最后一档应封顶在 30 秒"
+    );
+}
+
+/// 到上限就停手：不再排重拉，fault 说清次数与 core 自己留下的错误，界面进 error。
+#[test]
+fn a_crash_loop_stops_at_the_limit_and_reports_the_last_core_line() {
+    let mut harness = harness("crash-loop");
+    // core 的输出回调不在这条用例里跑，直接放一行它退出前留下的错误。
+    harness
+        .engine
+        .core_tail
+        .observe("ERROR tun device error err=rust tun error Failed to create adapter");
+    harness.engine.last_core_started_at = Some(Instant::now());
+
+    for _ in 0..MAX_REVIVE_ATTEMPTS {
+        harness.engine.core = Some(running_core());
+        harness.engine.on_core_event(mesh_core::Event::Exited {
+            gen: 1,
+            err: Some("退出码 1".to_string()),
+        });
+        assert!(harness.engine.revive.is_some(), "上限之前都要继续重拉");
+    }
+    assert_eq!(harness.engine.revive_attempt, MAX_REVIVE_ATTEMPTS);
+
+    // 第 MAX + 1 次崩溃踩到上限。
+    harness.engine.core = Some(running_core());
+    harness.engine.on_core_event(mesh_core::Event::Exited {
+        gen: 1,
+        err: Some("退出码 1".to_string()),
+    });
+    assert!(harness.engine.revive.is_none(), "到上限后不能再排重拉");
+    assert!(harness.engine.core_halted, "停手标记必须立起来");
+    let fault = harness.engine.fault.clone();
+    assert!(
+        fault.contains(&MAX_REVIVE_ATTEMPTS.to_string()),
+        "要说清失败了几次：{fault}"
+    );
+    assert!(
+        fault.contains("Failed to create adapter"),
+        "要带上 core 最后一行：{fault}"
+    );
+    let snapshot = harness.published();
+    assert_eq!(snapshot.status, "error");
+    assert_eq!(
+        snapshot.last_error, fault,
+        "界面上看到的是停手的原因，而不是“正在重启”"
+    );
+
+    // 心跳驱动的收敛也不能再拉起 core：否则「停止自动重拉」只是一句日志。
+    harness.engine.ensure_core_or_report();
+    harness.expect_no_core();
+}
+
+/// core 一行输出都没有时文案也要成句：不能留下一个空的“已停止自动重拉：”槽。
+#[test]
+fn a_crash_loop_without_core_output_still_reads_as_one_sentence() {
+    let mut harness = harness("crash-loop-silent");
+    harness.engine.last_core_started_at = Some(Instant::now());
+    for _ in 0..=MAX_REVIVE_ATTEMPTS {
+        harness.engine.core = Some(running_core());
+        harness
+            .engine
+            .on_core_event(mesh_core::Event::Exited { gen: 1, err: None });
+    }
+    let fault = harness.engine.fault.clone();
+    assert!(fault.contains(mesh_text::get(mesh_text::id::ENGINE_TEXT_CORE_NO_OUTPUT)));
+    assert!(!fault.contains("：；"), "空槽会读成一句病句：{fault}");
+}
+
+/// 手动重连是停手之后唯一的出口：清 fault、档位归零、立刻再拉一次。
+#[test]
+fn a_manual_reconnect_revives_a_core_after_the_crash_loop_limit() {
+    let mut harness = harness("reconnect-revive");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config);
+    harness
+        .engine
+        .store
+        .write_config("ipv4 = \"10.0.0.1/24\"\n")
+        .unwrap();
+    save_cred(&harness, "cred-1");
+
+    // 先走到停手：档位已经在最后一档，再来一次崩溃就超限。
+    harness.engine.revive_attempt = MAX_REVIVE_ATTEMPTS;
+    harness.engine.last_core_started_at = Some(Instant::now());
+    harness.engine.core = Some(running_core());
+    harness.engine.on_core_event(mesh_core::Event::Exited {
+        gen: 1,
+        err: Some("退出码 1".to_string()),
+    });
+    assert!(harness.engine.core_halted);
+    assert!(harness.engine.revive.is_none());
+
+    harness.engine.handle(Cmd::Reconnect);
+    assert!(harness.engine.fault.is_empty(), "重连要清掉停手时的失败");
+    assert_eq!(harness.engine.revive_attempt, 0, "档位归零");
+    assert!(!harness.engine.core_halted);
+    let revive = harness
+        .engine
+        .revive
+        .as_ref()
+        .expect("重连要立刻排一次重拉");
+    assert!(revive.due <= Instant::now(), "重连之后不该再等一段退避");
+
+    // 心跳另外推进，这里只看 core 的重拉。
+    harness.engine.control.due = None;
+    harness.engine.on_deadline();
+    assert!(matches!(harness.next_core(), Recorded::Start(_)));
 }
 
 #[test]
