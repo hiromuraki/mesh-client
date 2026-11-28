@@ -16,6 +16,8 @@ pub struct Snapshot {
     pub status: String,
     pub server_url: String,
     pub device_id: String,
+    /// 本机设备公钥（标准 base64）。管理员把它填进「新建设备」，认领就靠它。
+    pub pubkey: String,
     pub hostname: String,
     /// 配置里保存的设备名；空表示用本机主机名。
     pub hostname_set: String,
@@ -120,6 +122,12 @@ impl Engine {
             status: self.status().as_str().to_string(),
             server_url: String::new(),
             device_id: String::new(),
+            // 公钥在认领之前就有：它正是「把哪台设备建进控制台」的凭据。
+            pubkey: self
+                .store
+                .signing_key()
+                .map(|key| mesh_state::public_key_base64(&key))
+                .unwrap_or_default(),
             hostname: self.config.hostname.clone(),
             hostname_set: String::new(),
             config_hash: hash,

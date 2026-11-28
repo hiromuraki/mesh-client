@@ -294,12 +294,10 @@ fn configure(
     desktop: bool,
 ) -> Result<(), String> {
     let current = store.load_client().map_err(|err| err.to_string())?;
-    let given = !options.server.trim().is_empty()
-        || !options.token.trim().is_empty()
-        || !options.name.trim().is_empty();
+    let given = !options.server.trim().is_empty() || !options.name.trim().is_empty();
     if !given {
-        // 还没来得及注册不算错误：桌面模式下面板会停在设置页让用户填服务端
-        // 地址与令牌。headless 没人能填，只能直接失败。
+        // 还没来得及认领不算错误：桌面模式下面板会停在设置页让用户填服务端地址，
+        // 并把本机公钥显示给他抄进控制台。headless 没人能填，只能直接失败。
         let unregistered = current
             .as_ref()
             .map(|config| config.device_id.is_empty())
@@ -311,7 +309,6 @@ fn configure(
     }
     let mut input = mesh_engine::SettingsInput {
         server_url: options.server.trim().to_string(),
-        token: options.token.trim().to_string(),
         hostname: options.name.trim().to_string(),
     };
     if let Some(current) = current.as_ref() {

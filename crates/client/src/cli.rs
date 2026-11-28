@@ -14,7 +14,6 @@ pub(crate) struct Options {
     pub version: bool,
     pub root: Option<PathBuf>,
     pub server: String,
-    pub token: String,
     pub name: String,
     pub disable_auto_update: bool,
     /// 旧启动器在安装交接时传的一次性标记：写 `.boot-ok-<标记>` 让它确认启动。
@@ -37,7 +36,6 @@ pub(crate) fn usage() -> String {
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_VERSION)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_ROOT)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_SERVER)),
-        format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_TOKEN)),
         format!("  {}", mesh_text::get(id::CLIENT_TEXT_USAGE_NAME)),
         format!(
             "  {}",
@@ -87,7 +85,6 @@ pub(crate) fn parse(argv: &[String]) -> Result<Options, ParseError> {
             "disable-auto-update" => options.disable_auto_update = boolean(inline, name)?,
             "root" => options.root = Some(PathBuf::from(value(argv, &mut index, inline, name)?)),
             "server" => options.server = value(argv, &mut index, inline, name)?,
-            "token" => options.token = value(argv, &mut index, inline, name)?,
             "name" => options.name = value(argv, &mut index, inline, name)?,
             // 一次性兼容：旧启动器在安装交接时会传 `--boot-check <标记>`，它在等
             // `.boot-ok-<标记>` 这个文件；不写它，旧启动器会判定新版起不来并回滚。
@@ -179,7 +176,6 @@ mod tests {
             "S:\\mesh",
             "--server",
             "http://10.8.0.1:8088",
-            "--token=t",
             "--name",
             "laptop",
             "--disable-auto-update",
@@ -188,7 +184,6 @@ mod tests {
         assert!(options.headless);
         assert_eq!(options.root, Some(PathBuf::from("S:\\mesh")));
         assert_eq!(options.server, "http://10.8.0.1:8088");
-        assert_eq!(options.token, "t");
         assert_eq!(options.name, "laptop");
         assert!(options.disable_auto_update);
     }
@@ -221,6 +216,12 @@ mod tests {
         assert!(matches!(
             parse(&argv(&["--nope"])),
             Err(ParseError::Invalid(message)) if message.contains("未知参数")
+        ));
+        // 注册令牌整套删掉了：`--token` 不再是参数，而是明确的参数错误，
+        // 旧脚本不该以为它还在生效。
+        assert!(matches!(
+            parse(&argv(&["--token", "abc"])),
+            Err(ParseError::Invalid(message)) if message.contains("token")
         ));
     }
 
@@ -281,13 +282,16 @@ mod tests {
             "--version",
             "--root",
             "--server",
-            "--token",
             "--name",
             "--disable-auto-update",
             "--help",
         ] {
             assert!(text.contains(flag), "帮助里少了 {flag}");
         }
+        assert!(
+            !text.contains("--token"),
+            "帮助里不该再有已删除的令牌参数：{text}"
+        );
         assert!(text.contains(env!("MESH_CLIENT_BUILD_VERSION")));
     }
 }

@@ -10,6 +10,8 @@ export interface Snapshot {
   status: Status | "";
   serverUrl: string;
   deviceId: string;
+  /** 本机设备公钥（标准 base64）：填进控制台「新建设备」的就是它。 */
+  pubkey: string;
   hostname: string;
   hostnameSet: string;
   configHash: string;
@@ -91,6 +93,5 @@ export interface LogLine {
 
 export interface SettingsInput {
   serverUrl: string;
-  token: string;
   hostname: string;
 }

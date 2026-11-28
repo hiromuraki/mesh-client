@@ -380,7 +380,6 @@ impl Router {
         };
         let input = SettingsInput {
             server_url: body.server_url,
-            token: body.token,
             hostname: body.hostname,
         };
         let (reply_tx, reply_rx) = channel();
@@ -477,7 +476,6 @@ struct Dashboard<'a> {
 #[serde(rename_all = "camelCase", default)]
 struct SettingsBody {
     server_url: String,
-    token: String,
     hostname: String,
 }
 

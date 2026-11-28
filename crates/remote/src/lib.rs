@@ -93,19 +93,37 @@ impl Client {
         }
     }
 
-    /// `POST /api/v1/register`：用一次性 token 绑定设备（首次注册不带签名）。
+    /// `POST /api/v1/register`：认领槽位。服务端按公钥找到槽位，签名证明本机
+    /// 持有对应的私钥——没有可转交的令牌，所以注册与心跳用同一把钥匙、同一套签名。
     pub fn register(
         &self,
-        token: &str,
         hostname: &str,
         pubkey_b64: &str,
         timeout: Duration,
     ) -> Result<RegisterReply, Error> {
+        let timestamp = unix_now().to_string();
+        let nonce = random_hex(16)?;
+        let platform_id = platform::id();
+        // 注册请求没有配置与版本信息，签名里这两行留空。
+        let message = signing_string(
+            "POST",
+            "/api/v1/register",
+            &self.device_id,
+            &timestamp,
+            &nonce,
+            platform_id,
+            "",
+            "",
+        );
+        let signature = BASE64.encode(self.key.sign(message.as_bytes()).to_bytes());
         let body = serde_json::json!({
-            "token": token,
             "deviceId": self.device_id,
             "hostname": hostname,
             "pubkey": pubkey_b64,
+            "timestamp": timestamp,
+            "nonce": nonce,
+            "signature": signature,
+            "platform": platform_id,
         })
         .to_string();
         let response = post(&self.url("/api/v1/register"), &body, timeout)?;
@@ -665,7 +683,7 @@ mod tests {
             r#"{"code":"device_limit","message":"设备数已达上限"}"#.as_bytes(),
         )]);
         let error = client(&stub.base_url)
-            .register("token", "laptop", "pubkey", timeout())
+            .register("laptop", "pubkey", timeout())
             .unwrap_err();
         match error {
             Error::Api {
@@ -683,22 +701,54 @@ mod tests {
 
     #[test]
     fn register_sends_the_expected_fields() {
+        // 注册没有令牌可交：请求体里是设备 id、主机名与公钥，外加一次性 nonce 与
+        // 对同一套原文的签名。公钥就是签名私钥对应的那一把。
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey = BASE64.encode(key.verifying_key().to_bytes());
         let stub = Stub::new(vec![response(
             200,
             &[],
             br#"{"deviceId":"d1","configToml":"hostname = \"x\"","configHash":"h1"}"#,
         )]);
         let reply = client(&stub.base_url)
-            .register("token-1", "laptop", "pubkey-b64", timeout())
+            .register("laptop", &pubkey, timeout())
             .unwrap();
         assert_eq!(reply.device_id, "d1");
         assert_eq!(reply.config_hash, "h1");
         assert_eq!(reply.config_toml, "hostname = \"x\"");
+        let captured = stub.captured.lock().unwrap();
+        assert_eq!(captured[0].request_line, "POST /api/v1/register HTTP/1.1");
+        drop(captured);
         let body = stub.last_body();
-        assert_eq!(body["token"], "token-1");
-        assert_eq!(body["hostname"], "laptop");
-        assert_eq!(body["pubkey"], "pubkey-b64");
+        assert!(
+            body.get("token").is_none(),
+            "注册请求里不该再有令牌: {body}"
+        );
         assert_eq!(body["deviceId"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(body["hostname"], "laptop");
+        assert_eq!(body["pubkey"], pubkey.as_str());
+        assert_eq!(body["platform"], platform::id());
+        let nonce = body["nonce"].as_str().unwrap();
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+        let timestamp = body["timestamp"].as_str().unwrap();
+        assert!(timestamp.parse::<u64>().unwrap() > 1_700_000_000);
+        // 注册请求没有配置与版本信息：签名原文的最后两行留空。
+        let message = signing_string(
+            "POST",
+            "/api/v1/register",
+            body["deviceId"].as_str().unwrap(),
+            timestamp,
+            nonce,
+            body["platform"].as_str().unwrap(),
+            "",
+            "",
+        );
+        let signature = BASE64.decode(body["signature"].as_str().unwrap()).unwrap();
+        let signature = ed25519_dalek::Signature::from_slice(&signature).unwrap();
+        key.verifying_key()
+            .verify(message.as_bytes(), &signature)
+            .unwrap();
     }
 
     #[test]

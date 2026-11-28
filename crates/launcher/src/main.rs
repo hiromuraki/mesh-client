@@ -97,11 +97,11 @@ fn root_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| mesh_text::get(mesh_text::id::LAUNCHER_ERROR_INSTALL_DIR).to_string())
 }
 
-/// launch_installed 在 Windows 上清理、选槽、拉起客户端，确认它提交了
-/// `bin/current` 之后放手：客户端是独立进程，启动器退出。
+/// launch_installed 是 Windows 的普通启动：清理、选槽、拉起选中的槽，随即放手。
 ///
-/// 与安装入口同一个出口（`install::Owner::boot_current`）：先清理与选槽，再拉起，
-/// 再等确认。
+/// 不等启动确认：`bin/current` 本来就指着这个槽（缺失或无效时刚被修复写指着），
+/// 确认恒为真；确认只属于安装路径（拉起候选槽、等它提交）。客户端是独立进程，
+/// 启动器不观察它的结果。
 #[cfg(windows)]
 fn launch_installed(root: &Path) -> Result<i32, String> {
     install::launch_installed(root)?;

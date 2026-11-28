@@ -2181,11 +2181,11 @@ fn registering_persists_the_identity_and_leaves_activation_to_the_loop() {
     let reply = r#"{"deviceId":"d-server","configToml":"hostname = \"laptop\"\nipv4 = \"10.0.0.1/24\"\n","configHash":"h1"}"#;
     let stub = Stub::new(vec![(200, reply.as_bytes().to_vec())]);
     let mut harness = harness("register");
+    let pubkey = mesh_state::public_key_base64(&harness.engine.store.signing_key().unwrap());
     harness
         .engine
         .save_settings(crate::SettingsInput {
             server_url: stub.url.clone(),
-            token: "token-1".to_string(),
             hostname: "laptop".to_string(),
         })
         .unwrap();
@@ -2193,15 +2193,22 @@ fn registering_persists_the_identity_and_leaves_activation_to_the_loop() {
     assert_eq!(client.device_id, "d-server");
     assert_eq!(client.server_url, stub.url);
     assert!(client.created_at > 0);
+    // 认领成功才 bind：身份已经落盘，快照随之报出这一代。
+    assert_eq!(harness.engine.snapshot().device_id, "d-server");
     assert_eq!(harness.engine.snapshot().status, "connecting");
     assert!(harness.engine.store.read_config().unwrap().is_none());
     assert!(harness.engine.store.load_credential().unwrap().is_none());
     let requests = stub.requests.lock().unwrap();
     assert_eq!(requests[0].0, "POST /api/v1/register HTTP/1.1");
     let body = String::from_utf8_lossy(&requests[0].1);
-    assert!(body.contains("\"token\":\"token-1\""), "body = {body}");
+    assert!(!body.contains("\"token\""), "注册请求里不该有令牌: {body}");
     assert!(body.contains("\"hostname\":\"laptop\""), "body = {body}");
-    assert!(body.contains("\"pubkey\":"), "body = {body}");
+    // 请求里的公钥必须就是本机私钥对应的那一把：管理员把它填进「新建设备」。
+    assert!(
+        body.contains(&format!("\"pubkey\":\"{pubkey}\"")),
+        "body = {body}"
+    );
+    assert!(body.contains("\"signature\":"), "body = {body}");
 }
 
 #[test]
@@ -2219,7 +2226,6 @@ fn a_registered_identity_is_activated_by_a_plain_heartbeat() {
         .engine
         .save_settings(crate::SettingsInput {
             server_url: stub.url.clone(),
-            token: "token-1".to_string(),
             hostname: "laptop".to_string(),
         })
         .unwrap();
@@ -2268,7 +2274,6 @@ fn switching_the_control_plane_drops_the_previous_generation() {
         .engine
         .save_settings(crate::SettingsInput {
             server_url: stub.url.clone(),
-            token: "token-1".to_string(),
             hostname: String::new(),
         })
         .unwrap();
@@ -2293,6 +2298,9 @@ fn switching_the_control_plane_drops_the_previous_generation() {
 /// 清理失败就是这次保存失败：不留下「新身份配旧配置」的一代。
 #[test]
 fn a_failed_generation_cleanup_keeps_the_old_identity() {
+    // 认领先成功：这里要验的是「认领成功、清理失败」这一刻。
+    let reply = br#"{"deviceId":"same-id","configToml":"","configHash":""}"#;
+    let stub = Stub::new(vec![(200, reply.to_vec())]);
     let mut harness = harness("switch-cleanup-fails");
     harness
         .engine
@@ -2310,8 +2318,7 @@ fn a_failed_generation_cleanup_keeps_the_old_identity() {
     let err = harness
         .engine
         .save_settings(crate::SettingsInput {
-            server_url: "http://127.0.0.1:8".to_string(),
-            token: String::new(),
+            server_url: stub.url.clone(),
             hostname: String::new(),
         })
         .unwrap_err();
@@ -2324,6 +2331,9 @@ fn a_failed_generation_cleanup_keeps_the_old_identity() {
 /// 旧一代的身份与配置原样留着，下一轮心跳仍按同一份身份收敛。
 #[test]
 fn a_failed_generation_cleanup_stops_the_old_data_plane_first() {
+    // 认领先成功：这里要验的是「认领成功、清理失败」这一刻。
+    let reply = br#"{"deviceId":"dev-1","configToml":"","configHash":""}"#;
+    let stub = Stub::new(vec![(200, reply.to_vec())]);
     let mut harness = harness("switch-cleanup-fails-core");
     let config = saved_client(&harness);
     harness.engine.client = Some(config);
@@ -2341,8 +2351,7 @@ fn a_failed_generation_cleanup_stops_the_old_data_plane_first() {
     let err = harness
         .engine
         .save_settings(crate::SettingsInput {
-            server_url: "http://127.0.0.1:8".to_string(),
-            token: String::new(),
+            server_url: stub.url.clone(),
             hostname: String::new(),
         })
         .unwrap_err();
@@ -2403,6 +2412,9 @@ fn an_interrupted_generation_switch_stops_the_running_core() {
 /// 什么都不启动，旧一代的配置、凭据与认证失败计数一起作废。
 #[test]
 fn rebinding_to_another_control_plane_stops_the_running_core() {
+    // 保存即认领：新控制面必须先应下这次认领，换绑才会走到清理这一步。
+    let reply = br#"{"deviceId":"dev-1","configToml":"","configHash":""}"#;
+    let stub = Stub::new(vec![(200, reply.to_vec())]);
     let mut harness = harness("rebind-stop");
     let config = saved_client(&harness);
     harness.engine.client = Some(config);
@@ -2418,8 +2430,7 @@ fn rebinding_to_another_control_plane_stops_the_running_core() {
     harness
         .engine
         .save_settings(crate::SettingsInput {
-            server_url: "http://127.0.0.1:2".to_string(),
-            token: String::new(),
+            server_url: stub.url.clone(),
             hostname: String::new(),
         })
         .unwrap();
@@ -2447,7 +2458,7 @@ fn rebinding_to_another_control_plane_stops_the_running_core() {
             .unwrap()
             .unwrap()
             .server_url,
-        "http://127.0.0.1:2"
+        stub.url
     );
     assert_eq!(harness.engine.auth_fails, 0, "认证失败计数属于上一代");
 }
@@ -2514,7 +2525,6 @@ fn re_registering_on_the_same_control_plane_keeps_the_local_state() {
         .engine
         .save_settings(crate::SettingsInput {
             server_url: stub.url.clone(),
-            token: "token-2".to_string(),
             hostname: String::new(),
         })
         .unwrap();
@@ -2527,13 +2537,33 @@ fn re_registering_on_the_same_control_plane_keeps_the_local_state() {
         harness.engine.store.load_credential().unwrap().unwrap().id,
         "cred-kept"
     );
+    // created_at 是「这台设备第一次被接受」的时刻，再次认领不该刷新它。
+    assert_eq!(
+        harness
+            .engine
+            .store
+            .load_client()
+            .unwrap()
+            .unwrap()
+            .created_at,
+        1
+    );
 }
 
 /// 设备名是 core 的启动参数：规格变了就换进程，没变就不动。
 #[test]
 fn changing_the_device_name_replaces_the_core() {
+    // 两次保存都要认领成功；控制面地址与设备 id 不变，换的只是设备名。
+    let reply = br#"{"deviceId":"dev-1","configToml":"","configHash":""}"#;
+    let stub = Stub::new(vec![(200, reply.to_vec()), (200, reply.to_vec())]);
     let mut harness = harness("settings-hostname");
-    let config = saved_client_named(&harness, "old");
+    let config = ClientConfig {
+        server_url: stub.url.clone(),
+        device_id: "dev-1".to_string(),
+        hostname: "old".to_string(),
+        created_at: 1_700_000_000,
+    };
+    harness.engine.store.save_client(&config).unwrap();
     harness
         .engine
         .store
@@ -2546,8 +2576,7 @@ fn changing_the_device_name_replaces_the_core() {
     harness
         .engine
         .save_settings(crate::SettingsInput {
-            server_url: "http://127.0.0.1:1".to_string(),
-            token: String::new(),
+            server_url: stub.url.clone(),
             hostname: "new".to_string(),
         })
         .unwrap();
@@ -2564,26 +2593,68 @@ fn changing_the_device_name_replaces_the_core() {
     harness
         .engine
         .save_settings(crate::SettingsInput {
-            server_url: "http://127.0.0.1:1".to_string(),
-            token: String::new(),
+            server_url: stub.url.clone(),
             hostname: "new".to_string(),
         })
         .unwrap();
     harness.expect_no_core();
 }
 
+/// 保存设置就是认领：没有令牌可交，也没有「已有身份就只存本地」这支。认领被拒时
+/// 磁盘与进程里的身份都不动——写一半再回滚，等于让 core 拿一代不存在的身份去连。
 #[test]
-fn saving_without_a_token_needs_an_existing_identity() {
-    let mut harness = harness("settings-no-token");
+fn a_failed_claim_writes_nothing() {
+    let stub = Stub::new(vec![(401, br#"{"code":"unauthorized"}"#.to_vec())]);
+    let mut harness = harness("settings-claim-fails");
+    let config = saved_client(&harness);
+    harness.engine.client = Some(config.clone());
+
     let err = harness
         .engine
         .save_settings(crate::SettingsInput {
-            server_url: "http://10.0.0.1:8088".to_string(),
-            token: String::new(),
-            hostname: String::new(),
+            server_url: stub.url.clone(),
+            hostname: "laptop".to_string(),
         })
         .unwrap_err();
-    assert!(err.contains("尚未注册"), "err = {err}");
+    assert_eq!(
+        err,
+        mesh_text::get(mesh_text::id::ENGINE_TEXT_DEVICE_NOT_CLAIMED),
+        "认领被拒要报「控制台还不认这把公钥」"
+    );
+    assert_eq!(
+        harness.engine.store.load_client().unwrap().unwrap(),
+        config,
+        "认领失败不能动磁盘上的身份（含 created_at）"
+    );
+    assert_eq!(
+        harness.engine.client.as_ref().unwrap(),
+        &config,
+        "认领失败不能换掉进程里的身份"
+    );
+    assert!(harness.engine.store.read_config().unwrap().is_none());
+    assert!(harness.engine.store.load_credential().unwrap().is_none());
+    assert_eq!(
+        harness.engine.snapshot().server_url,
+        config.server_url,
+        "失败的那次保存不能出现在快照里"
+    );
+    harness.expect_no_core();
+    assert_eq!(stub.requests.lock().unwrap().len(), 1, "失败只发一次认领");
+}
+
+/// 设置页显示的公钥就是本机私钥对应的那一把：认领之前它已经存在，管理员正是
+/// 照着它把设备建进控制台。
+#[test]
+fn the_snapshot_shows_the_public_key_of_the_local_private_key() {
+    let mut harness = harness("settings-pubkey");
+    let key = harness.engine.store.signing_key().unwrap();
+    let snapshot = harness.published();
+    assert_eq!(
+        snapshot.pubkey,
+        mesh_state::public_key_base64(&key),
+        "快照里的公钥必须与本机私钥配对"
+    );
+    assert!(!snapshot.pubkey.is_empty(), "没有身份时也要有公钥");
 }
 
 // ------------------------------------------------------------ 下载交接

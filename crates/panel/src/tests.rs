@@ -18,6 +18,8 @@ fn published() -> Published {
             status: "online".into(),
             server_url: "http://10.126.126.1:8088".into(),
             device_id: "abc123".into(),
+            // 管理面板只在设置页显示它：这是「把本机建进控制台」的凭据。
+            pubkey: "ZGV2aWNlLXB1YmxpYy1rZXk=".into(),
             hostname: "laptop".into(),
             config_hash: "deadbeef".into(),
             core_path_used: "/opt/mesh/bin/easytier-core".into(),
@@ -280,6 +282,8 @@ fn snapshot_uses_the_frontend_field_names() {
     assert_eq!(body["status"], "online");
     assert_eq!(body["serverUrl"], "http://10.126.126.1:8088");
     assert_eq!(body["deviceId"], "abc123");
+    // 公钥是认领的唯一凭据：字段名与前端 Snapshot 一致，设置页要拿得到。
+    assert_eq!(body["pubkey"], "ZGV2aWNlLXB1YmxpYy1rZXk=");
     assert_eq!(body["corePid"], 42);
     assert_eq!(body["localIp"], "10.126.126.100/24");
     // publicIps 必须是数组而不是 null（前端类型是 string[]）。
@@ -368,7 +372,6 @@ fn settings_are_forwarded_to_the_engine() {
     let engine = std::thread::spawn(move || match rx.recv().expect("收到命令") {
         Cmd::Settings(input, reply) => {
             assert_eq!(input.server_url, "http://10.126.126.1:8088");
-            assert_eq!(input.token, "tok");
             assert_eq!(input.hostname, "laptop");
             let _ = reply.send(Ok(Snapshot {
                 device_id: "new-id".into(),
@@ -378,8 +381,7 @@ fn settings_are_forwarded_to_the_engine() {
         _ => panic!("应当是 Cmd::Settings"),
     });
     let mut req = request("PUT", "/api/settings");
-    req.body =
-        br#"{"serverUrl":"http://10.126.126.1:8088","token":"tok","hostname":"laptop"}"#.to_vec();
+    req.body = br#"{"serverUrl":"http://10.126.126.1:8088","hostname":"laptop"}"#.to_vec();
     let response = router.handle(req);
     assert_eq!(response.status, 200);
     assert_eq!(body_json(&response)["deviceId"], "new-id");
@@ -407,15 +409,15 @@ fn settings_report_the_engine_error_as_400() {
     let (router, rx) = router();
     let engine = std::thread::spawn(move || match rx.recv().expect("收到命令") {
         Cmd::Settings(_, reply) => {
-            let _ = reply.send(Err("token 无效或已过期".to_string()));
+            let _ = reply.send(Err("控制台还不认这把公钥".to_string()));
         }
         _ => panic!("应当是 Cmd::Settings"),
     });
     let mut req = request("PUT", "/api/settings");
-    req.body = br#"{"serverUrl":"http://x","token":"bad"}"#.to_vec();
+    req.body = br#"{"serverUrl":"http://x","hostname":"laptop"}"#.to_vec();
     let response = router.handle(req);
     assert_eq!(response.status, 400);
-    assert_eq!(body_json(&response)["error"], "token 无效或已过期");
+    assert_eq!(body_json(&response)["error"], "控制台还不认这把公钥");
     engine.join().expect("引擎替身");
 }
 

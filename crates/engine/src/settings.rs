@@ -1,6 +1,8 @@
-//! 设置页的两个动作：注册/保存设置、删除本地配置。
+//! 设置页的两个动作：认领（注册）、删除本地配置。
 //!
-//! 注册是唯一需要 token 的路径；`device_id` 由客户端先随机生成、服务端接受后以响应为准。
+//! 认领不需要任何共享秘密：本机先有 Ed25519 密钥，公钥显示在设置页，管理员把它填进
+//! 「新建设备」；保存设置就是拿这把钥匙去签名认领。`device_id` 由客户端先随机生成，
+//! 服务端接受后以响应为准。
 
 use crate::clock;
 use crate::run::Engine;
@@ -12,7 +14,6 @@ use std::time::Duration;
 #[derive(Debug, Clone, Default)]
 pub struct SettingsInput {
     pub server_url: String,
-    pub token: String,
     pub hostname: String,
 }
 
@@ -26,16 +27,15 @@ impl Engine {
         }
     }
 
-    /// 处理设置页提交：有 token 则注册，否则保存配置并重启连接。
+    /// 处理设置页提交：先向控制面认领，认领成功再写盘。
     ///
-    /// 注册分两半：**服务端接受**（token 就此用掉）与**本地激活**。只有前一半
-    /// 能退回设置页重填 token；后一半失败只记录，身份已经在盘上，连接循环按同一份
-    /// 身份继续重试。
+    /// 没有「先存本地、回头再说」的分支：认领是唯一让设置生效的路径，而配置只能从
+    /// 控制面拿到。认领失败留在设置页重试，磁盘上的身份与凭据一个都不动——写一半
+    /// 再回滚，等于让 core 拿着一代不存在的身份去连。
     pub(crate) fn save_settings(&mut self, input: SettingsInput) -> Result<(), String> {
         let server_url = normalize_server_url(&input.server_url)?;
         // 留空表示用本机主机名，不把当前主机名固化进配置。
         let hostname = input.hostname.trim().to_string();
-        let token = input.token.trim().to_string();
 
         let current = self.store.load_client().map_err(|err| err.to_string())?;
         let key = self.store.signing_key().map_err(|err| err.to_string())?;
@@ -49,39 +49,26 @@ impl Engine {
             config.device_id = current.device_id.clone();
             config.created_at = current.created_at;
         }
-
-        if !token.is_empty() {
-            if config.device_id.is_empty() {
-                config.device_id = new_device_id();
-            }
-            let api = remote::Client::new(&config.server_url, &config.device_id, key.clone());
-            let pubkey = public_key_base64(&key);
-            let hostname_used = self.effective_hostname(&config);
-            let reply = api
-                .register(&token, &hostname_used, &pubkey, Duration::from_secs(30))
-                .map_err(|err| register_error(&err))?;
-            if !reply.device_id.is_empty() {
-                config.device_id = reply.device_id;
-            }
-            config.created_at = clock::unix_now();
-            // 注册成功即已消耗 token：身份必须立刻落盘。
-            self.bind(config.clone(), current.as_ref())?;
-            self.logf(
-                "app",
-                &mesh_text::format(mesh_text::id::ENGINE_LOG_REGISTERED, &[&config.device_id]),
-            );
-            return Ok(());
-        }
-
         if config.device_id.is_empty() {
-            return Err(
-                mesh_text::get(mesh_text::id::ENGINE_TEXT_NOT_REGISTERED_TOKEN).to_string(),
-            );
+            config.device_id = new_device_id();
         }
-        self.bind(config, current.as_ref())?;
+        let api = remote::Client::new(&config.server_url, &config.device_id, key.clone());
+        let pubkey = public_key_base64(&key);
+        let hostname_used = self.effective_hostname(&config);
+        let reply = api
+            .register(&hostname_used, &pubkey, Duration::from_secs(30))
+            .map_err(|err| register_error(&err))?;
+        if !reply.device_id.is_empty() {
+            config.device_id = reply.device_id;
+        }
+        // created_at 是「这台设备第一次被接受」的时刻，之后的每次保存不改它。
+        if config.created_at == 0 {
+            config.created_at = clock::unix_now();
+        }
+        self.bind(config.clone(), current.as_ref())?;
         self.logf(
             "app",
-            mesh_text::get(mesh_text::id::ENGINE_LOG_SETTINGS_SAVED),
+            &mesh_text::format(mesh_text::id::ENGINE_LOG_REGISTERED, &[&config.device_id]),
         );
         Ok(())
     }
@@ -208,10 +195,10 @@ fn normalize_server_url(raw: &str) -> Result<String, String> {
 fn register_error(err: &remote::Error) -> String {
     match err {
         remote::Error::Unauthorized { .. } => {
-            mesh_text::get(mesh_text::id::ENGINE_TEXT_TOKEN_INVALID).to_string()
+            mesh_text::get(mesh_text::id::ENGINE_TEXT_DEVICE_NOT_CLAIMED).to_string()
         }
         remote::Error::Api { status: 401, .. } => {
-            mesh_text::get(mesh_text::id::ENGINE_TEXT_TOKEN_INVALID).to_string()
+            mesh_text::get(mesh_text::id::ENGINE_TEXT_DEVICE_NOT_CLAIMED).to_string()
         }
         remote::Error::Api {
             status: 409,

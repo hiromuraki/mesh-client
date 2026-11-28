@@ -7,9 +7,10 @@ const { snapshot } = useClient();
 
 const DEFAULT_SERVER_URL = "http://127.0.0.1:8088";
 
-const form = reactive({ serverUrl: "", token: "", hostname: "" });
+const form = reactive({ serverUrl: "", hostname: "" });
 const message = reactive({ text: "", kind: "" as "" | "ok" | "error" });
 const saving = ref(false);
+const copied = ref(false);
 
 // 表单只回填一次：之后由用户输入驱动，轮询不会把正在输入的内容覆盖掉。
 let filled = false;
@@ -18,7 +19,20 @@ function fill(next: { serverUrl: string; hostname: string } | null): void {
   if (!next) return;
   form.serverUrl = next.serverUrl || DEFAULT_SERVER_URL;
   form.hostname = next.hostname;
-  form.token = "";
+}
+
+// 本机公钥是认领的唯一凭证，但它不是秘密：抄进控制台、发给自己都行。
+async function onCopyPubkey(): Promise<void> {
+  const key = snapshot.value?.pubkey || "";
+  if (!key) return;
+  try {
+    await navigator.clipboard.writeText(key);
+    copied.value = true;
+    window.setTimeout(() => (copied.value = false), 1500);
+  } catch {
+    message.kind = "error";
+    message.text = "复制失败，请手动选中公钥";
+  }
 }
 
 watch(
@@ -62,11 +76,11 @@ async function onAutostart(event: Event): Promise<void> {
   }
 }
 
-// 删除本地配置是不可逆的：删掉下发的 config.toml 与设备身份，要重新用 token 注册。
+// 删除本地配置是不可逆的：删掉下发的 config.toml 与设备身份，要重新认领。
 // 放在设置页最底部，和数据页的日常操作分开。
 async function onReset(): Promise<void> {
   const ok = window.confirm(
-    "删除本地配置？\n\n会断开连接、删除下发的 config.toml，并清空设备身份；需要重新用 token 注册。\n服务端上的设备记录不会被删除。",
+    "删除本地配置？\n\n会断开连接、删除下发的 config.toml，并清空设备身份；需要重新认领（公钥不变，控制台那边不用改）。\n服务端上的设备记录不会被删除。",
   );
   if (!ok) return;
   message.kind = "";
@@ -86,7 +100,6 @@ async function onSave(): Promise<void> {
   try {
     const next = await saveSettings({
       serverUrl: form.serverUrl,
-      token: form.token,
       hostname: form.hostname,
     });
     fill({ serverUrl: next.serverUrl, hostname: next.hostnameSet });
@@ -115,9 +128,14 @@ async function onSave(): Promise<void> {
           <span class="note">管理页所在地址</span>
         </div>
         <div class="field">
-          <label for="token">注册令牌</label>
-          <input id="token" v-model="form.token" type="password" placeholder="粘贴管理页生成的 token" autocomplete="off" />
-          <span class="note">首次注册用，注册成功后即可留空</span>
+          <label>本机公钥</label>
+          <div class="copy">
+            <code>{{ snapshot?.pubkey || "…" }}</code>
+            <button type="button" :disabled="!snapshot?.pubkey" @click="onCopyPubkey">
+              {{ copied ? "已复制" : "复制" }}
+            </button>
+          </div>
+          <span class="note">填进控制台「新建设备」；换机或私钥丢失后在那边用「换钥匙」重新填</span>
         </div>
       </section>
 
@@ -148,7 +166,7 @@ async function onSave(): Promise<void> {
       <section class="card danger">
         <header>
           <h2>删除本地配置</h2>
-          <p>删掉下发的 config.toml 与设备身份，需要重新用 token 注册。服务端的设备记录不受影响。</p>
+          <p>删掉下发的 config.toml 与设备身份，之后用同一把公钥重新认领。服务端的设备记录不受影响。</p>
         </header>
         <div class="row">
           <span class="mono">{{ snapshot?.deviceId || "尚未注册" }}</span>

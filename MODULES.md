@@ -87,8 +87,9 @@ pub mod id { pub const STATE_ERROR_IO: &str = "state.error.io"; /* …… */ }
 ```rust
 pub mod layout {
     pub const BIN: &str = "bin";            // 槽的父目录；其余：SLOT_ALICE、SLOT_BOB、CURRENT、
-                                            //       UPDATE_FILE、FAILURES、LOCK、INSTALL_LOCK、
-                                            //       LAUNCHER_VERSION、MANIFEST
+                                            //       UPDATE_FILE、UPDATE_DIGEST、FAILURES、LOCK、
+                                            //       INSTALL_LOCK、LAUNCHER_VERSION、MANIFEST、
+                                            //       CONFIG、LOG
     pub fn slot_name(name: &str) -> Option<&'static str>;   // 只做 ASCII 小写比较，认 alice / bob
     pub fn slot_dir(root: &Path, slot: &str) -> PathBuf;     // <root>/bin/<槽>
     pub fn read_current(root: &Path) -> Option<&'static str>; // trim 后只认规范槽名
@@ -103,18 +104,29 @@ pub mod version { pub fn parse(text: &str) -> Option<Version>; pub fn valid(text
 pub mod failures { pub struct Failures; /* load/record/clear/count/exhausted，留下最新 5 个版本 */ }
 pub mod lock {
     pub struct Lock;                                          // 进程退出即释放（LockFileEx / flock）
-    pub fn acquire(path: &Path) -> Result<Lock, Error>;       // 已被占用 → Error::AlreadyRunning
-    pub fn path(root: &Path) -> PathBuf;                      // instance.lock：这份 config 的客户端
-    pub fn owner_path(root: &Path) -> PathBuf;                // install.lock：安装根的写权
+    pub fn acquire(path: &Path) -> Result<Lock, Error>;       // 模块级函数；已被占用 → Error::AlreadyRunning
+    impl Lock {
+        pub fn path(root: &Path) -> PathBuf;                  // instance.lock：这份 config 的客户端
+        pub fn owner_path(root: &Path) -> PathBuf;            // install.lock：安装根的写权
+    }
 }
 pub mod platform { pub fn client_exe() -> &'static str; pub fn launcher_name() -> &'static str;
                    pub fn core_name() -> &'static str; pub fn id() -> &'static str; } // "windows/amd64"
-pub mod manifest { pub struct Manifest { version, slot, platform, files, signature }
+pub mod manifest { pub const MANIFEST_BYTES: u64;   // 64 KiB：包里的与已安装槽里的同一个上限
+                   pub struct Manifest;              // version / slot / platform / files / signature，字段私有
+                   impl Manifest { version() -> &str; slot() -> &str; platform() -> &str;
+                                   files() -> &BTreeMap<String, String>;
+                                   parse(text: &str) -> Result<Manifest, String>;  // 解析即校验合法域
+                                   verify() -> bool; verify_with(public_hex: &str) -> bool; }
                    pub fn read(path: &Path) -> Result<Manifest, Error>;   // 字段缺一即解析失败
-                   pub fn parse(text: &str) -> Result<Manifest, String>;
                    pub fn is_plain_file_name(name: &str) -> bool; }       // 清单键与包内条目名同一判据
+pub mod artifact { pub fn is_full_digest(value: &str) -> bool;   // 64 位十六进制
+                    pub fn digest(path: &Path) -> io::Result<String>;
+                    pub fn digest_file(path: &Path) -> Option<String>;
+                    pub fn matches(path: &Path, want: &str) -> bool; }
 pub mod signing {
     pub const RELEASE_PUBLIC_KEY: &str;
+    pub const SLOT_CLIENT: &str; pub const SLOT_LAUNCHER: &str;            // 签名串里的槽位名
     pub fn signing_string(slot, platform, version, sha256) -> String;      // MESH3，签包
     pub fn manifest_string(slot, platform, version, files_digest) -> String; // MESH4，签清单
     pub fn files_digest(files: &BTreeMap<String, String>) -> String;
@@ -323,41 +335,59 @@ pub struct Panel { pub url: String }   // 不持有 join handle：关闭就是�
 
 ### 3.9 `mesh-launcher`（bin `mesh`）
 
-**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽），带 `--file`/`--url` 是 `Install`（装进候选槽）。Linux 上还消费 `<安装根>/update.tar.zst` 与它的 `.sha256`：先比对摘要，再解包。改动安装根的动作全部在 `Owner` 之内：确认成功后删旧槽（选槽时不删任何槽）、解包、校验、拉起、等 `current` 确认。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
+**职责**：安装根的写者。两条命令：不带安装参数是 `Launch`（拉起 `bin/current` 选中的槽，随即放手，不观察结果），带 `--file` / `--url` 是 `Install`（装进候选槽，拉起并等它提交 `bin/current`）。Linux 上还消费 `<安装根>/update.tar.zst` 与它的 `.sha256`：先比对摘要，再解包。改动安装根的动作全部在 `Owner` 之内：清空候选槽、解包、校验、拉起，确认成功之后删旧槽（选槽时不删任何槽）。启动器从不提交 `bin/current`，只在它缺失、非法或指向无效槽时补写一次。
+
+**模块**（职责 → 关键入口）：
+
+| 模块 | 职责 | 关键入口 |
+| --- | --- | --- |
+| `main` | 解析参数、定安装根、初始化日志、把自身版本写进 `launcher.json`，按命令分派 | `main`、`root_dir`、`record_version` |
+| `args` | 两条命令的形状与互斥规则 | `Command`、`Source`、`Options`、`parse` |
+| `install` | 安装根写权与一次安装事务：选槽与修复、装包、两条出口、确认、失败收尾、包预算与校验 | `own`、`run`、`launch_installed`、`Owner::prepare`、`Owner::install`、`Owner::boot_current`、`Owner::boot_candidate`、`Owner::apply_pending` |
+| `launch` | 客户端子进程句柄：拉起、问死活、停并确认退出 | `Client::{exited, stop, wait}`、`start`、`wait_exit` |
+| `supervisor` | Linux 常驻监督：一轮一轮选槽、消费待装包、拉起并守着客户端，把退出码透传给 systemd | `run`、`round` |
+| `log` | `<安装根>/log/launcher.log`，同时写 stderr | `init`、`line` |
 
 **对外 API**：
 
 ```rust
-// args：--root 可覆盖安装根；--file 与 --url 互斥；--sha256/--wait-for/--force 只能配安装
+// args.rs：--root 可覆盖安装根；--file 与 --url 互斥；--sha256/--wait-for/--force 只能配安装
 pub enum Command { Launch, Install { source: Source, sha256: Option<String>,
                                      wait_for: Option<u32>, force: bool } }
+pub enum Source { File(PathBuf), Url(String) }
+pub struct Options { pub command: Command, pub root: Option<PathBuf> }
+pub fn parse(argv: &[String]) -> Result<Options, ParseError>;
 
-// install.rs：安装根写权与一次安装
-pub(crate) fn own(root: &Path) -> Result<Owner, String>;            // install.lock，非阻塞
+// install.rs：安装根写权与两条出口
+pub(crate) fn own(root: &Path) -> Result<Owner, String>;                 // install.lock，非阻塞
 impl Owner {
-    pub(crate) fn recover(&self) -> Result<(), String>;             // 按 current 与槽的有效性决定启动哪一份
-    pub(crate) fn abort(&self) -> Result<(), String>;               // 放弃未确认的安装：停候选槽，保留 current 与候选槽
-    pub(crate) fn commit(&self) -> Result<(), String>;              // 收尾：删本次待装包
-    pub(crate) fn install(&self, pkg: &Path, force: bool) -> Result<(), String>;  // 清空候选槽、解包、校验
-    pub(crate) fn verify_current(&self) -> Result<(), String>;      // 校验某槽与清单同一集合
-    pub(crate) fn boot_and_settle(&self) -> Result<launch::Client, String>;  // 拉起选中的槽，等 current 变成它
+    pub(crate) fn prepare(&self) -> Result<Option<Selected>, String>;    // 清残留、读 current、判有效、选槽并修复
+    pub(crate) fn install(&self, pkg: &Path, target: &'static str,
+                          current_version: Option<&str>, force: bool) -> Result<Selected, String>;
+    pub(crate) fn boot_current(&self, selected: &Selected) -> Result<launch::Client, String>;  // 普通启动：拉起，不等确认
+    pub(crate) fn boot_candidate(&self, installed: &Selected) -> Result<launch::Client, BootFailure>;  // 安装：拉起并等 current
+    #[cfg(unix)] pub(crate) fn apply_pending(&self, selected: Option<&Selected>) -> Option<Selected>;  // 消费 update.tar.zst
 }
 pub fn run(root: &Path, source: Source, want_sha: Option<String>,
-           wait_for: Option<u32>, force: bool) -> Result<(), String>;  // 手动安装入口
+           wait_for: Option<u32>, force: bool) -> Result<(), String>;   // --file / --url 入口
+#[cfg(windows)] pub(crate) fn launch_installed(root: &Path) -> Result<(), String>;  // 普通启动入口
+pub(crate) fn no_slot_error() -> String;
 
 // launch.rs：客户端子进程句柄
 pub struct Client;
 impl Client {
     pub fn exited(&mut self) -> Result<Option<i32>, String>;
-    pub fn stop(&mut self) -> Result<(), String>;                   // 返回前确认它已退出
+    pub fn stop(&mut self) -> Result<(), String>;                    // 返回前确认它已退出
     #[cfg(unix)] pub fn wait(&mut self) -> Result<i32, String>;
 }
-pub fn start(exe: &Path, root: &Path) -> Result<Client, String>;   // 拉起槽内主程序，确认由观察 current 完成
+pub fn start(exe: &Path, root: &Path) -> Result<Client, String>;
 pub fn wait_exit(pid: u32, timeout: Duration) -> Result<(), String>;  // 只给 --wait-for
 
-#[cfg(windows)] pub(crate) fn launch_installed(root: &Path) -> Result<(), String>;
-pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>; }   // Linux 常驻
+// supervisor.rs
+pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>; }
 ```
+
+`Selected` 是选中的槽（槽名 + 清单版本）；`BootFailure` 是候选槽试运行失败的三种形状：`Create`（进程没创建出来）、`Confirm`（确认失败且已停掉）、`NotStopped`（确认失败且停不掉）。
 
 **一次安装的产物与判据**：
 
@@ -370,34 +400,39 @@ pub mod supervisor { #[cfg(unix)] pub fn run(root: &Path) -> Result<i32, String>
 
 一次安装按下列顺序推进：
 
-1. 验包根 `version.json` 的签名，确认它是客户端槽位、本机平台的。
-2. 候选槽 = 非当前槽；清空候选槽。
-3. 解包到候选槽，按最终落盘的内容校验该槽的 `version.json` 与文件集合。
-4. 拉起候选槽的 `mesh-client`，等 `bin/current` 变成该槽名（60 秒）；没变或子进程退出即失败。
-5. 成功：客户端已提交 `current`，随即删掉旧槽。
-6. 失败：停掉候选槽；`current` 不动、候选槽保留；按版本记一次失败。
+1. 包字节闸：超过上限的包在求摘要、读清单之前就拒绝。
+2. 不变量：`current` 不得已等于本次候选槽。
+3. 读包根清单（条目数、清单字节、声明的解压后字节、时限），验签并确认它是客户端槽位、本机平台的。
+4. 不比当前槽新、或该版本失败次数已满：拒绝（`--force` 跳过这两条）。
+5. 候选槽 = 非当前槽；清空候选槽。
+6. 解包到候选槽，按最终落盘的内容校验该槽的 `version.json` 与文件集合；不过即丢弃候选槽，不计次。
+7. 拉起候选槽的 `mesh-client`，等 `bin/current` 变成该槽名（60 秒）；没变或子进程退出即失败。
+8. 成功：客户端已提交 `current`，清该版本的失败计数，删掉旧槽。
+9. 失败：先 `Client::stop` 并确认退出，停得掉才按版本记一次失败；`current` 不动、候选槽保留。
 
-**四个入口、一个出口**：`boot_and_settle` 负责选槽、校验、拉起与等待 `current`——Windows 的安装后与普通启动（`run`、`launch_installed` → `boot_or_restore`）、确认被打断后的下一次启动、Linux 常驻监督（`supervisor::run`）。Linux 的手动安装同样拉起候选槽并等 `current`；确认失败就保留候选、不改 `current`。
+**两条出口**：`Owner::boot_current` 拉起 `prepare` 选中的槽，**不等确认**——`current` 本来就指着它（缺失或无效时刚被修复写指着），确认恒为真；Windows 的普通启动（`launch_installed`）与 Linux 常驻监督的无待装包分支走这条。`Owner::boot_candidate` 拉起刚装进候选槽的那一份并等 `current` 变成它，安装路径走这条。四个入口（安装之后、普通启动、确认被打断后的下一次启动、Linux 常驻监督）共用同一段「清残留 → 选槽 → 修复」，出口按这一轮有没有装包分成这两类。
 
 | 结局 | 处理 |
 | --- | --- |
-| 验证不过、进程创建失败 | 记一次失败；`current` 不动，候选槽保留 |
+| 包不可用（大小、清单、签名、平台、更新方向、失败次数） | 拒绝安装；候选槽未动 |
+| 解包或落盘后校验不过 | 丢弃候选槽，不计次 |
+| 进程创建失败 | 记一次失败；`current` 不动，候选槽保留 |
 | 确认超时或进程提前退出 | 先 `Client::stop` 并确认退出，再记一次失败；`current` 不动，候选槽保留 |
-| `stop` 失败（停不下来） | 不动 `current`，保留候选槽，下一轮接着判 |
+| `stop` 失败（停不下来） | 不动 `current`，保留候选槽，不计数，下一轮接着判 |
 | 确认成功 | 清失败计数；删掉旧槽 |
 
-**谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——读包里的版本，不比当前槽新、或清单读不出来都当场删掉，否则装它再删。Windows 上没有人按固定名去读：客户端把同一个路径作为 `--file` 交给启动器，由这次安装按 `downloaded` 判据处理——提交成功时 `commit` 删，安装失败时 `run` 删。客户端自己从不删固定路径上的这个文件。
+**谁消费 `update.tar.zst`**：Linux 上只有常驻启动器每轮循环里的 `apply_pending`——先对摘要，再读包里的清单；不比当前槽新、清单读不出、摘要不符都当场删掉，装与不装都删包与摘要。Windows 上没有人按固定名去读：客户端在持锁时把 `.part` 改名成这个路径，再把它作为 `--file` 交给启动器；`run` 只在路径正好是安装根里那一份时删它（成功失败都删），指向别处的 `--file` 是用户文件，原样保留。引擎只在交接还没被接收时删固定路径上的包（撤回或换 offer）。
 
-**拥有的状态**：`Owner`（安装根路径 + `install.lock` 的锁句柄；当前槽每次从 `bin/current` 现读，不留内存副本）；`launch::Client`（客户端子进程句柄：Windows 是自己 `spawn` 的 `Child` 或 `runas` 交回的 `HANDLE`，Unix 是 `Child`）。除这些之外没有跨调用的内存状态：`Budget` 与命令参数都是值。
+**拥有的状态**：`Owner`（安装根路径 + 验签公钥 + `install.lock` 的锁句柄；当前槽每次从 `bin/current` 现读，不留内存副本）；`launch::Client`（客户端子进程句柄：Windows 是自己 `spawn` 的 `Child` 或 `runas` 交回的 `HANDLE`，Unix 是 `Child`）。除这些之外没有跨调用的内存状态：`Budget` 与命令参数都是值。
 
 **依赖**：`mesh-install`（布局、清单、签名、失败计数、锁、版本比较）、`mesh-text`（文案）、`zstd`、`tar`、`sha2`；Windows 另加 `ureq`（`tls`+`native-certs`，`--url` 下载）与 `windows-sys`（`ShellExecuteExW` 的 runas、`TerminateProcess`、`WaitForSingleObject`）；Unix 的 `--url` 调系统 `curl`。
 
 **注**：
 
 1. Windows 拉起客户端要过 UAC：`CreateProcess` 返回 `ERROR_ELEVATION_REQUIRED(740)` 时改用 `ShellExecuteExW` 的 `runas`，并必须保留 `hProcess`——没有句柄就无从确认新版退没退，确认超时后不能安全换槽目录。
-2. Windows 上安装失败后要自己把当前槽拉回来（`boot_or_restore` → `start_current`）：启动器装完就退，没有别人替它拉起。Linux 的常驻启动器回到循环开头重走一遍。
-3. `verify_current` 要求槽目录与清单是同一个集合（`version.json` 除外）；装包、普通启动、手动安装后的拉起共用这一个判据。
-4. 预算收在 `Budget::package`：1024 条目、64 KiB 清单、256 MiB 解压后、120 s；`--url` 另加 200 MiB 包与 300 s 下载。条目数与声明字节在读清单时判完（此时候选槽还没动），解包时同一组数字是兜底，触发即让候选槽停在无效状态。
+2. Windows 上安装失败后要自己把当前槽拉回来（`restore_after_failure` → `Owner::boot_current`）：启动器装完就退，没有别人替它拉起。Linux 的常驻启动器回到循环开头重走一遍。
+3. `verify_slot` 要求槽目录与清单是同一个集合（`version.json` 除外），并要求清单列出主程序与内核；选槽（`valid_slot`）与装包后的校验共用这一个判据。
+4. 预算收在 `Budget::package`：1024 条目、64 KiB 清单、256 MiB 解压后、120 s（读清单与解包共用同一个截止时刻）；包字节上限 200 MiB 对两条入口都生效，`--url` 下载另加 300 s 时限。条目数与声明字节在读清单时判完（此时候选槽还没动），解包时同一组数字是兜底，触发即让候选槽停在无效状态。
 5. 每次启动先把自身版本写进 `launcher.json`（编进二进制的 `MESH_LAUNCHER_BUILD_VERSION`；不是合法版本号的开发构建不写，客户端按「没有记录」放行一次）。日志写 `<root>/log/launcher.log` 并同时进 stderr；`Launch` 在 Linux 上把客户端的退出码透传给 systemd。
 
 ## 4. Go ↔ Rust 对应与状态归属
@@ -498,7 +533,7 @@ Go 里 `quit`（停资源 + 通知主循环）与 `stop`（只停资源）是两
 
 - `instance.lock` 只回答「有没有客户端在跑」。启动器拿它不是要占住，而是试一次：拿得到就是没人跑，立刻放开。崩溃由内核释放，不会留下要人工删的锁文件。
 - `install.lock` 在 `own()` 里非阻塞地取；拿不到就报「安装根正被占用」，不排队。
-- Linux 常驻启动器只在「`recover` → `apply_pending` → `boot_and_settle`」这一段持有它，`client.wait()` 等客户端期间放开——客户端提交更新包与替换启动器要用同一把锁，一直握着就永远提交不了。客户端拿不到只影响这一次提交：包留在 `.part`，下一轮心跳再试。
+- Linux 常驻启动器只在「`own` → `prepare` → `apply_pending` → 拉起（`boot_candidate` 或 `boot_current`）」这一段持有它，`Client::wait` 等客户端期间放开——客户端提交更新包与替换启动器要用同一把锁，一直握着就永远提交不了。客户端拿不到只影响这一次提交：包留在 `.part`，下一轮心跳再试。
 - 冲突不靠锁预防，而是入口前提：
   1. **Linux 上手工安装先停服务。** 客户端在跑时它占着 `instance.lock`，手工 `mesh --file` 会被 `client_running` 判据拒绝；`systemctl stop` 之后才能装。
   2. **Windows 上客户端在跑时，`--file` 必须带 `--wait-for <pid>`。** 启动器等它退出（上限 60 s）；没有这一项就直接拒绝，不在运行中的客户端脚下换 `bin/`。
